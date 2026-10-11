@@ -528,3 +528,45 @@ fn reencoded_flac_streaminfo_md5_is_correct_for_known_unknown_and_bad_source_md5
         }
     }
 }
+/// BE-010 (100-album test, 2026-10-11): QuickTime/iTunes-family encoders
+/// write the legacy 16 into the MP4 sample entry's sample size for 24-bit
+/// ALAC; the ALAC configuration carries the real depth. Such files decode to
+/// the source PCM, while a channel mismatch, any other false depth and AAC
+/// in an .m4a stay refused.
+#[test]
+fn alac_sample_entry_legacy_depth_is_accepted_and_decoded() {
+    let d = Dir::new();
+    let src = d.0.join("source.wav");
+    ffmpeg(None, &src, "pcm_s24le");
+    let (_, expected, frames) = pcm_sha256(&src, Limits::default(), Backend::Scalar).unwrap();
+    let alac = d.0.join("source.m4a");
+    ffmpeg(Some(&src), &alac, "alac");
+    let bytes = std::fs::read(&alac).unwrap();
+    // The first `alac` is the sample entry (the second is its configuration).
+    let entry = bytes.windows(4).position(|w| w == b"alac").unwrap() + 4;
+    assert_eq!(&bytes[entry + 18..entry + 20], &24u16.to_be_bytes());
+    let patched = |field: usize, value: u16, name: &str| {
+        let mut b = bytes.clone();
+        b[entry + field..entry + field + 2].copy_from_slice(&value.to_be_bytes());
+        let p = d.0.join(name);
+        std::fs::write(&p, b).unwrap();
+        p
+    };
+    let legacy = patched(18, 16, "legacy16.m4a");
+    let (_, hash, count) = pcm_sha256(&legacy, Limits::default(), Backend::detect()).unwrap();
+    assert_eq!(hash, expected);
+    assert_eq!(count, frames);
+    for (field, value, name) in [(18, 20, "depth20.m4a"), (16, 1, "mono.m4a")] {
+        let p = patched(field, value, name);
+        assert!(
+            matches!(
+                pcm_sha256(&p, Limits::default(), Backend::detect()),
+                Err(Error::Invalid("ALAC description mismatch"))
+            ),
+            "{name}"
+        );
+    }
+    let aac = d.0.join("aac.m4a");
+    ffmpeg(Some(&src), &aac, "aac");
+    assert!(pcm_sha256(&aac, Limits::default(), Backend::detect()).is_err());
+}

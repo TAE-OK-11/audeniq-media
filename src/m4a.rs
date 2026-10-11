@@ -163,8 +163,13 @@ pub(crate) fn open(file: &mut File, limits: &Limits) -> Result<Track> {
         frames: None,
     };
     spec.validate()?;
+    // The ALAC configuration is authoritative for the bit depth: QuickTime
+    // and iTunes-family encoders write the legacy default 16 into the sample
+    // entry's sample size for 24-bit ALAC. Every packet is decoded against
+    // the configuration, so a false depth there still fails the decode.
+    let entry_bits = u16::from_be_bytes(desc[18..20].try_into().unwrap());
     if u16::from_be_bytes(desc[16..18].try_into().unwrap()) != spec.channels
-        || u16::from_be_bytes(desc[18..20].try_into().unwrap()) != spec.bits_per_sample
+        || (entry_bits != spec.bits_per_sample && entry_bits != 16)
     {
         return Err(Error::Invalid("ALAC description mismatch"));
     }

@@ -22,3 +22,16 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+
+
+  hash-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - run: cargo test -p photo-hash -p photo-deflate -p photo-png --lib
+      - run: cargo test -p photo-png --test qc_crc
+      - run: cargo test -p photo-hash --no-default-features
+      - run: cargo check -p photo-hash --no-default-features

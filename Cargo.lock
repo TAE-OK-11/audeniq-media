@@ -390,6 +390,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "md5"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -554,7 +564,17 @@ dependencies = [
  "crc32fast",
  "memoffset",
  "photo-core",
+ "photo-hash",
  "quickcheck",
+]
+
+[[package]]
+name = "photo-hash"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "md-5",
+ "sha2",
 ]
 
 [[package]]
@@ -666,6 +686,7 @@ dependencies = [
  "memchr",
  "photo-core",
  "photo-deflate",
+ "photo-hash",
  "photo-jpeg",
  "photo-pdf-ccitt",
  "photo-pdf-jbig2",

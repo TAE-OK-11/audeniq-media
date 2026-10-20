@@ -10,6 +10,8 @@ use crate::error::{MarkerError, Result, ValidationError, bail, err};
 use crate::reader::BitReader;
 
 const MAX_LAYER_COUNT: u8 = 32;
+/// Largest image area (full resolution, in reference grid points) accepted.
+const MAX_FULL_RESOLUTION_AREA: u64 = 1 << 30;
 const MAX_RESOLUTION_COUNT: u8 = 32;
 const MAX_PRECINCT_EXPONENT: u8 = 31;
 
@@ -546,6 +548,24 @@ fn size_marker(reader: &mut BitReader<'_>) -> Result<SizeData> {
         || size_data.tile_y_offset >= size_data.reference_grid_height
     {
         bail!(ValidationError::InvalidDimensions);
+    }
+
+    // Decoding state grows with the full-resolution area even when only a
+    // reduced resolution is decoded, and the sizes come from the file: a
+    // few hundred bytes could otherwise ask for gigabytes.
+    let area = u64::from(
+        size_data.reference_grid_width
+            - size_data
+                .image_area_x_offset
+                .min(size_data.reference_grid_width),
+    ) * u64::from(
+        size_data.reference_grid_height
+            - size_data
+                .image_area_y_offset
+                .min(size_data.reference_grid_height),
+    );
+    if area > MAX_FULL_RESOLUTION_AREA {
+        bail!(ValidationError::ImageTooLarge);
     }
 
     // The tile grid offsets (XTOsiz, YTOsiz) are constrained to be no greater than the

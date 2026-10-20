@@ -719,8 +719,12 @@ impl PredictorParams {
         self.bits_per_component * self.colors
     }
 
-    fn row_length_in_bytes(&self) -> usize {
-        (self.columns * self.bits_per_pixel() as usize).div_ceil(8)
+    fn row_length_in_bytes(&self) -> Option<usize> {
+        Some(
+            self.columns
+                .checked_mul(self.bits_per_pixel() as usize)?
+                .div_ceil(8),
+        )
     }
 }
 
@@ -754,7 +758,7 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
         i => {
             let is_png_predictor = i >= 10;
 
-            let row_len = params.row_length_in_bytes();
+            let row_len = params.row_length_in_bytes()?;
 
             let total_row_len = if is_png_predictor {
                 // + 1 Because each row must start with the predictor that is used for PNG predictors.
@@ -763,7 +767,15 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                 row_len
             };
 
+            if total_row_len == 0 {
+                return None;
+            }
             let num_rows = data.len() / total_row_len;
+            // `Columns` comes from the file: no buffers for rows the data
+            // does not contain (the result would be empty anyway).
+            if num_rows == 0 && matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
+                return Some(Vec::new());
+            }
 
             if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
                 warn!("invalid bits per component {}", params.bits_per_component);

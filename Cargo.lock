@@ -44,6 +44,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "audeniq-photo"
 version = "0.1.0"
 dependencies = [
+ "media-json",
  "photo-core",
  "photo-deflate",
  "photo-icc",
@@ -53,19 +54,15 @@ dependencies = [
  "photo-pdf",
  "photo-png",
  "photo-qr",
- "serde_json",
 ]
 
 [[package]]
 name = "audeniq-qc"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
  "image",
- "md-5",
  "media-hash",
- "serde_json",
- "sha2 0.11.0",
+ "media-json",
  "symphonia",
 ]
 
@@ -552,6 +549,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-json"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,12 +691,12 @@ version = "0.1.0"
 dependencies = [
  "audeniq-photo",
  "libc",
+ "media-json",
  "mimalloc",
  "photo-deflate",
  "photo-jpeg",
  "photo-png",
  "photo-qr",
- "serde_json",
 ]
 
 [[package]]
@@ -700,9 +704,9 @@ name = "photo-cli"
 version = "0.1.0"
 dependencies = [
  "audeniq-photo",
+ "media-json",
  "mimalloc",
  "photo-meta",
- "serde_json",
 ]
 
 [[package]]

@@ -23,7 +23,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use audeniq_photo::{Deadline, Kind};
-use serde_json::{Value, json};
+use media_json::{Value, json};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ fn read(path: &str) -> Result<Vec<u8>, String> {
 }
 
 fn print(v: &Value) {
-    println!("{}", serde_json::to_string_pretty(v).expect("json"));
+    println!("{}", media_json::to_string_pretty(v));
 }
 
 fn deadline() -> Deadline {
@@ -48,7 +48,7 @@ fn deadline() -> Deadline {
 
 fn meta_json(path: &str, data: &[u8], names: &[String]) -> Result<Value, String> {
     let m = audeniq_photo::metadata(data).map_err(|e| e.to_string())?;
-    let mut obj = serde_json::Map::new();
+    let mut obj = media_json::Map::new();
     obj.insert("SourceFile".into(), json!(path));
     for t in &m.tags {
         let base = t.name.split('-').next().unwrap_or(&t.name);

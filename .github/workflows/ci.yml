@@ -1,0 +1,42 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  # Every crate of the media engine (audio, photo and the shared crates),
+  # with the reference tools the parity tests compare against.
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Reference tools for parity tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg libimage-exiftool-perl zbar-tools qrencode poppler-utils python3-pil icc-profiles-free
+          pip install --break-system-packages -q qrcode==8.2 || true
+      # rustup installs the pinned toolchain from rust-toolchain.toml.
+      - run: rustc --version && cargo --version
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p audeniq-qc
+      - run: cargo build --profile release-photo --locked -p photo-cli
+      - run: |
+          target/release/audeniq-qc capabilities
+          target/release-photo/audeniq-photo --version
+
+  shared-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: rustc --version && cargo --version
+      - run: cargo test --locked -p media-hash -p media-json -p photo-deflate -p photo-png --lib
+      - run: cargo test --locked -p photo-png --test qc_crc
+      - run: cargo test --locked -p media-hash --no-default-features
+      - run: cargo check --locked -p media-hash --no-default-features

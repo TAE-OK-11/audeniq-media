@@ -1,0 +1,11 @@
+[package]
+name = "audeniq-qc-tools"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "LGPL-2.1-or-later"
+publish = false
+description = "Rust-only development qualification and resource benchmarks"
+
+[dependencies]
+audeniq-qc = { path = "../audeniq-qc" }

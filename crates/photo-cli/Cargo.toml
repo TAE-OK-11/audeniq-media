@@ -1,0 +1,20 @@
+[package]
+name = "photo-cli"
+description = "audeniq-photo command line: probe, metadata, QR, sanitize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "audeniq-photo"
+path = "src/main.rs"
+
+[dependencies]
+audeniq-photo.workspace = true
+photo-meta.workspace = true
+media-json.workspace = true
+mimalloc.workspace = true
+
+[lints]
+workspace = true

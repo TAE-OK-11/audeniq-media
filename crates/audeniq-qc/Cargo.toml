@@ -1,0 +1,22 @@
+[package]
+name = "audeniq-qc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "LGPL-2.1-or-later"
+description = "Bounded, lossless-only audio normalization and QC for AUDENIQ"
+repository = "https://github.com/TAE-OK-11/audeniq-qc"
+
+[dependencies]
+media-hash = { workspace = true, features = ["std"] }
+media-json.workspace = true
+symphonia = { version = "=0.5.4", optional = true, default-features = false, features = ["flac", "alac", "isomp4"] }
+
+[dev-dependencies]
+# Independent oracle for the cover validation tests only.
+image_reference = { package = "image", version = "=0.24.9", default-features = false, features = ["jpeg", "png"] }
+
+[features]
+default = []
+reference-codecs = ["dep:symphonia"]
+profile-native = []

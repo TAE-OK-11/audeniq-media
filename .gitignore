@@ -2,3 +2,6 @@
 /fixtures/
 *.partial
 __pycache__/
+/reference-target/
+/profile-target/
+*.profraw

@@ -25,9 +25,12 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked -p audeniq-qc
       - run: cargo build --profile release-photo --locked -p photo-cli
+      - run: cargo build --profile release-music --locked -p audeniq-music
       - run: |
           target/release/audeniq-qc capabilities
           target/release-photo/audeniq-photo --version
+          target/release-music/audeniq-music --version
+          cmp <(target/release/audeniq-qc capabilities) <(target/release-music/audeniq-music qc capabilities)
 
   shared-arm:
     runs-on: ubuntu-24.04-arm

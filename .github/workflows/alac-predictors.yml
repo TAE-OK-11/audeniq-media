@@ -2,6 +2,8 @@ name: Native ALAC predictor dispatch comparison
 on:
   push:
     paths:
+      - crates/media-hash/**
+      - crates/media-json/**
       - crates/audeniq-qc/src/alac.rs
       - crates/audeniq-qc/src/profile.rs
       - crates/audeniq-qc-tools/src/benchmark.rs
@@ -25,7 +27,7 @@ jobs:
           rustc --version
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg time
-      - run: cargo build --workspace --release --locked
+      - run: cargo build -p audeniq-qc -p audeniq-qc-tools --release --locked
       - run: cargo build -p audeniq-qc --release --features profile-native --locked --target-dir profile-target
       - name: Isolate order 4, 6 and 8 on the same host
         run: |

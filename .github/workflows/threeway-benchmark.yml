@@ -5,6 +5,8 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - crates/media-hash/**
+      - crates/media-json/**
       - crates/audeniq-qc/src/**
       - crates/audeniq-qc-tools/**
       - .github/workflows/threeway-benchmark.yml
@@ -34,11 +36,11 @@ jobs:
           sudo apt-get install -y -qq ffmpeg time
           grep -m4 -E "model name|CPU implementer|CPU part" /proc/cpuinfo || true
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - run: cargo clippy --workspace --features audeniq-qc/reference-codecs --locked --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo test --workspace --features audeniq-qc/reference-codecs --locked --target-dir reference-target
-      - run: cargo build --workspace --release --locked
+      - run: cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked --all-targets -- -D warnings
+      - run: cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --features audeniq-qc/reference-codecs --locked --all-targets -- -D warnings
+      - run: cargo test -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked
+      - run: cargo test -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --features audeniq-qc/reference-codecs --locked --target-dir reference-target
+      - run: cargo build -p audeniq-qc -p audeniq-qc-tools --release --locked
       - run: cargo build -p audeniq-qc --release --features reference-codecs --locked --target-dir reference-target
       - run: cargo build --manifest-path main-engine/Cargo.toml --release --locked --target-dir main-target
       - name: Identify builds

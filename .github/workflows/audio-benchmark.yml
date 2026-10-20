@@ -3,6 +3,8 @@ on:
   push:
     paths:
       - .github/workflows/audio-benchmark.yml
+      - crates/media-hash/**
+      - crates/media-json/**
       - crates/audeniq-qc/src/flac.rs
       - crates/audeniq-qc/src/audio.rs
       - crates/audeniq-qc/src/bits.rs
@@ -32,8 +34,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg time
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - run: cargo build --workspace --locked --release
+      - run: cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked --all-targets -- -D warnings
+      - run: cargo build -p audeniq-qc -p audeniq-qc-tools --locked --release
       - run: cargo build --manifest-path conversion-parent/Cargo.toml --locked --release --target-dir conversion-parent/target
       - run: target/release/audeniq-qc capabilities
       - name: Seven repeated runs on four-minute WAV and ALAC

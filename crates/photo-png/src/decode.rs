@@ -409,3 +409,118 @@ pub fn decode(data: &[u8], limits: &Limits, deadline: &Deadline) -> Result<(Info
         },
     ))
 }
+
+/// Rec.601 luma (8-bit) of a PNG, as [`decode`] followed by converting its
+/// pixels to gray (gray and gray+alpha keep the gray sample; RGB/RGBA and
+/// palettes use `(299 R + 587 G + 114 B + 500) / 1000`), with the same
+/// errors in the same precedence. The zlib stream is decoded row by row
+/// into a two-row window instead of one buffer for the whole image, so the
+/// only image-sized allocation is the `width * height` gray output.
+pub fn decode_gray(data: &[u8], limits: &Limits, deadline: &Deadline) -> Result<(Info, Vec<u8>)> {
+    let Parsed { info, idat } = parse(data, true)?;
+    limits.check_dimensions(info.width, info.height)?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let passes: Vec<(usize, usize, usize, usize, usize, usize)> = if info.interlace {
+        ADAM7
+            .iter()
+            .map(|&(x0, y0, dx, dy)| (x0, y0, dx, dy, pass_size(w, x0, dx), pass_size(h, y0, dy)))
+            .filter(|p| p.4 > 0 && p.5 > 0)
+            .collect()
+    } else {
+        vec![(0, 0, 1, 1, w, h)]
+    };
+    let mut raw_len: u64 = 0;
+    for p in &passes {
+        raw_len += p.5 as u64 * (1 + row_bytes(p.4, &info) as u64);
+    }
+    let raw_len = limits.alloc_size(raw_len, 1)?;
+    let fmt = out_format(&info);
+    let ch = fmt.channels();
+    // The checks `decode` makes for its output buffer.
+    limits.alloc_size((w * h) as u64, ch as u64)?;
+    let stream: Cow<[u8]> = if idat.len() == 1 {
+        Cow::Borrowed(idat[0])
+    } else {
+        Cow::Owned(idat.concat())
+    };
+    let bpp = (info.channels() * info.bit_depth as usize).div_ceil(8);
+    let mut gray = vec![0u8; w * h];
+    // Row state: the current pass, row within it, the row being filled
+    // (filter byte + samples) and the previous unfiltered row of the pass.
+    let (mut pass, mut py) = (0usize, 0usize);
+    let max_rb = passes
+        .iter()
+        .map(|p| row_bytes(p.4, &info))
+        .max()
+        .unwrap_or(0);
+    let mut cur: Vec<u8> = Vec::with_capacity(1 + max_rb);
+    let mut prev: Vec<u8> = Vec::with_capacity(1 + max_rb);
+    let mut scratch = Vec::with_capacity(w * ch);
+    // `decode` inflates everything before unfiltering, so an inflate or
+    // length error wins over a row error; the first row error is kept.
+    let mut row_error: Option<Error> = None;
+    let mut sink = |mut bytes: &[u8]| {
+        while !bytes.is_empty() && pass < passes.len() {
+            let (x0, y0, dx, dy, pw, ph) = passes[pass];
+            let rb = row_bytes(pw, &info);
+            let take = (1 + rb - cur.len()).min(bytes.len());
+            cur.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if cur.len() < 1 + rb {
+                break;
+            }
+            if row_error.is_none() {
+                let filter = cur[0];
+                let r = if py % 64 == 0 {
+                    deadline.check()
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| {
+                    let p = if py == 0 { None } else { Some(&prev[1..]) };
+                    unfilter(filter, bpp, p, &mut cur[1..])
+                });
+                match r {
+                    Err(e) => row_error = Some(e),
+                    Ok(()) => {
+                        expand(&info, &cur[1..], pw, &mut scratch);
+                        let row = &mut gray[(y0 + py * dy) * w..(y0 + py * dy + 1) * w];
+                        for (px, p) in scratch.chunks_exact(ch).enumerate() {
+                            row[x0 + px * dx] = match ch {
+                                1 | 2 => p[0],
+                                _ => {
+                                    ((u32::from(p[0]) * 299
+                                        + u32::from(p[1]) * 587
+                                        + u32::from(p[2]) * 114
+                                        + 500)
+                                        / 1000) as u8
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+            std::mem::swap(&mut prev, &mut cur);
+            cur.clear();
+            py += 1;
+            if py == ph {
+                pass += 1;
+                py = 0;
+            }
+        }
+    };
+    let mut produced = 0usize;
+    let chunk = raw_len.clamp(1, 256 * 1024);
+    let r = photo_deflate::inflate_zlib_chunks(&stream, raw_len, true, chunk, &mut |b| {
+        produced += b.len();
+        sink(b);
+    })?;
+    drop(stream);
+    if produced != raw_len || (r.complete && produced < raw_len) {
+        return Err(Error::Truncated);
+    }
+    if let Some(e) = row_error {
+        return Err(e);
+    }
+    Ok((info, gray))
+}

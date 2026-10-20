@@ -806,6 +806,10 @@ fn lm_init(state: &mut State) {
     state.match_available = false;
     state.match_start = 0;
     state.ins_h = 0;
+    // As a new state: a reused one must not carry the last stream's
+    // literal costs (the output would depend on what ran before).
+    state.image_cost = [64; 256];
+    state.image_cost_mark = 0;
 }
 
 fn lm_set_level(state: &mut State, level: i8) {

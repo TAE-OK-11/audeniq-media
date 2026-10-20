@@ -277,12 +277,11 @@ impl Transform {
                 off,
                 shaper2,
             } => {
-                for i in 0..n {
-                    let (r, g, b) = (
-                        src[i * 3] as usize,
-                        src[i * 3 + 1] as usize,
-                        src[i * 3 + 2] as usize,
-                    );
+                // Whole pixels on both sides (n of them): no per-pixel
+                // bounds checks, whatever the caller's buffer sizes.
+                let (src, dst) = (src.as_chunks::<3>().0, dst.as_chunks_mut::<3>().0);
+                for (s, d) in src[..n].iter().zip(&mut dst[..n]) {
+                    let [r, g, b] = s.map(usize::from);
                     let v = [shaper1[0][r], shaper1[1][g], shaper1[2][b]];
                     for c in 0..3 {
                         let l = (mat[c][0] * v[0]
@@ -291,7 +290,7 @@ impl Transform {
                             + off[c]
                             + 0x2000)
                             >> 14;
-                        dst[i * 3 + c] = shaper2[l.clamp(0, 16384) as usize];
+                        d[c] = shaper2[l.clamp(0, 16384) as usize];
                     }
                 }
             }

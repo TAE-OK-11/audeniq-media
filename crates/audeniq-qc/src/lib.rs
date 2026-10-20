@@ -3,6 +3,7 @@
 mod alac;
 pub mod audio;
 mod bits;
+pub mod cli;
 #[cfg(not(feature = "reference-codecs"))]
 mod compressed;
 mod crc16;

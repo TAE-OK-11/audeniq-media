@@ -87,6 +87,15 @@ codegen-units = 1
 strip = true
 panic = "unwind"
 
+# audeniq-music: audio and photo in one binary, the one the backend installs.
+# photo needs unwinding. Thin LTO with the default codegen units keeps audio at
+# its `release` speed (fat LTO: ALAC convert/analyze ~11% slower, one codegen
+# unit ~26%); the cost is JPEG sanitize ~10% (docs/BENCHMARK-MUSIC.md).
+[profile.release-music]
+inherits = "release-photo"
+lto = "thin"
+codegen-units = 16
+
 [profile.profiling]
 inherits = "release-photo"
 debug = true

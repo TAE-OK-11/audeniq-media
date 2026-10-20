@@ -262,3 +262,41 @@ fn randomized_roundtrips() {
     }
     eprintln!("randomized: 160 cases, {python_checked} cross-checked with zlib");
 }
+
+/// A compressor reused from the thread's pool must give the same bytes as
+/// a fresh one, whatever it compressed before (parallel PNG pieces land
+/// on whichever thread is free).
+#[test]
+fn image_tuning_output_does_not_depend_on_earlier_streams() {
+    // The earlier stream leaves literals looking cheap (4 symbols); its
+    // costs must not decide whether the early 8-byte matches here are
+    // coded.
+    let mut seed = 0x9e37_79b9u32;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let other: Vec<u8> = (0..100_000).map(|_| (rnd() % 4) as u8).collect();
+    let mut pixels: Vec<u8> = (0..900).map(|_| (rnd() % 4) as u8).collect();
+    for k in 0..40 {
+        pixels.extend_from_within(k * 9..k * 9 + 8);
+        pixels.push(4 + k as u8);
+    }
+    let encode = |data: &[u8]| {
+        let mut z = Compressor::zlib_image(Level::DEFAULT);
+        let mut out = Vec::new();
+        z.write(data, &mut out);
+        z.finish(&mut out);
+        out
+    };
+    let fresh = std::thread::spawn({
+        let pixels = pixels.clone();
+        move || encode(&pixels)
+    })
+    .join()
+    .unwrap();
+    encode(&other);
+    assert_eq!(encode(&pixels), fresh);
+}

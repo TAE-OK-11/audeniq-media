@@ -14,7 +14,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use audeniq_photo::{Deadline, Image, Kind, PixelFormat};
-use serde_json::json;
+use media_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -767,7 +767,7 @@ fn main() {
     }
     if let Some(p) = &args.json {
         let doc = json!({"iterations": args.iterations, "threads": args.threads, "rows": jrows, "throughput": {"rust_files_per_s": rust_tput, "external_files_per_s": ext_tput}});
-        std::fs::write(p, serde_json::to_string_pretty(&doc).unwrap()).expect("write json");
+        std::fs::write(p, media_json::to_string_pretty(&doc)).expect("write json");
     }
     std::fs::remove_dir_all(&tmp).ok();
 }

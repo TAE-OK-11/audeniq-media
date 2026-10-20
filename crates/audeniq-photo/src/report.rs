@@ -1,8 +1,8 @@
 //! ExifTool-shaped JSON from photo-meta tags.
 
 use crate::{Error, Result, guard};
+use media_json::{Map, Number, Value as J};
 use photo_meta::{Metadata, Value};
-use serde_json::{Map, Value as J};
 
 /// Read all metadata (replacement for running `exiftool` on the file).
 pub fn metadata(data: &[u8]) -> Result<Metadata> {
@@ -60,9 +60,9 @@ fn looks_numeric(s: &str) -> bool {
 fn json_scalar(s: &str) -> J {
     if looks_numeric(s) {
         if let Ok(i) = s.parse::<i64>() {
-            return J::from(i);
+            return media_json::to_value(&i);
         }
-        if let Some(n) = s.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+        if let Some(n) = s.parse::<f64>().ok().and_then(Number::from_f64) {
             return J::Number(n);
         }
     }
@@ -71,8 +71,8 @@ fn json_scalar(s: &str) -> J {
 
 pub(crate) fn json_value(v: &Value) -> J {
     match v {
-        Value::Int(i) => J::from(*i),
-        Value::Real(r) => serde_json::Number::from_f64(*r).map_or(J::Null, J::Number),
+        Value::Int(i) => media_json::to_value(i),
+        Value::Real(r) => Number::from_f64(*r).map_or(J::Null, J::Number),
         Value::Text(s) => json_scalar(s),
         Value::List(l) => J::Array(l.iter().map(|s| json_scalar(s)).collect()),
     }
@@ -121,7 +121,7 @@ fn group_rank(group: &str) -> u8 {
 
 /// Color properties object, one value per field (ExifTool duplicate
 /// suppression: the highest-priority group wins).
-pub fn color_report(meta: &Metadata) -> Map<String, J> {
+pub fn color_report(meta: &Metadata) -> Map {
     let mut out = Map::new();
     for &field in COLOR_FIELDS {
         if let Some(t) = meta.get(field).min_by_key(|t| group_rank(&t.group)) {
@@ -134,7 +134,7 @@ pub fn color_report(meta: &Metadata) -> Map<String, J> {
 /// Provenance fields keyed `Group:Name` like `exiftool -G1`. Repeated
 /// group/name pairs (e.g. several AIFF comments) get `Group-2:Name` keys so
 /// the field name after the last colon stays exact.
-pub fn provenance_fields(meta: &Metadata) -> Map<String, J> {
+pub fn provenance_fields(meta: &Metadata) -> Map {
     let mut out = Map::new();
     for t in &meta.tags {
         let base = t.name.split('-').next().unwrap_or(&t.name);

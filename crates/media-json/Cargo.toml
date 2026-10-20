@@ -1,0 +1,14 @@
+[package]
+name = "media-json"
+description = "Dependency-free JSON values, writers and parser with serde_json-identical output, shared by the AUDENIQ media engines"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+
+[dev-dependencies]
+# Independent oracle for the tests only.
+serde_json_reference = { package = "serde_json", version = "=1.0.140" }
+
+[lints]
+workspace = true

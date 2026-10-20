@@ -11,6 +11,7 @@ repository = "https://github.com/TAE-OK-11/audeniq-qc"
 
 [workspace.dependencies]
 media-hash = { path = "crates/media-hash", default-features = false }
+media-json = { path = "crates/media-json" }
 photo-core = { path = "crates/photo-core" }
 photo-deflate = { path = "crates/photo-deflate" }
 photo-png = { path = "crates/photo-png" }

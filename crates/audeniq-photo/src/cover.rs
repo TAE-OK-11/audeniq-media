@@ -4,15 +4,15 @@
 
 use crate::report::{color_report, provenance_fields};
 use crate::{Deadline, Probe, Result, guard, probe};
-use serde_json::{Map, Value};
+use media_json::Map;
 
 #[derive(Debug, Clone)]
 pub struct CoverReport {
     pub probe: Probe,
     /// `IMAGE_COLOR_PROFILE` properties (ExifTool `-j -n -s` shape).
-    pub color: Map<String, Value>,
+    pub color: Map,
     /// Provenance fields (ExifTool `-j -n -G1 -s` shape).
-    pub provenance: Map<String, Value>,
+    pub provenance: Map,
     /// Decoded QR codes, or the reason the scan could not run.
     pub qr: std::result::Result<usize, crate::Error>,
 }

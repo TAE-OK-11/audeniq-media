@@ -1,6 +1,7 @@
-//! JSON reports: a value type, compact and pretty writers, a `json!` macro
-//! and a parser, producing byte-for-byte the output serde_json 1.0 gave the
-//! engine and its tools before (and parsing what they read).
+//! JSON for the AUDENIQ media engines (audio and photo reports, the tools):
+//! a value type, compact and pretty writers, a `json!` macro and a parser,
+//! producing byte-for-byte the output serde_json 1.0 gave the engines and
+//! their tools before (and parsing what they read).
 //!
 //! * Structs are written field by field in declaration order (the derive
 //!   order); inside a [`Value`] objects are sorted by key, as serde_json's
@@ -862,16 +863,16 @@ impl<'a, 'b> ObjectWriter<'a, 'b> {
 #[macro_export]
 macro_rules! json_struct {
     ($type:ty { $($field:ident $(: $skip:ident)?),* $(,)? }) => {
-        impl $crate::json::ToJson for $type {
-            fn write_json(&self, out: &mut $crate::json::Out) {
-                let mut object = $crate::json::ObjectWriter::new(out);
+        impl $crate::ToJson for $type {
+            fn write_json(&self, out: &mut $crate::Out) {
+                let mut object = $crate::ObjectWriter::new(out);
                 $( $crate::json_struct_field!(write object self $field $($skip)?); )*
                 object.end();
             }
-            fn to_value(&self) -> $crate::json::Value {
-                let mut map = $crate::json::Map::new();
+            fn to_value(&self) -> $crate::Value {
+                let mut map = $crate::Map::new();
                 $( $crate::json_struct_field!(value map self $field $($skip)?); )*
-                $crate::json::Value::Object(map)
+                $crate::Value::Object(map)
             }
         }
     };
@@ -891,14 +892,14 @@ macro_rules! json_struct_field {
     (value $map:ident $self:ident $field:ident) => {
         $map.insert(
             stringify!($field).to_owned(),
-            $crate::json::ToJson::to_value(&$self.$field),
+            $crate::ToJson::to_value(&$self.$field),
         );
     };
     (value $map:ident $self:ident $field:ident skip_none) => {
         if let Some(value) = &$self.$field {
             $map.insert(
                 stringify!($field).to_owned(),
-                $crate::json::ToJson::to_value(value),
+                $crate::ToJson::to_value(value),
             );
         }
     };
@@ -908,12 +909,12 @@ macro_rules! json_struct_field {
 #[macro_export]
 macro_rules! json_enum {
     ($type:ty { $($variant:ident => $name:literal),* $(,)? }) => {
-        impl $crate::json::ToJson for $type {
-            fn write_json(&self, out: &mut $crate::json::Out) {
-                $crate::json::write_str(match self { $(Self::$variant => $name),* }, out);
+        impl $crate::ToJson for $type {
+            fn write_json(&self, out: &mut $crate::Out) {
+                $crate::write_str(match self { $(Self::$variant => $name),* }, out);
             }
-            fn to_value(&self) -> $crate::json::Value {
-                $crate::json::Value::String(match self { $(Self::$variant => $name),* }.to_owned())
+            fn to_value(&self) -> $crate::Value {
+                $crate::Value::String(match self { $(Self::$variant => $name),* }.to_owned())
             }
         }
     };
@@ -925,20 +926,20 @@ macro_rules! json_enum {
 /// parenthesized expressions.
 #[macro_export]
 macro_rules! json {
-    (null) => { $crate::json::Value::Null };
+    (null) => { $crate::Value::Null };
     ([ $($tt:tt)* ]) => {{
         #[allow(unused_mut)]
-        let mut array: Vec<$crate::json::Value> = Vec::new();
+        let mut array: Vec<$crate::Value> = Vec::new();
         $crate::json_items!(array $($tt)*);
-        $crate::json::Value::Array(array)
+        $crate::Value::Array(array)
     }};
     ({ $($tt:tt)* }) => {{
         #[allow(unused_mut)]
-        let mut map = $crate::json::Map::new();
+        let mut map = $crate::Map::new();
         $crate::json_members!(map $($tt)*);
-        $crate::json::Value::Object(map)
+        $crate::Value::Object(map)
     }};
-    ($other:expr) => { $crate::json::to_value(&$other) };
+    ($other:expr) => { $crate::to_value(&$other) };
 }
 
 #[doc(hidden)]
@@ -946,7 +947,7 @@ macro_rules! json {
 macro_rules! json_items {
     ($array:ident) => {};
     ($array:ident null $(, $($rest:tt)*)?) => {
-        $array.push($crate::json::Value::Null);
+        $array.push($crate::Value::Null);
         $crate::json_items!($array $($($rest)*)?);
     };
     ($array:ident [ $($inner:tt)* ] $(, $($rest:tt)*)?) => {
@@ -958,7 +959,7 @@ macro_rules! json_items {
         $crate::json_items!($array $($($rest)*)?);
     };
     ($array:ident $value:expr $(, $($rest:tt)*)?) => {
-        $array.push($crate::json::to_value(&$value));
+        $array.push($crate::to_value(&$value));
         $crate::json_items!($array $($($rest)*)?);
     };
 }
@@ -979,7 +980,7 @@ macro_rules! json_members {
 #[macro_export]
 macro_rules! json_member {
     ($map:ident ($key:expr) null $(, $($rest:tt)*)?) => {
-        $map.insert(::std::string::String::from($key), $crate::json::Value::Null);
+        $map.insert(::std::string::String::from($key), $crate::Value::Null);
         $crate::json_members!($map $($($rest)*)?);
     };
     ($map:ident ($key:expr) [ $($inner:tt)* ] $(, $($rest:tt)*)?) => {
@@ -991,7 +992,7 @@ macro_rules! json_member {
         $crate::json_members!($map $($($rest)*)?);
     };
     ($map:ident ($key:expr) $value:expr $(, $($rest:tt)*)?) => {
-        $map.insert(::std::string::String::from($key), $crate::json::to_value(&$value));
+        $map.insert(::std::string::String::from($key), $crate::to_value(&$value));
         $crate::json_members!($map $($($rest)*)?);
     };
 }

@@ -2,7 +2,7 @@
 //! SourceFile); provenance_fields must contain everything
 //! `exiftool -j -n -G1 -s <provenance fields>` reports.
 use audeniq_photo::{color_report, metadata, provenance_fields};
-use serde_json::Value;
+use media_json::Value;
 use std::process::Command;
 
 const COLOR: &[&str] = &[
@@ -31,18 +31,14 @@ const PROV: &[&str] = &[
     "Workflow",
 ];
 
-fn exiftool(
-    path: &std::path::Path,
-    args: &[&str],
-    names: &[&str],
-) -> Option<serde_json::Map<String, Value>> {
+fn exiftool(path: &std::path::Path, args: &[&str], names: &[&str]) -> Option<media_json::Map> {
     let mut c = Command::new("exiftool");
     c.args(args);
     for n in names {
         c.arg(format!("-{n}"));
     }
     let o = c.arg("--").arg(path).output().ok()?;
-    let v: Value = serde_json::from_slice(&o.stdout).ok()?;
+    let v: Value = media_json::from_slice(&o.stdout).ok()?;
     let mut m = v.as_array()?.first()?.as_object()?.clone();
     m.remove("SourceFile");
     Some(m)

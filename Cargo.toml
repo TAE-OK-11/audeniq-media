@@ -48,7 +48,7 @@ rustc-hash = "2"
 siphasher = "1"
 skrifa = "0.46.0"
 smallvec = "1"
-vello_cpu = { version = "0.3", default-features = false, features = ["std", "png", "u8_pipeline"] }
+vello_cpu = { version = "0.3", default-features = false, features = ["std", "u8_pipeline"] }
 yoke = "0.8"
 
 [workspace.lints.rust]

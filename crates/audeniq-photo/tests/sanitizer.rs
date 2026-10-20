@@ -159,3 +159,41 @@ fn verify_image_rejects_corrupt_pixel_data_with_valid_headers() {
         Err(audeniq_photo::Error::Invalid(_))
     ));
 }
+
+/// JPEG to JPEG streams row groups through the encoder; the result must be
+/// the whole-image path's (`pixels` then `encode_jpeg` at q95 4:4:4),
+/// including inputs it hands back to that path (rotated, progressive).
+#[test]
+fn streamed_jpeg_sanitize_matches_whole_image_path() {
+    use audeniq_photo::{Image, Kind, PixelFormat};
+    let dl = audeniq_photo::Deadline::NONE;
+    let gradient = |w: u32, h: u32, format: PixelFormat| Image {
+        width: w,
+        height: h,
+        format,
+        data: (0..w as usize * h as usize * format.channels())
+            .map(|i| ((i * 13 + i / 5) % 256) as u8)
+            .collect(),
+    };
+    let mut inputs = Vec::new();
+    for (w, h) in [(1, 1), (17, 9), (64, 40), (130, 77)] {
+        for format in [PixelFormat::Gray8, PixelFormat::Rgb8] {
+            inputs.push(audeniq_photo::sanitize::encode_jpeg(&gradient(w, h, format), 85).unwrap());
+            inputs.push(audeniq_photo::sanitize::encode_jpeg(&gradient(w, h, format), 95).unwrap());
+        }
+    }
+    // An EXIF orientation (rotated: whole-image path) spliced in after SOI.
+    let mut rotated = inputs[5][..2].to_vec();
+    let exif = b"Exif\0\0MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0";
+    rotated.extend_from_slice(&[0xFF, 0xE1]);
+    rotated.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+    rotated.extend_from_slice(exif);
+    rotated.extend_from_slice(&inputs[5][2..]);
+    inputs.push(rotated);
+    for src in &inputs {
+        let whole = audeniq_photo::sanitize::pixels(src, &dl)
+            .and_then(|img| audeniq_photo::sanitize::encode_jpeg(&img, 95));
+        let streamed = audeniq_photo::sanitize(src, Kind::Jpeg, &dl);
+        assert_eq!(format!("{whole:?}"), format!("{streamed:?}"));
+    }
+}

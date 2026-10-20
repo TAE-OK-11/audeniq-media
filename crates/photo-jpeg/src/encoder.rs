@@ -281,182 +281,432 @@ impl Encoder {
     }
 
     pub fn encode(&self, img: &Image) -> Result<Vec<u8>> {
-        encode_any(self, img)
+        encode_whole(self, img)
+    }
+}
+
+/// Everything one MCU row of the encoder works on.
+struct EncState {
+    w: usize,
+    h: usize,
+    gray: bool,
+    hs: usize,
+    vs: usize,
+    ncomp: usize,
+    mcu_h: usize,
+    /// Per MCU row: full-resolution planes (edge-replicated), then
+    /// downsampled chroma.
+    planes: Vec<Vec<u8>>,
+    chroma: Vec<Vec<u8>>,
+    comps: Vec<Comp>,
+    bw: BitWriter,
+}
+
+/// Baseline encoder fed rows from top to bottom ([`Encoder::encode`] in
+/// pieces): memory is one MCU row of input plus the output, and the bytes
+/// are the same however the rows are split.
+pub struct RowEncoder {
+    st: EncState,
+    /// Input bytes per row (`width * channels`).
+    row_len: usize,
+    /// Rows of the current MCU row received so far.
+    band: Vec<u8>,
+    filled: usize,
+    /// Next MCU row, and rows received in total.
+    my: usize,
+    rows: usize,
+}
+
+impl RowEncoder {
+    /// Start a `width`×`height` Gray8 or Rgb8 image; writes the headers.
+    pub fn new(enc: Encoder, width: u32, height: u32, format: PixelFormat) -> Result<RowEncoder> {
+        let (p, out, comps) = start(enc, width, height, format)?;
+        let Params {
+            w,
+            h,
+            gray,
+            hs,
+            vs,
+            ncomp,
+        } = p;
+        let mcu_h = 8 * vs;
+        let pw = w.div_ceil(8 * hs) * 8 * hs;
+        let cw = pw / hs;
+        Ok(RowEncoder {
+            st: EncState {
+                w,
+                h,
+                gray,
+                hs,
+                vs,
+                ncomp,
+                mcu_h,
+                planes: vec![vec![0u8; pw * mcu_h]; ncomp],
+                chroma: vec![vec![0u8; cw * 8]; if gray { 0 } else { 2 }],
+                comps,
+                bw: BitWriter { out, buf: 0, n: 0 },
+            },
+            row_len: w * ncomp,
+            band: Vec::new(),
+            filled: 0,
+            my: 0,
+            rows: 0,
+        })
     }
 
-    /// The whole encoder, inlined into each instruction-set variant.
-    #[inline(always)]
-    fn encode_body(&self, img: &Image) -> Result<Vec<u8>> {
-        let gray = match img.format {
-            PixelFormat::Gray8 => true,
-            PixelFormat::Rgb8 => false,
-            _ => return Err(Error::Unsupported("JPEG input must be Gray8 or Rgb8")),
-        };
-        if img.width == 0 || img.height == 0 || img.width > 65_535 || img.height > 65_535 {
-            return Err(Error::Invalid("JPEG dimensions"));
+    /// Append whole rows (a multiple of `width * channels` bytes).
+    pub fn push_rows(&mut self, mut data: &[u8]) -> Result<()> {
+        if !data.len().is_multiple_of(self.row_len)
+            || self.rows + data.len() / self.row_len > self.st.h
+        {
+            return Err(Error::Invalid("JPEG encoder row count"));
         }
-        let (w, h) = (img.width as usize, img.height as usize);
-        let sub = if gray {
-            Subsampling::S444
-        } else {
-            self.subsampling
-        };
-        let (hs, vs) = if sub == Subsampling::S420 {
-            (2usize, 2usize)
-        } else {
-            (1, 1)
-        };
-        let ncomp = if gray { 1 } else { 3 };
-        let lum = quant_table(&STD_LUM, self.quality);
-        let chr = quant_table(&STD_CHR, self.quality);
+        self.rows += data.len() / self.row_len;
+        let mcu_h = self.st.mcu_h;
+        let band_len = mcu_h * self.row_len;
+        while !data.is_empty() {
+            if self.filled == 0 && data.len() >= band_len {
+                // A whole MCU row straight from the caller's buffer.
+                encode_rows(&mut self.st, self.my, &data[..band_len], mcu_h);
+                self.my += 1;
+                data = &data[band_len..];
+                continue;
+            }
+            let take = (band_len - self.filled * self.row_len).min(data.len());
+            self.band.extend_from_slice(&data[..take]);
+            self.filled += take / self.row_len;
+            data = &data[take..];
+            if self.filled == mcu_h {
+                encode_rows(&mut self.st, self.my, &self.band, self.filled);
+                self.my += 1;
+                self.band.clear();
+                self.filled = 0;
+            }
+        }
+        Ok(())
+    }
 
-        let mut out = Vec::with_capacity(w * h / 4 + 1024);
-        out.extend_from_slice(&[0xFF, 0xD8]);
-        // JFIF APP0: version 1.01, aspect 1:1, no thumbnail (jcmarker.c).
-        out.extend_from_slice(&[
-            0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0,
-        ]);
-        for (i, t) in [lum, chr].iter().enumerate().take(if gray { 1 } else { 2 }) {
-            out.extend_from_slice(&[0xFF, 0xDB, 0, 67, i as u8]);
-            for k in 0..64 {
-                out.push(t[ZIGZAG[k]] as u8);
-            }
+    /// Encode the last (partial) MCU row and return the file.
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        if self.rows != self.st.h {
+            return Err(Error::Invalid("JPEG encoder row count"));
         }
-        let sof_len = 8 + 3 * ncomp;
-        out.extend_from_slice(&[0xFF, 0xC0, 0, sof_len as u8, 8]);
-        out.extend_from_slice(&(h as u16).to_be_bytes());
-        out.extend_from_slice(&(w as u16).to_be_bytes());
-        out.push(ncomp as u8);
-        out.extend_from_slice(&[1, ((hs << 4) | vs) as u8, 0]);
-        if !gray {
-            out.extend_from_slice(&[2, 0x11, 1, 3, 0x11, 1]);
+        if self.filled > 0 {
+            encode_rows(&mut self.st, self.my, &self.band, self.filled);
         }
-        let tables: [(u8, &[u8; 16], &[u8]); 4] = [
-            (0x00, &DC_LUM_BITS, &DC_VALS),
-            (0x10, &AC_LUM_BITS, &AC_LUM_VALS),
-            (0x01, &DC_CHR_BITS, &DC_VALS),
-            (0x11, &AC_CHR_BITS, &AC_CHR_VALS),
-        ];
-        for (class, bits, vals) in tables.iter().take(if gray { 2 } else { 4 }) {
-            let len = 2 + 1 + 16 + vals.len();
-            out.extend_from_slice(&[0xFF, 0xC4]);
-            out.extend_from_slice(&(len as u16).to_be_bytes());
-            out.push(*class);
-            out.extend_from_slice(*bits);
-            out.extend_from_slice(vals);
-        }
-        let sos_len = 6 + 2 * ncomp;
-        out.extend_from_slice(&[0xFF, 0xDA, 0, sos_len as u8, ncomp as u8, 1, 0x00]);
-        if !gray {
-            out.extend_from_slice(&[2, 0x11, 3, 0x11]);
-        }
-        out.extend_from_slice(&[0, 63, 0]);
-
-        let mk = |qt: [u16; 64], dcb: &[u8; 16], acb: &[u8; 16], acv: &[u8]| Comp {
-            recip: std::array::from_fn(|i| reciprocal(u32::from(qt[i]) * 8).recip),
-            corr: std::array::from_fn(|i| reciprocal(u32::from(qt[i]) * 8).corr),
-            shift: std::array::from_fn(|i| reciprocal(u32::from(qt[i]) * 8).shift),
-            qt,
-            dc: huff_codes(dcb, &DC_VALS),
-            ac: huff_codes(acb, acv),
-            pred: 0,
-        };
-        let mut comps = vec![mk(lum, &DC_LUM_BITS, &AC_LUM_BITS, &AC_LUM_VALS)];
-        if !gray {
-            comps.push(mk(chr, &DC_CHR_BITS, &AC_CHR_BITS, &AC_CHR_VALS));
-            comps.push(mk(chr, &DC_CHR_BITS, &AC_CHR_BITS, &AC_CHR_VALS));
-        }
-        let _ = comps[0].qt;
-        let mut bw = BitWriter { out, buf: 0, n: 0 };
-
-        let mcu_w = 8 * hs;
-        let mcu_h = 8 * vs;
-        let mcus_x = w.div_ceil(mcu_w);
-        let mcus_y = h.div_ceil(mcu_h);
-        let pw = mcus_x * mcu_w;
-        // Per MCU row: full-resolution planes (edge-replicated), then
-        // downsampled chroma.
-        let mut planes = vec![vec![0u8; pw * mcu_h]; ncomp];
-        let cw = pw / hs;
-        let mut chroma = vec![vec![0u8; cw * 8]; if gray { 0 } else { 2 }];
-        for my in 0..mcus_y {
-            for ry in 0..mcu_h {
-                let sy = (my * mcu_h + ry).min(h - 1);
-                let src = &img.data[sy * w * ncomp..(sy + 1) * w * ncomp];
-                let row = ry * pw;
-                if gray {
-                    planes[0][row..row + w].copy_from_slice(src);
-                } else {
-                    let (p0, rest) = planes.split_at_mut(1);
-                    let (p1, p2) = rest.split_at_mut(1);
-                    rgb_to_ycc(
-                        src,
-                        &mut p0[0][row..row + w],
-                        &mut p1[0][row..row + w],
-                        &mut p2[0][row..row + w],
-                    );
-                }
-                for p in planes.iter_mut() {
-                    let edge = p[row + w - 1];
-                    p[row + w..row + pw].fill(edge);
-                }
-            }
-            if !gray {
-                for c in 0..2 {
-                    if hs == 2 {
-                        // h2v2_downsample: box average with alternating bias 1, 2.
-                        let p = &planes[c + 1];
-                        for oy in 0..8 {
-                            let r0 = &p[(2 * oy) * pw..(2 * oy + 1) * pw];
-                            let r1 = &p[(2 * oy + 1) * pw..(2 * oy + 2) * pw];
-                            let mut bias = 1u32;
-                            for ox in 0..cw {
-                                let s = u32::from(r0[2 * ox])
-                                    + u32::from(r0[2 * ox + 1])
-                                    + u32::from(r1[2 * ox])
-                                    + u32::from(r1[2 * ox + 1]);
-                                chroma[c][oy * cw + ox] = ((s + bias) >> 2) as u8;
-                                bias ^= 3;
-                            }
-                        }
-                    } else {
-                        chroma[c].copy_from_slice(&planes[c + 1][..cw * 8]);
-                    }
-                }
-            }
-            for mx in 0..mcus_x {
-                // libjpeg (jccoefct.c) codes blocks outside the component's
-                // real block grid as "dummy" blocks: zero AC, DC copied from
-                // the preceding block (row end: previous block; bottom row:
-                // the block just before the dummy row).
-                let mut last_dc = 0;
-                for v in 0..vs {
-                    let row_dc = last_dc;
-                    for hh in 0..hs {
-                        let (x0, y0) = (mx * mcu_w + hh * 8, v * 8);
-                        let real_row = my * vs + v < h.div_ceil(8);
-                        let real_col = mx * hs + hh < w.div_ceil(8);
-                        last_dc = if !real_row {
-                            encode_dc_only(&mut bw, &mut comps[0], row_dc)
-                        } else if !real_col {
-                            encode_dc_only(&mut bw, &mut comps[0], last_dc)
-                        } else {
-                            encode_block(&mut bw, &mut comps[0], &planes[0], pw, x0, y0)
-                        };
-                    }
-                }
-                if !gray {
-                    for c in 0..2 {
-                        let (x0, src) = (mx * 8, &chroma[c]);
-                        encode_block(&mut bw, &mut comps[c + 1], src, cw, x0, 0);
-                    }
-                }
-            }
-        }
-        bw.flush();
-        let mut out = bw.out;
+        self.st.bw.flush();
+        let mut out = self.st.bw.out;
         out.extend_from_slice(&[0xFF, 0xD9]);
         Ok(out)
+    }
+}
+
+photo_core::multiversion! {
+    /// Encode MCU row `my` from `rows` input rows (the image's last rows
+    /// repeat below the bottom edge).
+    fn encode_rows(st: &mut EncState, my: usize, band: &[u8], rows: usize) -> () = encode_mcu_row;
+}
+
+#[inline(always)]
+fn encode_mcu_row(st: &mut EncState, my: usize, band: &[u8], rows: usize) {
+    // Locals for the row, as in the whole-image encoder (the buffers and
+    // the bit writer then stay out of memory the stores may alias).
+    let mut planes = std::mem::take(&mut st.planes);
+    let mut chroma = std::mem::take(&mut st.chroma);
+    let mut comps = std::mem::take(&mut st.comps);
+    let mut bw = BitWriter {
+        out: std::mem::take(&mut st.bw.out),
+        buf: st.bw.buf,
+        n: st.bw.n,
+    };
+    mcu_row(
+        st.params(),
+        &mut planes,
+        &mut chroma,
+        &mut comps,
+        &mut bw,
+        my,
+        band,
+        rows,
+    );
+    st.bw = bw;
+    st.planes = planes;
+    st.chroma = chroma;
+    st.comps = comps;
+}
+
+photo_core::multiversion! {
+    fn encode_whole(e: &Encoder, img: &Image) -> Result<Vec<u8>> = encode_whole_body;
+}
+
+/// Validate the input, write the headers and build the component tables.
+fn start(
+    enc: Encoder,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+) -> Result<(Params, Vec<u8>, Vec<Comp>)> {
+    let gray = match format {
+        PixelFormat::Gray8 => true,
+        PixelFormat::Rgb8 => false,
+        _ => return Err(Error::Unsupported("JPEG input must be Gray8 or Rgb8")),
+    };
+    if width == 0 || height == 0 || width > 65_535 || height > 65_535 {
+        return Err(Error::Invalid("JPEG dimensions"));
+    }
+    let (w, h) = (width as usize, height as usize);
+    let sub = if gray {
+        Subsampling::S444
+    } else {
+        enc.subsampling
+    };
+    let (hs, vs) = if sub == Subsampling::S420 {
+        (2usize, 2usize)
+    } else {
+        (1, 1)
+    };
+    let ncomp = if gray { 1 } else { 3 };
+    let lum = quant_table(&STD_LUM, enc.quality);
+    let chr = quant_table(&STD_CHR, enc.quality);
+
+    let mut out = Vec::with_capacity(w * h / 4 + 1024);
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    // JFIF APP0: version 1.01, aspect 1:1, no thumbnail (jcmarker.c).
+    out.extend_from_slice(&[
+        0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0,
+    ]);
+    for (i, t) in [lum, chr].iter().enumerate().take(if gray { 1 } else { 2 }) {
+        out.extend_from_slice(&[0xFF, 0xDB, 0, 67, i as u8]);
+        for k in 0..64 {
+            out.push(t[ZIGZAG[k]] as u8);
+        }
+    }
+    let sof_len = 8 + 3 * ncomp;
+    out.extend_from_slice(&[0xFF, 0xC0, 0, sof_len as u8, 8]);
+    out.extend_from_slice(&(h as u16).to_be_bytes());
+    out.extend_from_slice(&(w as u16).to_be_bytes());
+    out.push(ncomp as u8);
+    out.extend_from_slice(&[1, ((hs << 4) | vs) as u8, 0]);
+    if !gray {
+        out.extend_from_slice(&[2, 0x11, 1, 3, 0x11, 1]);
+    }
+    let tables: [(u8, &[u8; 16], &[u8]); 4] = [
+        (0x00, &DC_LUM_BITS, &DC_VALS),
+        (0x10, &AC_LUM_BITS, &AC_LUM_VALS),
+        (0x01, &DC_CHR_BITS, &DC_VALS),
+        (0x11, &AC_CHR_BITS, &AC_CHR_VALS),
+    ];
+    for (class, bits, vals) in tables.iter().take(if gray { 2 } else { 4 }) {
+        let len = 2 + 1 + 16 + vals.len();
+        out.extend_from_slice(&[0xFF, 0xC4]);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+        out.push(*class);
+        out.extend_from_slice(*bits);
+        out.extend_from_slice(vals);
+    }
+    let sos_len = 6 + 2 * ncomp;
+    out.extend_from_slice(&[0xFF, 0xDA, 0, sos_len as u8, ncomp as u8, 1, 0x00]);
+    if !gray {
+        out.extend_from_slice(&[2, 0x11, 3, 0x11]);
+    }
+    out.extend_from_slice(&[0, 63, 0]);
+
+    let mk = |qt: [u16; 64], dcb: &[u8; 16], acb: &[u8; 16], acv: &[u8]| Comp {
+        recip: std::array::from_fn(|i| reciprocal(u32::from(qt[i]) * 8).recip),
+        corr: std::array::from_fn(|i| reciprocal(u32::from(qt[i]) * 8).corr),
+        shift: std::array::from_fn(|i| reciprocal(u32::from(qt[i]) * 8).shift),
+        qt,
+        dc: huff_codes(dcb, &DC_VALS),
+        ac: huff_codes(acb, acv),
+        pred: 0,
+    };
+    let mut comps = vec![mk(lum, &DC_LUM_BITS, &AC_LUM_BITS, &AC_LUM_VALS)];
+    if !gray {
+        comps.push(mk(chr, &DC_CHR_BITS, &AC_CHR_BITS, &AC_CHR_VALS));
+        comps.push(mk(chr, &DC_CHR_BITS, &AC_CHR_BITS, &AC_CHR_VALS));
+    }
+    let _ = comps[0].qt;
+    let p = Params {
+        w,
+        h,
+        gray,
+        hs,
+        vs,
+        ncomp,
+    };
+    Ok((p, out, comps))
+}
+
+/// [`Encoder::encode`]: headers as [`RowEncoder`], then every MCU row in
+/// one loop over the caller's buffer.
+#[inline(always)]
+fn encode_whole_body(e: &Encoder, img: &Image) -> Result<Vec<u8>> {
+    let (p, out, mut comps) = start(*e, img.width, img.height, img.format)?;
+    let row_len = p.w * p.ncomp;
+    let mcu_h = 8 * p.vs;
+    let pw = p.w.div_ceil(8 * p.hs) * 8 * p.hs;
+    let mut planes = vec![vec![0u8; pw * mcu_h]; p.ncomp];
+    let mut chroma = vec![vec![0u8; pw / p.hs * 8]; if p.gray { 0 } else { 2 }];
+    let mut bw = BitWriter { out, buf: 0, n: 0 };
+    let mcus_y = p.h.div_ceil(mcu_h);
+    for my in 0..mcus_y {
+        let y0 = my * mcu_h;
+        let rows = mcu_h.min(p.h - y0);
+        let band = &img.data[y0 * row_len..(y0 + rows) * row_len];
+        mcu_row(
+            p,
+            &mut planes,
+            &mut chroma,
+            &mut comps,
+            &mut bw,
+            my,
+            band,
+            rows,
+        );
+    }
+    bw.flush();
+    let mut out = bw.out;
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    Ok(out)
+}
+
+/// The fixed geometry of an encode (the rest is derived in [`mcu_row`]).
+#[derive(Clone, Copy)]
+struct Params {
+    w: usize,
+    h: usize,
+    gray: bool,
+    hs: usize,
+    vs: usize,
+    ncomp: usize,
+}
+
+impl EncState {
+    fn params(&self) -> Params {
+        Params {
+            w: self.w,
+            h: self.h,
+            gray: self.gray,
+            hs: self.hs,
+            vs: self.vs,
+            ncomp: self.ncomp,
+        }
+    }
+}
+
+/// Encode MCU row `my` from `rows` input rows of `band` (rows below the
+/// image repeat its last row).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn mcu_row(
+    p: Params,
+    planes: &mut [Vec<u8>],
+    chroma: &mut [Vec<u8>],
+    comps: &mut [Comp],
+    bw: &mut BitWriter,
+    my: usize,
+    band: &[u8],
+    rows: usize,
+) {
+    let Params {
+        w,
+        h,
+        gray,
+        hs,
+        vs,
+        ncomp,
+    } = p;
+    // Derived here (not read from `p`) so the compiler sees how the sizes
+    // relate (e.g. 2 * cw <= pw) and drops bounds checks.
+    let mcu_w = 8 * hs;
+    let mcu_h = 8 * vs;
+    let mcus_x = w.div_ceil(mcu_w);
+    let pw = mcus_x * mcu_w;
+    let cw = pw / hs;
+    // Re-sliced to their known lengths (checked once per MCU row) so the
+    // per-block indexing below needs no bounds checks.
+    let planes = &mut planes[..ncomp];
+    let chroma = &mut chroma[..if gray { 0 } else { 2 }];
+    let comps = &mut comps[..ncomp];
+    for ry in 0..mcu_h {
+        // Rows below the image repeat its last row.
+        let sy = ry.min(rows - 1);
+        let src = &band[sy * w * ncomp..(sy + 1) * w * ncomp];
+        let row = ry * pw;
+        if gray {
+            planes[0][row..row + w].copy_from_slice(src);
+        } else {
+            let (p0, rest) = planes.split_at_mut(1);
+            let (p1, p2) = rest.split_at_mut(1);
+            rgb_to_ycc(
+                src,
+                &mut p0[0][row..row + w],
+                &mut p1[0][row..row + w],
+                &mut p2[0][row..row + w],
+            );
+        }
+        for p in planes.iter_mut() {
+            let edge = p[row + w - 1];
+            p[row + w..row + pw].fill(edge);
+        }
+    }
+    if !gray {
+        for c in 0..2 {
+            if hs == 2 {
+                // h2v2_downsample: box average with alternating bias 1, 2.
+                let p = &planes[c + 1];
+                // Spelled out so the compiler sees 2 * cw == pw here.
+                let cw = pw / 2;
+                // Plain slices in the loop (no Vec headers to reload).
+                let dst = &mut chroma[c][..cw * 8];
+                for oy in 0..8 {
+                    let r0 = &p[(2 * oy) * pw..(2 * oy + 1) * pw];
+                    let r1 = &p[(2 * oy + 1) * pw..(2 * oy + 2) * pw];
+                    let mut bias = 1u32;
+                    for ox in 0..cw {
+                        let s = u32::from(r0[2 * ox])
+                            + u32::from(r0[2 * ox + 1])
+                            + u32::from(r1[2 * ox])
+                            + u32::from(r1[2 * ox + 1]);
+                        dst[oy * cw + ox] = ((s + bias) >> 2) as u8;
+                        bias ^= 3;
+                    }
+                }
+            } else {
+                chroma[c].copy_from_slice(&planes[c + 1][..cw * 8]);
+            }
+        }
+    }
+    // Chroma rows as plain slices, read once instead of per block.
+    let (cb, cr): (&[u8], &[u8]) = match &*chroma {
+        [cb, cr] => (cb, cr),
+        _ => (&[], &[]),
+    };
+    for mx in 0..mcus_x {
+        // libjpeg (jccoefct.c) codes blocks outside the component's
+        // real block grid as "dummy" blocks: zero AC, DC copied from
+        // the preceding block (row end: previous block; bottom row:
+        // the block just before the dummy row).
+        let mut last_dc = 0;
+        for v in 0..vs {
+            let row_dc = last_dc;
+            for hh in 0..hs {
+                let (x0, y0) = (mx * mcu_w + hh * 8, v * 8);
+                let real_row = my * vs + v < h.div_ceil(8);
+                let real_col = mx * hs + hh < w.div_ceil(8);
+                last_dc = if !real_row {
+                    encode_dc_only(bw, &mut comps[0], row_dc)
+                } else if !real_col {
+                    encode_dc_only(bw, &mut comps[0], last_dc)
+                } else {
+                    encode_block(bw, &mut comps[0], &planes[0], pw, x0, y0)
+                };
+            }
+        }
+        if !gray {
+            encode_block(bw, &mut comps[1], cb, cw, mx * 8, 0);
+            encode_block(bw, &mut comps[2], cr, cw, mx * 8, 0);
+        }
     }
 }
 
@@ -559,10 +809,6 @@ fn magnitude(v: i32) -> (u32, u32) {
     let nbits = 32 - v.unsigned_abs().leading_zeros();
     let bits = (v + (v >> 31)) as u32;
     (nbits, bits & ((1u64 << nbits) - 1) as u32)
-}
-
-photo_core::multiversion! {
-    fn encode_any(e: &Encoder, img: &Image) -> Result<Vec<u8>> = Encoder::encode_body;
 }
 
 /// Encode with the given quality and chroma subsampling.

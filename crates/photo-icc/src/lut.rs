@@ -32,17 +32,18 @@ impl Clut {
         {
             return Err(Error::Invalid("CLUT shape"));
         }
-        let mut opta = vec![0usize; inputs];
-        opta[0] = outputs;
-        for i in 1..inputs {
-            opta[i] = opta[i - 1] * grid[inputs - i];
-        }
         let n = grid
             .iter()
             .try_fold(outputs, |acc, &g| acc.checked_mul(g))
             .ok_or(Error::Limit("CLUT size"))?;
         if n != table.len() {
             return Err(Error::Invalid("CLUT size"));
+        }
+        // Partial products of `n`: no overflow once `n` is known.
+        let mut opta = vec![0usize; inputs];
+        opta[0] = outputs;
+        for i in 1..inputs {
+            opta[i] = opta[i - 1] * grid[inputs - i];
         }
         Ok(Clut {
             inputs,
@@ -75,7 +76,7 @@ impl Clut {
         let (a, b) = (k0 * o, (k0 + 1) * o);
         for i in 0..self.outputs {
             let (l, h) = (i32::from(self.table[a + i]), i32::from(self.table[b + i]));
-            out[i] = ((((h - l) * rk + 0x8000) >> 16) + l) as u16;
+            out[i] = lerp16(l, h, rk);
         }
     }
 
@@ -142,13 +143,19 @@ impl Clut {
             } else {
                 (0, 0, 0)
             };
-            let rest = c1 * rx + c2 * ry + c3 * rz;
+            // lcms computes these in C `int`, where steep tables overflow
+            // (c * r reaches 65535^2); the results are defined by its
+            // two's-complement wrap, which is reproduced exactly here.
+            let rest = c1
+                .wrapping_mul(rx)
+                .wrapping_add(c2.wrapping_mul(ry))
+                .wrapping_add(c3.wrapping_mul(rz));
             *o = if eval4_rounding {
-                let f = rest + ((rest + 0x7FFF) / 0xFFFF);
-                (c0 + ((f + 0x8000) >> 16)) as u16
+                let f = rest.wrapping_add(rest.wrapping_add(0x7FFF) / 0xFFFF);
+                c0.wrapping_add(f.wrapping_add(0x8000) >> 16) as u16
             } else {
-                let rest = rest + 0x8001;
-                (c0 + ((rest + (rest >> 16)) >> 16)) as u16
+                let rest = rest.wrapping_add(0x8001);
+                c0.wrapping_add(rest.wrapping_add(rest >> 16) >> 16) as u16
             };
         }
     }
@@ -166,7 +173,7 @@ impl Clut {
         self.tetrahedral(&input[1..4], k1, &mut t2, true);
         for i in 0..self.outputs {
             let (l, h) = (i32::from(t1[i]), i32::from(t2[i]));
-            out[i] = ((((h - l) * rk + 0x8000) >> 16) + l) as u16;
+            out[i] = lerp16(l, h, rk);
         }
     }
 
@@ -199,6 +206,13 @@ impl Clut {
             *o = saturate_word(a);
         }
     }
+}
+
+/// lcms linear interpolation of 16-bit samples by a 16.16 fraction, with
+/// its C `int` wrap made explicit ((h - l) * rk can exceed i32).
+#[inline(always)]
+fn lerp16(l: i32, h: i32, rk: i32) -> u16 {
+    ((h - l).wrapping_mul(rk).wrapping_add(0x8000) >> 16).wrapping_add(l) as u16
 }
 
 #[derive(Debug, Clone)]
@@ -406,5 +420,28 @@ impl Lut {
             *x = c.eval(*x);
         }
         out[..self.outputs].copy_from_slice(&v[..self.outputs]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Clut;
+
+    /// A full-range step between grid nodes overflows lcms's `int`
+    /// interpolation; the port must wrap like lcms, not panic.
+    #[test]
+    fn steep_tables_wrap_like_lcms() {
+        for inputs in [1usize, 3, 4] {
+            let n = 1 << inputs;
+            let mut table = vec![0u16; n];
+            table[n - 1] = 0xFFFF;
+            let clut = Clut::new(vec![2; inputs], 1, table).unwrap();
+            let mut out = [0u16; 1];
+            for v in [0u16, 1, 0x7FFF, 0x8000, 0xFFFE, 0xFFFF] {
+                clut.eval16(&vec![v; inputs], &mut out);
+            }
+            clut.eval16(&vec![0xFFFF; inputs], &mut out);
+            assert_eq!(out[0], 0xFFFF);
+        }
     }
 }

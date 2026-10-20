@@ -34,6 +34,11 @@ impl HuffTable {
         let mut p = 0usize;
         for l in 1..=16usize {
             let n = counts[l - 1] as usize;
+            // Codes must fit in `l` bits (otherwise the table is
+            // over-subscribed); checked before the lookup table is filled.
+            if code as usize + n > 1 << l {
+                return Err(Error::Invalid("bad Huffman table"));
+            }
             if n > 0 {
                 t.valoffset[l] = p as i32 - code as i32;
                 for _ in 0..n {
@@ -48,10 +53,6 @@ impl HuffTable {
                     p += 1;
                 }
                 t.maxcode[l] = code as i32 - 1;
-            }
-            // Codes must fit in `l` bits (otherwise the table is over-subscribed).
-            if code > (1 << l) {
-                return Err(Error::Invalid("bad Huffman table"));
             }
             code <<= 1;
         }
@@ -263,5 +264,21 @@ impl<'a> BitReader<'a> {
         }
         self.pos = at + 2;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod oversubscribed {
+    use super::HuffTable;
+
+    /// Found by fuzzing: more 2-bit codes than fit used to index past the
+    /// lookup table before the table was rejected.
+    #[test]
+    fn rejected_before_filling_the_lookup() {
+        let mut counts = [0u8; 16];
+        counts[1] = 5;
+        assert!(HuffTable::new(&counts, &[0; 5]).is_err());
+        counts[1] = 4;
+        assert!(HuffTable::new(&counts, &[0; 4]).is_ok());
     }
 }

@@ -5,6 +5,8 @@ on:
 permissions:
   contents: read
 jobs:
+  # Every crate of the media engine (audio, photo and the shared crates),
+  # with the reference tools the parity tests compare against.
   test:
     runs-on: ubuntu-24.04
     steps:
@@ -19,19 +21,22 @@ jobs:
           toolchain: "1.98.1"
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo build --release --workspace
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p audeniq-qc
+      - run: cargo build --profile release-photo --locked -p photo-cli
+      - run: |
+          target/release/audeniq-qc capabilities
+          target/release-photo/audeniq-photo --version
 
-
-  hash-arm:
+  shared-arm:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98.1"
-      - run: cargo test -p media-hash -p photo-deflate -p photo-png --lib
-      - run: cargo test -p photo-png --test qc_crc
-      - run: cargo test -p media-hash --no-default-features
-      - run: cargo check -p media-hash --no-default-features
+      - run: cargo test --locked -p media-hash -p media-json -p photo-deflate -p photo-png --lib
+      - run: cargo test --locked -p photo-png --test qc_crc
+      - run: cargo test --locked -p media-hash --no-default-features
+      - run: cargo check --locked -p media-hash --no-default-features

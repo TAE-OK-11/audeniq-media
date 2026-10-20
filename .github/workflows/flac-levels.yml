@@ -2,6 +2,8 @@ name: FLAC levels on the IETF corpus
 on:
   push:
     paths:
+      - crates/media-hash/**
+      - crates/media-json/**
       - crates/audeniq-qc/src/flac.rs
       - crates/audeniq-qc/src/flac_decode.rs
       - crates/audeniq-qc/src/kernels.rs

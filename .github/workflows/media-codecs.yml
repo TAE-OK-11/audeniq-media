@@ -4,6 +4,8 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - crates/media-hash/**
+      - crates/media-json/**
       - crates/audeniq-qc/src/**
       - crates/audeniq-qc-tools/**
       - crates/audeniq-qc/tests/**
@@ -28,17 +30,17 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg time
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - run: cargo clippy --workspace --features audeniq-qc/reference-codecs --locked --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo test --workspace --features audeniq-qc/reference-codecs --locked --target-dir reference-target
-      - run: cargo build --workspace --release --locked
+      - run: cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked --all-targets -- -D warnings
+      - run: cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --features audeniq-qc/reference-codecs --locked --all-targets -- -D warnings
+      - run: cargo test -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked
+      - run: cargo test -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --features audeniq-qc/reference-codecs --locked --target-dir reference-target
+      - run: cargo build -p audeniq-qc -p audeniq-qc-tools --release --locked
       - run: cargo build -p audeniq-qc --release --features reference-codecs --locked --target-dir reference-target
       - name: Identify both builds
         run: |
           target/release/audeniq-qc capabilities
           reference-target/release/audeniq-qc capabilities
-          cargo tree --locked -e normal
+          cargo tree -p audeniq-qc --locked -e normal
       - name: Native and reference qualification
         run: |
           target/release/audeniq-qc-tools qualify --output qualification-native.json
@@ -54,7 +56,7 @@ jobs:
       - name: Build native predecessor and diagnostic build
         run: |
           cargo build --manifest-path predecessor/Cargo.toml --release --locked --target-dir predecessor-target
-          cargo clippy --workspace --features audeniq-qc/profile-native --locked --all-targets -- -D warnings
+          cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --features audeniq-qc/profile-native --locked --all-targets -- -D warnings
           cargo build -p audeniq-qc --features profile-native --release --locked --target-dir profile-target
       - name: Same-host native before and after comparisons
         run: |

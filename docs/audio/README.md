@@ -1,10 +1,10 @@
 # audeniq-qc
 
-AUDENIQ 전용 Rust 오디오 엔진. 실제 AUDENIQ 소스의 FFmpeg·FFprobe·LUFS 사용처를 [먼저 조사](docs/AUDIT.md)하고, 필요한 무손실 처리와 QC만 구현했습니다. 런타임 FFmpeg·libav* 의존성이 없고 미디어 처리 경로는 Rust로 동작합니다.
+AUDENIQ 전용 Rust 오디오 엔진. 실제 AUDENIQ 소스의 FFmpeg·FFprobe·LUFS 사용처를 [먼저 조사](AUDIT.md)하고, 필요한 무손실 처리와 QC만 구현했습니다. 런타임 FFmpeg·libav* 의존성이 없고 미디어 처리 경로는 Rust로 동작합니다.
 
-독립 엔진 구현과 최적화, EPYC 7763(Zen3)·Arm 검증 결과를 공개합니다. 요청에 따라 백엔드 연결·배포·지문 이관은 작업 범위에서 제외합니다. 전체 공식 EBU 파일 세트, 실제 음악 코퍼스, 실제 배포 장비의 부하 검증은 별도입니다. 현재 검증 범위와 측정의 한계는 [VALIDATION.md](docs/VALIDATION.md)를 참조하세요.
+독립 엔진 구현과 최적화, EPYC 7763(Zen3)·Arm 검증 결과를 공개합니다. 요청에 따라 백엔드 연결·배포·지문 이관은 작업 범위에서 제외합니다. 전체 공식 EBU 파일 세트, 실제 음악 코퍼스, 실제 배포 장비의 부하 검증은 별도입니다. 현재 검증 범위와 측정의 한계는 [VALIDATION.md](VALIDATION.md)를 참조하세요.
 
-최우선 대상은 **AWS Graviton4의 WAV/ALAC → FLAC와 심사용 QC**입니다. 변환 중 QC·선택적 지문을 함께 계산하는 경로, Arm NEON 필터/정수 비용 계산, 복사·버퍼 개선을 추가했습니다. 같은 러너에서 이전 엔진과 비교한 결과 및 Graviton4 재현 명령은 [GRAVITON4.md](docs/GRAVITON4.md)에 기록합니다. 현재 Arm CI는 Neoverse N2이며 Graviton4 실측으로 표시하지 않습니다.
+최우선 대상은 **AWS Graviton4의 WAV/ALAC → FLAC와 심사용 QC**입니다. 변환 중 QC·선택적 지문을 함께 계산하는 경로, Arm NEON 필터/정수 비용 계산, 복사·버퍼 개선을 추가했습니다. 같은 러너에서 이전 엔진과 비교한 결과 및 Graviton4 재현 명령은 [GRAVITON4.md](GRAVITON4.md)에 기록합니다. 현재 Arm CI는 Neoverse N2이며 Graviton4 실측으로 표시하지 않습니다.
 
 ## 구현 범위
 
@@ -21,7 +21,7 @@ AUDENIQ 전용 Rust 오디오 엔진. 실제 AUDENIQ 소스의 FFmpeg·FFprobe·
 
 1~2채널, 16/24-bit 정수, 44100~192000Hz가 경계입니다. 비디오, 네트워크, 손실 코덱, float/32-bit PCM, hybrid/DSD/float WavPack, fragmented MP4는 지원하지 않습니다. RF64 확장 ds64 테이블과 샘플 수가 선언되지 않은 FLAC도 지원하지 않습니다. 지원 불가나 손상은 오류이며 부분 성공으로 처리하지 않습니다.
 
-기본 빌드의 FLAC/ALAC/TTA/WavPack 디코더와 FLAC 인코더는 고정한 FFmpeg 소스를 참고/포팅한 자체 Rust 경로입니다. WAV/AIFF 및 제한된 단일 ALAC 트랙 M4A 컨테이너도 자체 처리합니다. 기존 Symphonia 코덱은 `--features reference-codecs` 비교 빌드에만 남깁니다. JSON·SHA-256·MD5·CRC32·JPEG/PNG 검증도 자체 구현이며 기본 빌드에는 외부 크레이트가 없습니다(기존 라이브러리는 테스트 비교용 dev-dependency로만 남김). [출처와 라이선스](THIRD_PARTY.md)를 유지합니다.
+기본 빌드의 FLAC/ALAC/TTA/WavPack 디코더와 FLAC 인코더는 고정한 FFmpeg 소스를 참고/포팅한 자체 Rust 경로입니다. WAV/AIFF 및 제한된 단일 ALAC 트랙 M4A 컨테이너도 자체 처리합니다. 기존 Symphonia 코덱은 `--features reference-codecs` 비교 빌드에만 남깁니다. JSON·SHA-256·MD5·CRC32·JPEG/PNG 검증도 자체 구현이며 기본 빌드에는 외부 크레이트가 없습니다(기존 라이브러리는 테스트 비교용 dev-dependency로만 남김). [출처와 라이선스](../../THIRD_PARTY.md)를 유지합니다.
 
 ## 사용
 
@@ -67,21 +67,21 @@ target/release/audeniq-qc tags master.wv
 | 7 | 12 / 32 | 추정 + 최고 차수 | 8 | 2 | 67,137,764 (68,224,152) |
 | 8 | 12 / 32 | 추정 ±2 + 최고 차수 | 8 | 4 | 67,123,667 (67,939,273) |
 
-LPC 계수는 13-bit로 양자화합니다. Levinson-Durbin 오차로 차수별 크기를 추정하고(잔차 log2(오차)/2 비트 + 워밍업·계수 비트), 추정이 가장 작은 차수만 전체 샘플에서 정확히 계산합니다. 스테레오 배치(L/R, L/S, S/R, M/S)는 블록 가운데 절반의 4차 Levinson 추정으로 순위를 매깁니다. 코퍼스는 IETF CELLAR FLAC 테스트 파일 중 지원 규격 49곡(CC0)이며 [라운드 13~14](docs/BENCHMARK-VERIFIED-PIPELINE.md#round-14-streamable-subset-stereo-estimate-and-block-size)에 측정 조건과 기각한 가설을 기록했습니다.
+LPC 계수는 13-bit로 양자화합니다. Levinson-Durbin 오차로 차수별 크기를 추정하고(잔차 log2(오차)/2 비트 + 워밍업·계수 비트), 추정이 가장 작은 차수만 전체 샘플에서 정확히 계산합니다. 스테레오 배치(L/R, L/S, S/R, M/S)는 블록 가운데 절반의 4차 Levinson 추정으로 순위를 매깁니다. 코퍼스는 IETF CELLAR FLAC 테스트 파일 중 지원 규격 49곡(CC0)이며 [라운드 13~14](BENCHMARK-VERIFIED-PIPELINE.md#round-14-streamable-subset-stereo-estimate-and-block-size)에 측정 조건과 기각한 가설을 기록했습니다.
 
 모든 레벨에서 PCM SHA-256을 계산하고 모든 프레임을 원본과 비교 검증한 뒤 게시합니다. 예측 모델 선택은 압축률에만 영향을 주며 PCM 복원에는 영향을 주지 않습니다. 입력마다 압축률이 달라지며 높은 레벨이 항상 더 작은 파일을 만드는 것은 아닙니다. 손실 압축, 샘플레이트 변경, bit depth 축소, ALAC/WavPack/TTA 인코딩은 구현 범위에 포함하지 않습니다.
 
-`src/lib.rs`의 공개 Rust API도 있습니다. 업로드 파일을 다루는 AUDENIQ에서는 CLI를 기존 Linux parser sandbox 안에서 실행해야 합니다. 라이브러리를 워커 내부에서 직접 호출하여 격리를 없애면 안 됩니다. 세부 연결 조건은 [INTEGRATION.md](docs/INTEGRATION.md)에 기록합니다.
+`src/lib.rs`의 공개 Rust API도 있습니다. 업로드 파일을 다루는 AUDENIQ에서는 CLI를 기존 Linux parser sandbox 안에서 실행해야 합니다. 라이브러리를 워커 내부에서 직접 호출하여 격리를 없애면 안 됩니다. 세부 연결 조건은 [INTEGRATION.md](INTEGRATION.md)에 기록합니다.
 
 ## 정확도와 측정
 
-[인코더·외부 의존성 자체화 조사](docs/DEPENDENCY-AUDIT.md)에 이미 자체 구현한 부분, MD5/SHA-256/CRC32/JPEG/PNG/JSON 자체화 경과와 측정 결과([검증 파이프라인 벤치마크](docs/BENCHMARK-VERIFIED-PIPELINE.md) 라운드 4~8)를 정리했습니다.
+[인코더·외부 의존성 자체화 조사](DEPENDENCY-AUDIT.md)에 이미 자체 구현한 부분, MD5/SHA-256/CRC32/JPEG/PNG/JSON 자체화 경과와 측정 결과([검증 파이프라인 벤치마크](BENCHMARK-VERIFIED-PIPELINE.md) 라운드 4~8)를 정리했습니다.
 
-[FFmpeg·자체·일부 외부 코덱 3개 재측정](docs/BENCHMARK-THREEWAY-RERUN.md)을 N2와 EPYC 9V74에서 완료했습니다. WAV/ALAC 변환, QC, 변환+QC의 CPU·처리 시간·RAM·파일 크기와 반복 원시값을 공개합니다. 이번 x86 결과는 이전 EPYC 7763 Zen3 측정과 구분합니다.
+[FFmpeg·자체·일부 외부 코덱 3개 재측정](BENCHMARK-THREEWAY-RERUN.md)을 N2와 EPYC 9V74에서 완료했습니다. WAV/ALAC 변환, QC, 변환+QC의 CPU·처리 시간·RAM·파일 크기와 반복 원시값을 공개합니다. 이번 x86 결과는 이전 EPYC 7763 Zen3 측정과 구분합니다.
 
-최신 [자체 코덱·컨테이너 병목 개선 결과](docs/NATIVE-BOTTLENECKS.md)는 `b8918279`를 Neoverse N2와 EPYC 7763에서 검증했습니다. 같은 서버의 이전 자체 구현 대비 ALAC 디코딩 CPU는 각각 21.1%/19.2%, ALAC→FLAC은 8.5%/8.1%, 변환+QC는 7.0%/5.6% 감소했습니다. WAV 변환 CPU는 거의 같았습니다. 복사·버퍼 생성 감소, 제거한 느린 SIMD 후보, 남은 느린 경로와 전체 원시 반복을 함께 공개합니다. N2 측정은 Graviton4 실측을 대신하지 않습니다.
+최신 [자체 코덱·컨테이너 병목 개선 결과](NATIVE-BOTTLENECKS.md)는 `b8918279`를 Neoverse N2와 EPYC 7763에서 검증했습니다. 같은 서버의 이전 자체 구현 대비 ALAC 디코딩 CPU는 각각 21.1%/19.2%, ALAC→FLAC은 8.5%/8.1%, 변환+QC는 7.0%/5.6% 감소했습니다. WAV 변환 CPU는 거의 같았습니다. 복사·버퍼 생성 감소, 제거한 느린 SIMD 후보, 남은 느린 경로와 전체 원시 반복을 함께 공개합니다. N2 측정은 Graviton4 실측을 대신하지 않습니다.
 
-[이전 WAV/ALAC 비교](docs/BENCHMARK-WAV-ALAC.md)는 당시 구현의 기록이며 최신 결과는 위 보고서를 기준으로 확인하세요.
+[이전 WAV/ALAC 비교](BENCHMARK-WAV-ALAC.md)는 당시 구현의 기록이며 최신 결과는 위 보고서를 기준으로 확인하세요.
 
 ```sh
 # FFmpeg는 아래 개발/검증 명령에서만 사용합니다.
@@ -99,12 +99,12 @@ target/release/audeniq-qc-tools benchmark-review --seconds 120 --repeats 5 --fin
 
 엔진과 개발 도구 모두 Rust입니다. 일반 `cargo build --release --locked`는 엔진만 빌드합니다. `--workspace`를 지정하면 별도 개발 도구도 빌드합니다. 개발 검증은 비교 기준인 FFmpeg, Linux 자원 측정은 GNU time이 필요합니다. `AUDENIQ_GNU_TIME`으로 GNU time 경로를 지정할 수 있습니다. 테스트 난수는 고정 시드 SplitMix64이며, 도구의 메모리는 측정 대상 엔진의 RSS에 포함하지 않습니다.
 
-[PCM·변환·손상·태그 비교](docs/qualification.json)와 [EBU 설명을 따라 합성한 기준 테스트](docs/standards-synthesized.json)를 공개합니다. 합성 테스트는 공식 파일 세트 인증을 대신하지 않습니다. LUFS와 지문 리샘플러는 버전이 명시되며, 지문 PCM은 FFmpeg 기본값과 비트 단위로 같지 않습니다. True Peak는 ITU-R BS.1770-5 Annex 2의 공개 FIR 계수를 사용합니다. 백색 잡음의 FFmpeg 비교 차이도 결과에 기록되어 있습니다.
+[PCM·변환·손상·태그 비교](qualification.json)와 [EBU 설명을 따라 합성한 기준 테스트](standards-synthesized.json)를 공개합니다. 합성 테스트는 공식 파일 세트 인증을 대신하지 않습니다. LUFS와 지문 리샘플러는 버전이 명시되며, 지문 PCM은 FFmpeg 기본값과 비트 단위로 같지 않습니다. True Peak는 ITU-R BS.1770-5 Annex 2의 공개 FIR 계수를 사용합니다. 백색 잡음의 FFmpeg 비교 차이도 결과에 기록되어 있습니다.
 
-이전 독립 엔진의 [x86 원시 측정](docs/benchmark-ci-x86.json), [Arm 원시 측정](docs/benchmark-ci-arm.json), [검증 조건](docs/VALIDATION.md)과 최신 [Arm 우선 최적화 결과](docs/GRAVITON4.md)를 공개합니다. 양쪽 모두 디코딩+LUFS/True Peak+PCM SHA-256을 수행합니다. native는 추가 QC 지표도 계산합니다. 지문을 포함한 분석과 검증한 FLAC 변환도 각각 측정합니다. CPU 시간은 user+system, 메모리는 프로세스 최대 RSS이며, AUDENIQ 전체 파이프라인 속도 향상 수치는 아닙니다.
+이전 독립 엔진의 [x86 원시 측정](benchmark-ci-x86.json), [Arm 원시 측정](benchmark-ci-arm.json), [검증 조건](VALIDATION.md)과 최신 [Arm 우선 최적화 결과](GRAVITON4.md)를 공개합니다. 양쪽 모두 디코딩+LUFS/True Peak+PCM SHA-256을 수행합니다. native는 추가 QC 지표도 계산합니다. 지문을 포함한 분석과 검증한 FLAC 변환도 각각 측정합니다. CPU 시간은 user+system, 메모리는 프로세스 최대 RSS이며, AUDENIQ 전체 파이프라인 속도 향상 수치는 아닙니다.
 
-Zen3에서는 AVX2, AArch64에서는 NEON을 사용하며, 전역 `target-cpu=native`나 LTO 변경에 의존하지 않습니다. [EPYC 7763 실행](docs/benchmark-zen3-7763.json)에서도 AVX2 경로를 검증했습니다. GitHub 러너의 실제 CPU는 실행마다 달라질 수 있으므로 각 결과의 CPU 식별자·소스 커밋·선택한 커널을 확인하세요. Arm CPU의 세대/제품명이 확인되지 않아 요청한 Arm 4세대 장비로 표시하지 않습니다. 배포할 장비에서도 위 명령으로 다시 측정할 수 있습니다.
+Zen3에서는 AVX2, AArch64에서는 NEON을 사용하며, 전역 `target-cpu=native`나 LTO 변경에 의존하지 않습니다. [EPYC 7763 실행](benchmark-zen3-7763.json)에서도 AVX2 경로를 검증했습니다. GitHub 러너의 실제 CPU는 실행마다 달라질 수 있으므로 각 결과의 CPU 식별자·소스 커밋·선택한 커널을 확인하세요. Arm CPU의 세대/제품명이 확인되지 않아 요청한 Arm 4세대 장비로 표시하지 않습니다. 배포할 장비에서도 위 명령으로 다시 측정할 수 있습니다.
 
 ## 라이선스
 
-FFmpeg 번역 코드를 포함하므로 LGPL-2.1-or-later입니다. 최적화/재작성 후에도 출처와 해당 의무가 유지됩니다. Rust 의존성에는 MPL-2.0, MIT, Apache-2.0 등이 적용됩니다. [LICENSE](LICENSE), [THIRD_PARTY.md](THIRD_PARTY.md)를 참조하세요.
+FFmpeg 번역 코드를 포함하므로 LGPL-2.1-or-later입니다. 최적화/재작성 후에도 출처와 해당 의무가 유지됩니다. Rust 의존성에는 MPL-2.0, MIT, Apache-2.0 등이 적용됩니다. [LICENSE](../../LICENSE), [THIRD_PARTY.md](../../THIRD_PARTY.md)를 참조하세요.

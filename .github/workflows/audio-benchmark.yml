@@ -3,10 +3,10 @@ on:
   push:
     paths:
       - .github/workflows/audio-benchmark.yml
-      - src/flac.rs
-      - src/audio.rs
-      - src/bits.rs
-      - src/kernels.rs
+      - crates/audeniq-qc/src/flac.rs
+      - crates/audeniq-qc/src/audio.rs
+      - crates/audeniq-qc/src/bits.rs
+      - crates/audeniq-qc/src/kernels.rs
   workflow_dispatch:
 permissions:
   contents: read

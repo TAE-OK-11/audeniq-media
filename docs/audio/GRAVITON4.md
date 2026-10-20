@@ -70,7 +70,7 @@ FFmpeg도 한 번의 입력 decode에서 FLAC·입력 hash·ebur128/True Peak를
 Graviton4 arm64 Linux에서 아래처럼 실행합니다. FFmpeg와 GNU time은 개발용 비교 도구에만 필요합니다.
 
 ```sh
-cargo build --workspace --release --locked
+cargo build -p audeniq-qc -p audeniq-qc-tools --release --locked
 target/release/audeniq-qc capabilities
 target/release/audeniq-qc-tools qualify --output qualification.json
 target/release/audeniq-qc-tools standards --output standards.json
@@ -85,7 +85,7 @@ target/release/audeniq-qc-tools benchmark-review --seconds 240 --repeats 7 --fin
 최적화는 기본 portable 빌드에서도 작동합니다. Graviton4 전용 배포라면 별도 디렉터리에서 아래 빌드의 추가 효과도 비교할 수 있습니다. LLVM의 Neoverse V2 instruction scheduling을 요청하는 보조 설정이며, 위 SIMD·복사·중복 작업 개선의 대체물이 아닙니다. 이 전용 빌드의 성능 수치는 아직 측정하지 않았습니다.
 
 ```sh
-RUSTFLAGS="-C target-cpu=neoverse-v2" CARGO_TARGET_DIR=target/graviton4 cargo build --workspace --release --locked
+RUSTFLAGS="-C target-cpu=neoverse-v2" CARGO_TARGET_DIR=target/graviton4 cargo build -p audeniq-qc -p audeniq-qc-tools --release --locked
 ```
 
 [AWS의 Rust 가이드](https://aws.github.io/graviton/rust.html)는 arm64의 기본 outline atomics와 Graviton의 LSE 지원을 설명합니다. 이 엔진의 공유 atomic은 파일 이름 카운터 정도이며, mutex/atomic 플래그 변경으로 큰 성능 향상을 주장하지 않습니다. 각 파일은 한 프로세스에서 처리하며 파일 단위 병렬성은 나중의 워커가 제한합니다. 실제 워커 수는 배포 장비에서 처리량, p95 지연과 메모리를 함께 측정해 정해야 합니다.

@@ -97,7 +97,7 @@ suite covers borrowed packet boundaries, truncation, common/variable sample
 sizes, timing-run changes, chunk-map changes and 32/64-bit offset tables.
 
 FFmpeg-derived port provenance and LGPL obligations remain in
-[MEDIA-CODECS.md](MEDIA-CODECS.md) and [THIRD_PARTY.md](../THIRD_PARTY.md). Generic
+[MEDIA-CODECS.md](MEDIA-CODECS.md) and [THIRD_PARTY.md](../../THIRD_PARTY.md). Generic
 JSON/hash/image dependencies remain; `reference-codecs` is only a comparison
 build. Benchmarks are workload-specific and do not establish better loudness or
 true-peak accuracy than FFmpeg.

@@ -23,7 +23,7 @@ measured on one host in one session; they are not cross-host claims.
   warm-up; warm page cache. CPU = user+system from `wait4` (us resolution),
   peak RSS of each engine process from GNU `time` (the harness's own memory
   excluded), wall from the harness.
-* Harness: [`tools/scripts/fair_pipeline_bench.py`](../tools/scripts/fair_pipeline_bench.py).
+* Harness: [`tools/scripts/fair_pipeline_bench.py`](../../crates/audeniq-qc-tools/scripts/fair_pipeline_bench.py).
 
 ## Workload-matched pipelines
 
@@ -201,7 +201,7 @@ better steady-state measure.
 * Qualification 596/596, codec stress 288/288, synthesized standards pass
   ([qualification.json](verified-pipeline/qualification.json),
   [codec-stress.json](verified-pipeline/codec-stress.json)).
-* Mutation fuzz ([`tools/scripts/mutation_fuzz.py`](../tools/scripts/mutation_fuzz.py), rerun on `26ff3bc`):
+* Mutation fuzz ([`tools/scripts/mutation_fuzz.py`](../../crates/audeniq-qc-tools/scripts/mutation_fuzz.py), rerun on `26ff3bc`):
   1,600 mutated WAV/ALAC/FLAC files x `pcm-hash`/`analyze`/`convert`, zero
   crashes, signals or timeouts; all 327 accepted conversions re-decode in
   FFmpeg to the reported hash. Outcome counts are identical for the baseline
@@ -877,7 +877,7 @@ Correctness: tests (x86, reference codecs, aarch64 under QEMU) including the
 subset test; `qualify` 596, `codec-stress` 288 and `standards` passed; all
 441 x86 outputs and the aarch64 outputs at levels 5 and 8 decode in FFmpeg
 with CRC checking to the source PCM. Real Arm timing: the workflow
-`flac-levels.yml` runs [`flac_level_bench.py`](../tools/scripts/flac_level_bench.py)
+`flac-levels.yml` runs [`flac_level_bench.py`](../../crates/audeniq-qc-tools/scripts/flac_level_bench.py)
 on the same corpus for round 12, this engine and FFmpeg on x86 and Arm
 runners. [Raw](verified-pipeline/round14-encoder.txt).
 

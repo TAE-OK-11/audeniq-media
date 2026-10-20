@@ -8,4 +8,4 @@ publish = false
 description = "Rust-only development qualification and resource benchmarks"
 
 [dependencies]
-audeniq-qc = { path = ".." }
+audeniq-qc = { path = "../audeniq-qc" }

@@ -2,10 +2,10 @@ name: FLAC levels on the IETF corpus
 on:
   push:
     paths:
-      - src/flac.rs
-      - src/flac_decode.rs
-      - src/kernels.rs
-      - tools/scripts/flac_level_bench.py
+      - crates/audeniq-qc/src/flac.rs
+      - crates/audeniq-qc/src/flac_decode.rs
+      - crates/audeniq-qc/src/kernels.rs
+      - crates/audeniq-qc-tools/scripts/flac_level_bench.py
       - .github/workflows/flac-levels.yml
   workflow_dispatch:
 permissions:
@@ -59,6 +59,6 @@ jobs:
           ls -la long*.wav
       - name: Levels 0-8, three interleaved repeats, every output cross-decoded
         run: |
-          python3 tools/scripts/flac_level_bench.py corpus flac-levels.json \
+          python3 crates/audeniq-qc-tools/scripts/flac_level_bench.py corpus flac-levels.json \
             round12=round12/target/release/audeniq-qc new=target/release/audeniq-qc --ffmpeg --repeats 5 \
             --albums long44100.wav,long96000.wav

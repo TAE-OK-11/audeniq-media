@@ -1,4 +1,6 @@
-# audeniq-qc
+# audeniq-qc (AUDENIQ 미디어 엔진의 오디오 부분)
+
+> audeniq-photo와 한 워크스페이스로 통합되었습니다. 전체 구성은 [루트 README](../../README.md)를 보세요. 해시(MD5·SHA-256·CRC32)는 `crates/media-hash`, JSON은 `crates/media-json`으로 옮겨 photo와 공유합니다.
 
 AUDENIQ 전용 Rust 오디오 엔진. 실제 AUDENIQ 소스의 FFmpeg·FFprobe·LUFS 사용처를 [먼저 조사](AUDIT.md)하고, 필요한 무손실 처리와 QC만 구현했습니다. 런타임 FFmpeg·libav* 의존성이 없고 미디어 처리 경로는 Rust로 동작합니다.
 
@@ -28,7 +30,7 @@ AUDENIQ 전용 Rust 오디오 엔진. 실제 AUDENIQ 소스의 FFmpeg·FFprobe·
 Rust 1.89 이상이 필요합니다. SHA-256(x86 SHA-NI/AArch64 SHA2), FLAC MD5와 IEEE CRC32(x86 AVX-512/AVX2 VPCLMULQDQ·PCLMULQDQ, AArch64 PMULL)는 저장소 안의 구현을 사용합니다. 지원 여부를 런타임에 검사하며 미지원 CPU에서는 이식 가능한 구현을 선택합니다. `--scalar`는 자체 DSP 커널을 바꾸며 해시/CRC의 하드웨어 감지는 유지합니다.
 
 ```sh
-cargo build --release --locked
+cargo build --release --locked -p audeniq-qc
 target/release/audeniq-qc capabilities
 target/release/audeniq-qc probe master.m4a
 target/release/audeniq-qc analyze master.flac --fingerprint
@@ -71,7 +73,7 @@ LPC 계수는 13-bit로 양자화합니다. Levinson-Durbin 오차로 차수별 
 
 모든 레벨에서 PCM SHA-256을 계산하고 모든 프레임을 원본과 비교 검증한 뒤 게시합니다. 예측 모델 선택은 압축률에만 영향을 주며 PCM 복원에는 영향을 주지 않습니다. 입력마다 압축률이 달라지며 높은 레벨이 항상 더 작은 파일을 만드는 것은 아닙니다. 손실 압축, 샘플레이트 변경, bit depth 축소, ALAC/WavPack/TTA 인코딩은 구현 범위에 포함하지 않습니다.
 
-`src/lib.rs`의 공개 Rust API도 있습니다. 업로드 파일을 다루는 AUDENIQ에서는 CLI를 기존 Linux parser sandbox 안에서 실행해야 합니다. 라이브러리를 워커 내부에서 직접 호출하여 격리를 없애면 안 됩니다. 세부 연결 조건은 [INTEGRATION.md](INTEGRATION.md)에 기록합니다.
+`crates/audeniq-qc/src/lib.rs`의 공개 Rust API도 있습니다. 업로드 파일을 다루는 AUDENIQ에서는 CLI를 기존 Linux parser sandbox 안에서 실행해야 합니다. 라이브러리를 워커 내부에서 직접 호출하여 격리를 없애면 안 됩니다. 세부 연결 조건은 [INTEGRATION.md](INTEGRATION.md)에 기록합니다.
 
 ## 정확도와 측정
 
@@ -85,9 +87,9 @@ LPC 계수는 13-bit로 양자화합니다. Levinson-Durbin 오차로 차수별 
 
 ```sh
 # FFmpeg는 아래 개발/검증 명령에서만 사용합니다.
-cargo test --workspace --locked
-cargo clippy --workspace --locked --all-targets -- -D warnings
-cargo build --workspace --release --locked
+cargo test -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked
+cargo clippy -p media-hash -p media-json -p audeniq-qc -p audeniq-qc-tools --locked --all-targets -- -D warnings
+cargo build -p audeniq-qc -p audeniq-qc-tools --release --locked
 target/release/audeniq-qc-tools qualify --output qualification.json
 target/release/audeniq-qc-tools standards --output standards.json
 target/release/audeniq-qc-tools codec-stress --output codec-stress.json

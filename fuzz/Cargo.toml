@@ -1,0 +1,51 @@
+[package]
+name = "media-engine-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+media-hash = { path = "../crates/media-hash" }
+photo-deflate = { path = "../crates/photo-deflate" }
+audeniq-qc = { path = "../crates/audeniq-qc" }
+audeniq-photo = { path = "../crates/audeniq-photo" }
+sha2 = "=0.10.9"
+md-5 = "=0.10.6"
+crc32fast = "=1.5.2"
+
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[workspace]
+
+[[bin]]
+name = "deflate"
+path = "fuzz_targets/deflate.rs"
+test = false
+doc = false
+[[bin]]
+name = "hash"
+path = "fuzz_targets/hash.rs"
+test = false
+doc = false
+[[bin]]
+name = "audio"
+path = "fuzz_targets/audio.rs"
+test = false
+doc = false
+[[bin]]
+name = "image"
+path = "fuzz_targets/image.rs"
+test = false
+doc = false
+[[bin]]
+name = "pdf"
+path = "fuzz_targets/pdf.rs"
+test = false
+doc = false

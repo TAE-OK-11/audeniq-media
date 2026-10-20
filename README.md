@@ -45,6 +45,7 @@ photo는 디코더 패닉을 `catch_unwind`로 격리해야 하므로 `audeniq-p
 컴파일 오류를 내며 빌드되지 않습니다.
 
 통합 전후 성능 비교(방법·결과)는 [docs/BENCHMARK-MERGE.md](docs/BENCHMARK-MERGE.md)에 있습니다.
+보안 점검 결과와 퍼징 방법은 [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md), [fuzz/README.md](fuzz/README.md)에 있습니다.
 
 ## 테스트
 

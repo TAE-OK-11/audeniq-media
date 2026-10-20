@@ -84,6 +84,15 @@ impl Md5 {
         self.buffered = tail.len();
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn state_mut(&mut self) -> &mut [u32; 4] {
+        &mut self.state
+    }
+
     pub fn update(&mut self, data: &[u8]) {
         let rest = self.absorb_head(data);
         let (blocks, tail) = rest.as_chunks::<64>();
@@ -264,6 +273,7 @@ pub(crate) fn compress(state: &mut [u32; 4], blocks: &[[u8; 64]]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
     use std::prelude::v1::*;
 
     fn hex(bytes: [u8; 16]) -> String {

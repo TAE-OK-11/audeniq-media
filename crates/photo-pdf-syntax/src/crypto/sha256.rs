@@ -1,7 +1,7 @@
 //! PDF-compatible Sha256 using the implementation developed in audeniq-qc.
 
 pub(crate) fn calculate(data: &[u8]) -> [u8; 32] {
-    let mut hash = photo_hash::Sha256::new();
+    let mut hash = media_hash::Sha256::new();
     hash.update(data);
     hash.finalize()
 }

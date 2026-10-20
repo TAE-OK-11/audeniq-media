@@ -21,6 +21,7 @@ const INIT: [u32; 8] = [
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 enum Engine {
     Portable,
     #[cfg(target_arch = "x86_64")]
@@ -31,14 +32,14 @@ enum Engine {
 
 impl Engine {
     fn detect() -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
         if std::is_x86_feature_detected!("sha")
             && std::is_x86_feature_detected!("sse4.1")
             && std::is_x86_feature_detected!("ssse3")
         {
             return Self::ShaNi;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "std"))]
         if std::arch::is_aarch64_feature_detected!("sha2") {
             return Self::Sha2;
         }
@@ -89,7 +90,7 @@ impl Sha256 {
                 return &[];
             }
             let block = self.buffer;
-            self.compress(std::slice::from_ref(&block));
+            self.compress(core::slice::from_ref(&block));
             self.buffered = 0;
         }
         data
@@ -205,7 +206,7 @@ fn compress_portable(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 #[inline]
 pub(crate) unsafe fn compress_sha_ni(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let byte_swap = _mm_set_epi64x(0x0c0d0e0f08090a0b, 0x0405060700010203);
     // SAFETY (all loads/stores below): every pointer comes from a live
     // array or slice element of at least 16 bytes; loads are unaligned.
@@ -298,7 +299,7 @@ pub(crate) unsafe fn compress_sha_ni(state: &mut [u32; 8], blocks: &[[u8; 64]]) 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,sha2")]
 unsafe fn compress_arm_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
     // SAFETY (all loads/stores below): pointers come from live arrays or
     // slice elements of at least 16 bytes.
     let mut abcd = vld1q_u32(state.as_ptr());
@@ -353,6 +354,8 @@ unsafe fn compress_arm_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::prelude::v1::*;
+    use std::vec;
 
     fn engines() -> Vec<Engine> {
         let mut engines = vec![Engine::Portable];

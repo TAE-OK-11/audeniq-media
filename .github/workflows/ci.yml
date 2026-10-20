@@ -31,7 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98.1"
-      - run: cargo test -p photo-hash -p photo-deflate -p photo-png --lib
+      - run: cargo test -p media-hash -p photo-deflate -p photo-png --lib
       - run: cargo test -p photo-png --test qc_crc
-      - run: cargo test -p photo-hash --no-default-features
-      - run: cargo check -p photo-hash --no-default-features
+      - run: cargo test -p media-hash --no-default-features
+      - run: cargo check -p media-hash --no-default-features

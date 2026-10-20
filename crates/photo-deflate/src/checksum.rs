@@ -3,7 +3,7 @@
 
 // Lazily initialize dispatch to preserve the const constructor and Copy API.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Crc32(Option<photo_hash::Crc32>);
+pub struct Crc32(Option<media_hash::Crc32>);
 
 impl Crc32 {
     pub const fn new() -> Self {
@@ -11,16 +11,16 @@ impl Crc32 {
     }
     pub fn update(&mut self, data: &[u8]) {
         self.0
-            .get_or_insert_with(photo_hash::Crc32::new)
+            .get_or_insert_with(media_hash::Crc32::new)
             .update(data);
     }
     pub fn finish(&self) -> u32 {
-        self.0.as_ref().map_or(0, photo_hash::Crc32::finalize)
+        self.0.as_ref().map_or(0, media_hash::Crc32::finalize)
     }
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
-    photo_hash::crc32(data)
+    media_hash::crc32(data)
 }
 
 #[derive(Debug, Clone, Copy)]

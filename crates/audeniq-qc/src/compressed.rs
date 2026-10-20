@@ -58,7 +58,7 @@ impl Compressed {
         &mut self,
         out: &mut Vec<i32>,
         limits: &Limits,
-        sha: Option<&mut crate::sha256::Sha256>,
+        sha: Option<&mut media_hash::Sha256>,
     ) -> Result<bool> {
         let hashed = sha.is_some() && matches!(self.input, Input::Flac(_));
         match &mut self.input {

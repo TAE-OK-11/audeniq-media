@@ -2,14 +2,11 @@
 //! same samples in one traversal.
 //!
 //! SHA-256 covers left-aligned little-endian i32 samples (4 bytes each); the
-//! MD5 covers compact little-endian samples (2 or 3 bytes each). Both are
-//! serial per-block chains. When the SHA extensions are in use, runs of
-//! whole blocks are compressed by kernels that interleave one MD5 block with
-//! two SHA blocks (16-bit) or three MD5 blocks with four SHA blocks
-//! (24-bit), so the core overlaps the two chains. Partial blocks and any
-//! remainder go through each hash's own path; digests are identical to
-//! hashing the two byte streams separately.
-use crate::{md5::Md5, sha256::Sha256};
+//! MD5 covers compact little-endian samples (2 or 3 bytes each). Both go
+//! through `media_hash::update_both`, which interleaves the two block chains
+//! on SHA-NI; digests are identical to hashing the two byte streams
+//! separately.
+use media_hash::{Md5, Sha256};
 
 pub(crate) struct PcmHash {
     sha: Sha256,
@@ -39,7 +36,7 @@ impl PcmHash {
             return;
         };
         crate::audio::compact_pcm(samples, self.bits, &mut self.compact);
-        update_both(&mut self.sha, &canonical, md5, &self.compact, self.bits);
+        media_hash::update_both(&mut self.sha, &canonical, md5, &self.compact, self.bits);
     }
 
     pub(crate) fn sha_mut(&mut self) -> &mut Sha256 {
@@ -81,56 +78,6 @@ impl PcmHash {
         };
         Ok((self.sha.finalize(), md5))
     }
-}
-
-/// Hash `sha_bytes` into `sha` and `md5_bytes` into `md5`.
-pub(crate) fn update_both(
-    sha: &mut Sha256,
-    sha_bytes: &[u8],
-    md5: &mut Md5,
-    md5_bytes: &[u8],
-    bits: u16,
-) {
-    let (sha_blocks, sha_tail) = sha.absorb_head(sha_bytes).as_chunks::<64>();
-    let (md5_blocks, md5_tail) = md5.absorb_head(md5_bytes).as_chunks::<64>();
-    #[cfg(target_arch = "x86_64")]
-    let (sha_blocks, md5_blocks) = interleave(sha, sha_blocks, md5, md5_blocks, bits);
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = bits;
-    sha.absorb_blocks(sha_blocks);
-    sha.absorb_tail(sha_tail);
-    md5.absorb_blocks(md5_blocks);
-    md5.absorb_tail(md5_tail);
-}
-
-/// Compress the longest run of whole interleaved units with the fused
-/// kernels (SHA extensions only) and return the blocks left for each hash.
-#[cfg(target_arch = "x86_64")]
-fn interleave<'a, 'b>(
-    sha: &mut Sha256,
-    sha_blocks: &'a [[u8; 64]],
-    md5: &mut Md5,
-    md5_blocks: &'b [[u8; 64]],
-    bits: u16,
-) -> (&'a [[u8; 64]], &'b [[u8; 64]]) {
-    // (MD5 blocks, SHA blocks) per interleaved unit.
-    let (m, s) = if bits == 16 { (1, 2) } else { (3, 4) };
-    let units = (md5_blocks.len() / m).min(sha_blocks.len() / s);
-    let Some(state) = sha.sha_ni_state().filter(|_| units > 0) else {
-        return (sha_blocks, md5_blocks);
-    };
-    let (md5_run, md5_rest) = md5_blocks.split_at(units * m);
-    let (sha_run, sha_rest) = sha_blocks.split_at(units * s);
-    // SAFETY: `sha_ni_state` is Some only when the SHA extensions (and
-    // SSSE3/SSE4.1) were detected at runtime.
-    unsafe {
-        if bits == 16 {
-            crate::hash_fused::md5_1_sha_2(md5.state_mut(), md5_run, state, sha_run);
-        } else {
-            crate::hash_fused::md5_3_sha_4(md5.state_mut(), md5_run, state, sha_run);
-        }
-    }
-    (sha_rest, md5_rest)
 }
 
 #[cfg(test)]

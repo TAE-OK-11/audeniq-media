@@ -139,7 +139,7 @@ enum Normalizer {
 /// and compared sample-for-sample with its source PCM before being written.
 #[derive(Default)]
 struct FrameLog {
-    crc: crate::crc32::Crc32,
+    crc: media_hash::Crc32,
     bytes: u64,
 }
 impl FrameLog {
@@ -350,7 +350,7 @@ fn verify_output(
     let mut file = File::open(path)?;
     let mut head = [0u8; 42];
     file.read_exact(&mut head)?;
-    let mut crc = crate::crc32::Crc32::new();
+    let mut crc = media_hash::Crc32::new();
     let mut bytes = 0u64;
     let mut buffer = vec![0u8; 1 << 16];
     loop {

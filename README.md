@@ -38,11 +38,13 @@ cargo build --profile release-photo --locked -p photo-cli    # target/release-ph
 
 | 프로필 | 설정 | 이유 |
 |---|---|---|
-| `release` | opt-level 3, LTO 없음, panic=unwind | 오디오 커널은 런타임 디스패치. fat LTO·codegen-units=1이면 ALAC→FLAC+QC CPU 시간이 약 13% 증가 |
-| `release-photo` | `release` + fat LTO, codegen-units=1, strip | 크레이트 사이 인라이닝이 중요(LTO 없이 OCR 약 11% 느림) |
+| `release` | opt-level 3, LTO 없음, panic=abort (통합 전 audeniq-qc와 동일) | 오디오 커널은 런타임 디스패치. fat LTO·codegen-units=1이면 ALAC→FLAC+QC CPU 시간이 약 13% 증가. unwind면 시작할 때마다 동적 심볼 해석이 늘어남 |
+| `release-photo` | `release` + fat LTO, codegen-units=1, strip, panic=unwind (통합 전 audeniq-photo와 동일) | 크레이트 사이 인라이닝이 중요(LTO 없이 OCR 약 11% 느림) |
 
-photo는 디코더 패닉을 `catch_unwind`로 격리하므로 공통 `release`는 unwind입니다. `audeniq-qc`는 패닉 훅으로
-기존과 같이 패닉 시 즉시 abort합니다.
+photo는 디코더 패닉을 `catch_unwind`로 격리해야 하므로 `audeniq-photo`는 unwind가 아닌 프로필(`--release`)로는
+컴파일 오류를 내며 빌드되지 않습니다.
+
+통합 전후 성능 비교(방법·결과)는 [docs/BENCHMARK-MERGE.md](docs/BENCHMARK-MERGE.md)에 있습니다.
 
 ## 테스트
 

@@ -71,19 +71,21 @@ opt-level = 2
 
 # `release` is the audio engine's measured profile: runtime-dispatched SIMD
 # kernels, no LTO (fat LTO or one codegen unit made ALAC conversion ~13%
-# slower). Unwinding stays on because audeniq-photo isolates decoder panics
-# with catch_unwind; audeniq-qc still aborts on panic through a panic hook.
+# slower) and abort on panic (no unwind runtime to resolve at start-up).
 [profile.release]
 opt-level = 3
-panic = "unwind"
+panic = "abort"
 
 # audeniq-photo binaries: cross-crate inlining matters there (OCR is ~11%
-# slower without LTO). Build with `--profile release-photo`.
+# slower without LTO), and decoder panics are isolated with catch_unwind, so
+# audeniq-photo refuses to build without unwinding. Build with
+# `--profile release-photo`.
 [profile.release-photo]
 inherits = "release"
 lto = "fat"
 codegen-units = 1
 strip = true
+panic = "unwind"
 
 [profile.profiling]
 inherits = "release-photo"

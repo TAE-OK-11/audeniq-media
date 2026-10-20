@@ -139,13 +139,6 @@ fn run() -> audeniq_qc::Result<()> {
     }
 }
 fn main() {
-    // The release profile unwinds (audeniq-photo catches decoder
-    // panics); this engine has no unwind boundary and keeps aborting.
-    let report = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        report(info);
-        std::process::abort();
-    }));
     let outcome = run();
     #[cfg(feature = "profile-native")]
     eprintln!(

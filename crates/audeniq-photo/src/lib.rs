@@ -72,6 +72,11 @@ impl From<photo_core::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// Decoder panics become `Error::Internal` through `guard`; that needs
+// unwinding (`cargo build --profile release-photo`, not `--release`).
+#[cfg(panic = "abort")]
+compile_error!("audeniq-photo needs panic = \"unwind\": build with --profile release-photo");
+
 /// Run `f` and turn a panic into [`Error::Internal`] so one malformed file
 /// can never take down a worker thread.
 pub(crate) fn guard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {

@@ -331,7 +331,7 @@ pub fn crc8(data: &[u8]) -> u8 {
     crc
 }
 pub use crate::crc16::crc16;
-pub use crate::crc32::crc32;
+pub use media_hash::crc32;
 
 #[cfg(test)]
 mod tests {

@@ -213,7 +213,7 @@ pub(crate) fn validate(data: &[u8]) -> Result<(u32, u32)> {
         let crc = data
             .get(pos + 8 + length..pos + 12 + length)
             .ok_or_else(invalid)?;
-        let mut c = crate::crc32::Crc32::new();
+        let mut c = media_hash::Crc32::new();
         c.update(&kind);
         c.update(body);
         Ok((length, kind, body, c.finalize() == be32(crc)))

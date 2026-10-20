@@ -1,7 +1,7 @@
 //! PDF-compatible Md5 using the implementation developed in audeniq-qc.
 
 pub(crate) fn calculate(data: &[u8]) -> [u8; 16] {
-    let mut hash = photo_hash::Md5::new();
+    let mut hash = media_hash::Md5::new();
     hash.update(data);
     hash.finalize()
 }

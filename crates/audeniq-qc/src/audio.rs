@@ -1,8 +1,8 @@
 #[cfg(not(feature = "reference-codecs"))]
 use crate::compressed::Compressed;
-#[cfg(feature = "reference-codecs")]
-use crate::md5::Md5;
 use crate::{kernels::Backend, AudioSpec, Error, Limits, Result};
+#[cfg(feature = "reference-codecs")]
+use media_hash::Md5;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -120,7 +120,7 @@ impl AudioReader {
         &mut self,
         samples: &mut Vec<i32>,
         backend: Backend,
-        sha: Option<&mut crate::sha256::Sha256>,
+        sha: Option<&mut media_hash::Sha256>,
     ) -> Result<(bool, bool)> {
         self.limits.check()?;
         let hashed = match &mut self.source {

@@ -10,7 +10,7 @@ license = "UNLICENSED"
 repository = "https://github.com/TAE-OK-11/audeniq-qc"
 
 [workspace.dependencies]
-photo-hash = { path = "crates/photo-hash", default-features = false }
+media-hash = { path = "crates/media-hash", default-features = false }
 photo-core = { path = "crates/photo-core" }
 photo-deflate = { path = "crates/photo-deflate" }
 photo-png = { path = "crates/photo-png" }

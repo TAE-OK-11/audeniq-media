@@ -110,7 +110,7 @@ impl Format {
 pub fn qr_count(data: &[u8], deadline: &Deadline) -> Result<usize> {
     guard(|| {
         let (w, h, gray) = intensity(data, deadline)?;
-        Ok(photo_qr::scan(&gray, w, h, deadline)?.decoded)
+        Ok(photo_qr::scan_owned(gray, w, h, deadline)?.decoded)
     })
 }
 
@@ -121,12 +121,16 @@ pub(crate) fn intensity(data: &[u8], deadline: &Deadline) -> Result<(usize, usiz
         Some(Format::Jpeg) => photo_jpeg::decode_luma(data, &Limits::default(), deadline)?.1,
         _ => decode_image(data, &Limits::default(), deadline)?.image,
     };
+    let (width, height) = (img.width as usize, img.height as usize);
     let gray = if img.format == PixelFormat::Gray8 {
         img.data
-    } else {
+    } else if img.format == PixelFormat::Cmyk8 {
         photo_qr::to_gray(&gray_source(&img), gray_channels(&img))
+    } else {
+        let channels = img.format.channels();
+        photo_qr::to_gray_in_place(img.data, channels)
     };
-    Ok((img.width as usize, img.height as usize, gray))
+    Ok((width, height, gray))
 }
 
 fn gray_source(img: &Image) -> std::borrow::Cow<'_, [u8]> {

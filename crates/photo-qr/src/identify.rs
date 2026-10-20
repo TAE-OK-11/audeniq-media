@@ -7,6 +7,46 @@ const WHITE: u16 = 0;
 const BLACK: u16 = 1;
 const REGION0: u16 = 2;
 const MAX_REGION: usize = 65_534;
+
+/// Pixel storage: 0 white, 1 black, 2.. region labels (quirc's
+/// `quirc_pixel_t`). Images are scanned with `u8` labels in the grayscale
+/// buffer itself; one that needs more than 254 regions is scanned again
+/// with `u16` labels, which allow quirc's 65 534.
+pub(crate) trait Px: Copy + Ord + 'static {
+    /// Regions this type can label.
+    const MAX_REGION: usize;
+    fn from_u16(v: u16) -> Self;
+    fn to_u16(self) -> u16;
+    fn dark_masks(row: &[Self], out: &mut Vec<u64>);
+}
+impl Px for u8 {
+    const MAX_REGION: usize = (u8::MAX as u16 - REGION0 + 1) as usize;
+    #[inline(always)]
+    fn from_u16(v: u16) -> Self {
+        v as u8
+    }
+    #[inline(always)]
+    fn to_u16(self) -> u16 {
+        u16::from(self)
+    }
+    fn dark_masks(row: &[u8], out: &mut Vec<u64>) {
+        dark_masks_u8(row, out)
+    }
+}
+impl Px for u16 {
+    const MAX_REGION: usize = MAX_REGION;
+    #[inline(always)]
+    fn from_u16(v: u16) -> Self {
+        v
+    }
+    #[inline(always)]
+    fn to_u16(self) -> u16 {
+        self
+    }
+    fn dark_masks(row: &[u16], out: &mut Vec<u64>) {
+        dark_masks_u16(row, out)
+    }
+}
 const MAX_CAPSTONES: usize = 256;
 const MAX_GRIDS: usize = 64;
 const MAX_VERSION: i32 = 40;
@@ -65,10 +105,18 @@ impl Code {
     }
 }
 
-pub(crate) struct Quirc {
+pub(crate) enum Outcome {
+    Done,
+    RowOverflow(usize),
+    GroupOverflow,
+}
+
+pub(crate) struct Quirc<P: Px> {
     w: usize,
     h: usize,
-    px: Vec<u16>,
+    px: Vec<P>,
+    /// A `u8` scan needed more regions than it can label.
+    overflow: bool,
     regions: Vec<Region>,
     caps: Vec<Capstone>,
     /// Scratch: one row as 64-pixel dark bitmasks.
@@ -230,16 +278,21 @@ impl Spans for Leftmost {
 
 photo_core::multiversion! {
     /// One row as bitmasks of 64 pixels (bit set = not white).
-    fn dark_masks(row: &[u16], out: &mut Vec<u64>) -> () = dark_masks_body;
+    fn dark_masks_u8(row: &[u8], out: &mut Vec<u64>) -> () = dark_masks_body::<u8>;
+}
+photo_core::multiversion! {
+    /// One row as bitmasks of 64 pixels (bit set = not white).
+    fn dark_masks_u16(row: &[u16], out: &mut Vec<u64>) -> () = dark_masks_body::<u16>;
 }
 
 #[inline(always)]
-fn dark_masks_body(row: &[u16], out: &mut Vec<u64>) {
+fn dark_masks_body<P: Px>(row: &[P], out: &mut Vec<u64>) {
+    let white = P::from_u16(WHITE);
     out.clear();
     out.extend(row.chunks(64).map(|c| {
         let mut m = 0u64;
         for (i, &p) in c.iter().enumerate() {
-            m |= u64::from(p != WHITE) << i;
+            m |= u64::from(p != white) << i;
         }
         m
     }));
@@ -252,11 +305,12 @@ photo_core::multiversion! {
     /// average step to an integer, a serial integer division per pixel;
     /// here the averages are exact (f64), which moves the threshold by
     /// well under one gray level and runs several times faster.
-    fn threshold(px: &mut [u16], gray: &[u8], w: usize, h: usize) -> () = threshold_body;
+    /// In place: each gray byte becomes BLACK or WHITE.
+    fn threshold(px: &mut [u8], w: usize, h: usize) -> () = threshold_body;
 }
 
 #[inline(always)]
-fn threshold_body(px: &mut [u16], gray: &[u8], w: usize, h: usize) {
+fn threshold_body(px: &mut [u8], w: usize, h: usize) {
     if w == 0 || h == 0 {
         return;
     }
@@ -283,7 +337,7 @@ fn threshold_body(px: &mut [u16], gray: &[u8], w: usize, h: usize) {
     };
     let n4 = w / 4 * 4;
     for y in 0..h {
-        let row = &gray[y * w..(y + 1) * w];
+        let row = &px[y * w..(y + 1) * w];
         // Left-to-right average: avg_u on even rows, avg_w on odd rows;
         // the other runs right to left (quirc's boustrophedon).
         let (mut f, mut b) = if y & 1 == 1 {
@@ -320,33 +374,70 @@ fn threshold_body(px: &mut [u16], gray: &[u8], w: usize, h: usize) {
         } else {
             (avg_u, avg_w) = (f, b);
         }
+        // The row has been read; overwrite it with the classes.
         let out = &mut px[y * w..(y + 1) * w];
         for x in 0..w {
-            out[x] = if g(x) < (fwd_avg[x] + bwd_avg[x]) * k {
-                BLACK
+            out[x] = if f64::from(out[x]) < (fwd_avg[x] + bwd_avg[x]) * k {
+                BLACK as u8
             } else {
-                WHITE
+                WHITE as u8
             };
         }
     }
 }
 
-impl Quirc {
-    pub fn new(gray: &[u8], w: usize, h: usize) -> Quirc {
-        let mut q = Quirc {
+impl Quirc<u8> {
+    /// Threshold `gray` (row-major, `w * h`) in place and use it as the
+    /// pixel buffer.
+    pub fn new(mut gray: Vec<u8>, w: usize, h: usize) -> Quirc<u8> {
+        gray.truncate(w * h);
+        threshold(&mut gray, w, h);
+        Quirc {
             w,
             h,
-            px: vec![WHITE; w * h],
+            px: gray,
+            overflow: false,
             regions: Vec::new(),
             caps: Vec::new(),
             masks: Vec::new(),
             grids: Vec::new(),
-        };
-        threshold(&mut q.px, gray, w, h);
-        q
+        }
     }
 
-    fn fill<S: Spans>(&mut self, x: i32, y: i32, from: u16, to: u16, spans: &mut S) {
+    /// The same state with `u16` labels (numbering unchanged), to continue
+    /// a scan that ran out of `u8` labels.
+    pub fn widen(self) -> Quirc<u16> {
+        Quirc {
+            w: self.w,
+            h: self.h,
+            px: self.px.iter().map(|&p| u16::from(p)).collect(),
+            overflow: false,
+            regions: self.regions,
+            caps: self.caps,
+            masks: self.masks,
+            grids: self.grids,
+        }
+    }
+
+    /// Start over with `u16` labels on the same thresholded image (every
+    /// region is a relabelled black area).
+    pub fn restart_wide(self) -> Quirc<u16> {
+        let px = self.px.iter().map(|&p| u16::from(p).min(BLACK)).collect();
+        Quirc {
+            w: self.w,
+            h: self.h,
+            px,
+            overflow: false,
+            regions: Vec::new(),
+            caps: Vec::new(),
+            masks: Vec::new(),
+            grids: Vec::new(),
+        }
+    }
+}
+
+impl<P: Px> Quirc<P> {
+    fn fill<S: Spans>(&mut self, x: i32, y: i32, from: P, to: P, spans: &mut S) {
         let (w, h) = (self.w as i32, self.h as i32);
         let mut stack = vec![(x, y)];
         while let Some((sx, sy)) = stack.pop() {
@@ -390,16 +481,20 @@ impl Quirc {
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
             return -1;
         }
-        let p = self.px[y as usize * self.w + x as usize];
+        let p = self.px[y as usize * self.w + x as usize].to_u16();
         if p >= REGION0 {
             return i32::from(p - REGION0);
         }
-        if p == WHITE || self.regions.len() >= MAX_REGION {
+        if p == WHITE {
+            return -1;
+        }
+        if self.regions.len() >= P::MAX_REGION {
+            self.overflow |= P::MAX_REGION < MAX_REGION;
             return -1;
         }
         let id = self.regions.len();
         let mut count = Count(0);
-        self.fill(x, y, p, REGION0 + id as u16, &mut count);
+        self.fill(x, y, P::from_u16(p), self.label(id), &mut count);
         self.regions.push(Region {
             seed: Point { x, y },
             count: count.0,
@@ -408,8 +503,8 @@ impl Quirc {
         id as i32
     }
 
-    fn label(&self, r: usize) -> u16 {
-        REGION0 + r as u16
+    fn label(&self, r: usize) -> P {
+        P::from_u16(REGION0 + r as u16)
     }
 
     fn find_region_corners(&mut self, r: usize, reference: Point) -> [Point; 4] {
@@ -420,7 +515,7 @@ impl Quirc {
             corner: Point::default(),
         };
         let label = self.label(r);
-        self.fill(seed.x, seed.y, label, BLACK, &mut one);
+        self.fill(seed.x, seed.y, label, P::from_u16(BLACK), &mut one);
         let rf = Point {
             x: one.corner.x - reference.x,
             y: one.corner.y - reference.y,
@@ -432,7 +527,7 @@ impl Quirc {
             scores: [i, j, -i, -j],
             corners: [seed; 4],
         };
-        self.fill(seed.x, seed.y, BLACK, label, &mut other);
+        self.fill(seed.x, seed.y, P::from_u16(BLACK), label, &mut other);
         other.corners
     }
 
@@ -486,7 +581,7 @@ impl Quirc {
         // (bit set = dark), so the loop body runs per run, not per pixel.
         let mut prev_dark = false;
         let mut base = 0;
-        dark_masks(&self.px[y * w..(y + 1) * w], &mut self.masks);
+        P::dark_masks(&self.px[y * w..(y + 1) * w], &mut self.masks);
         while base < w {
             let n = (w - base).min(64);
             let dark = self.masks[base / 64];
@@ -516,6 +611,10 @@ impl Quirc {
                         .all(|i| pb[i] >= check[i] * avg - err && pb[i] <= check[i] * avg + err)
                     {
                         self.test_capstone(x as i32, y as i32, &pb);
+                        if self.overflow {
+                            // Stop at once: the row is redone with u16 labels.
+                            return;
+                        }
                     }
                 }
             }
@@ -547,7 +646,7 @@ impl Quirc {
         if p.x < 0 || p.y < 0 || p.x >= self.w as i32 || p.y >= self.h as i32 {
             return None;
         }
-        Some(self.px[p.y as usize * self.w + p.x as usize] != WHITE)
+        Some(self.px[p.y as usize * self.w + p.x as usize].to_u16() != WHITE)
     }
 
     fn timing_scan(&self, p0: Point, p1: Point) -> i32 {
@@ -717,8 +816,8 @@ impl Quirc {
                     best,
                     corner: seed,
                 };
-                self.fill(seed.x, seed.y, label, BLACK, &mut NoSpans);
-                self.fill(seed.x, seed.y, BLACK, label, &mut lm);
+                self.fill(seed.x, seed.y, label, P::from_u16(BLACK), &mut NoSpans);
+                self.fill(seed.x, seed.y, P::from_u16(BLACK), label, &mut lm);
                 self.grids[gi].align = lm.corner;
             }
         }
@@ -867,18 +966,32 @@ impl Quirc {
         }
     }
 
-    pub fn identify(&mut self, deadline: &Deadline) -> Result<()> {
-        for y in 0..self.h {
+    /// Find the grids, scanning rows from `first_row`.
+    ///
+    /// A `u8` scan that runs out of labels stops: during the row scan it
+    /// returns [`Outcome::RowOverflow`] right after the region that did not
+    /// fit, so [`Quirc::widen`] can redo that row (regions already made in
+    /// it get their labels back and recorded capstones are skipped, so the
+    /// state matches a `u16` scan); during grouping it returns
+    /// [`Outcome::GroupOverflow`] and the scan starts over.
+    pub fn identify(&mut self, first_row: usize, deadline: &Deadline) -> Result<Outcome> {
+        for y in first_row..self.h {
             if y % 128 == 0 {
                 deadline.check()?;
             }
             self.finder_scan(y);
+            if self.overflow {
+                return Ok(Outcome::RowOverflow(y));
+            }
         }
         for i in 0..self.caps.len() {
             deadline.check()?;
             self.test_grouping(i);
+            if self.overflow {
+                return Ok(Outcome::GroupOverflow);
+            }
         }
-        Ok(())
+        Ok(Outcome::Done)
     }
 
     pub fn extract(&self, gi: usize) -> Code {

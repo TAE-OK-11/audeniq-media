@@ -1,0 +1,23 @@
+[package]
+name = "photo-bench"
+description = "Benchmarks audeniq-photo against the external tools it replaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "audeniq-photo-bench"
+path = "src/main.rs"
+
+[dependencies]
+audeniq-photo.workspace = true
+photo-png.workspace = true
+photo-jpeg.workspace = true
+photo-deflate.workspace = true
+media-json.workspace = true
+mimalloc.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+photo-qr.workspace = true

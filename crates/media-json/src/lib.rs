@@ -13,6 +13,9 @@
 //!   serde_json did. Non-finite numbers are `null`.
 //! * Strings escape `"`, `\` and control characters only (`\n` etc., else
 //!   `\u00xx` in lowercase hex).
+mod ryu;
+mod ryu_tables;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -202,7 +205,9 @@ pub struct Out<'a> {
 impl<'a> Out<'a> {
     pub fn new() -> Out<'static> {
         Out {
-            buf: Vec::new(),
+            // serde_json's initial capacity; saves the first regrowths of
+            // small reports.
+            buf: Vec::with_capacity(128),
             sink: None,
             error: None,
         }
@@ -280,45 +285,60 @@ pub fn to_writer<T: ToJson + ?Sized>(
     out.finish()
 }
 pub fn to_string<T: ToJson + ?Sized>(value: &T) -> String {
-    String::from_utf8(to_vec(value)).expect("JSON output is UTF-8")
+    utf8(to_vec(value))
+}
+
+/// The writers only emit ASCII and whole `&str` contents split at ASCII
+/// bytes, so the text is UTF-8 by construction (serde_json relies on the
+/// same); checked in debug builds.
+#[allow(unsafe_code)]
+fn utf8(bytes: Vec<u8>) -> String {
+    debug_assert!(std::str::from_utf8(&bytes).is_ok());
+    // SAFETY: see above; every byte sequence written comes from a `&str`
+    // (cut only before or after an ASCII byte) or is ASCII.
+    unsafe { String::from_utf8_unchecked(bytes) }
 }
 
 /// JSON text indented by two spaces, as serde_json's pretty printer.
 pub fn to_string_pretty(value: &Value) -> String {
     let mut out = Out::new();
     write_pretty(value, &mut out, 0);
-    String::from_utf8(out.into_bytes()).expect("JSON output is UTF-8")
+    utf8(out.into_bytes())
 }
 
 fn write_pretty(value: &Value, out: &mut Out, depth: usize) {
-    let indent = |out: &mut Out, depth: usize| {
-        for _ in 0..depth {
-            out.extend_from_slice(b"  ");
+    // ",\n" or "\n" and the indentation, appended as one slice.
+    const BREAK: &[u8; 66] = b",\n                                                                ";
+    let line = |out: &mut Out, first: bool, depth: usize| {
+        let width = 2 * depth;
+        if width <= BREAK.len() - 2 {
+            out.extend_from_slice(&BREAK[first as usize..2 + width]);
+        } else {
+            out.extend_from_slice(&BREAK[first as usize..2]);
+            for _ in 0..depth {
+                out.extend_from_slice(b"  ");
+            }
         }
     };
     match value {
         Value::Array(items) if !items.is_empty() => {
             out.push(b'[');
             for (i, item) in items.iter().enumerate() {
-                out.extend_from_slice(if i == 0 { b"\n" } else { b",\n" });
-                indent(out, depth + 1);
+                line(out, i == 0, depth + 1);
                 write_pretty(item, out, depth + 1);
             }
-            out.push(b'\n');
-            indent(out, depth);
+            line(out, true, depth);
             out.push(b']');
         }
         Value::Object(map) if !map.is_empty() => {
             out.push(b'{');
             for (i, (key, item)) in map.iter().enumerate() {
-                out.extend_from_slice(if i == 0 { b"\n" } else { b",\n" });
-                indent(out, depth + 1);
+                line(out, i == 0, depth + 1);
                 write_str(key, out);
                 out.extend_from_slice(b": ");
                 write_pretty(item, out, depth + 1);
             }
-            out.push(b'\n');
-            indent(out, depth);
+            line(out, true, depth);
             out.push(b'}');
         }
         other => other.write_json(out),
@@ -331,25 +351,52 @@ impl std::fmt::Display for Value {
     }
 }
 
+/// The escape for each byte: 0 none, `u` for `\u00xx`, else the character
+/// after the backslash (serde_json's table).
+const ESCAPE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 0x20 {
+        table[i] = b'u';
+        i += 1;
+    }
+    table[0x08] = b'b';
+    table[b'\t' as usize] = b't';
+    table[b'\n' as usize] = b'n';
+    table[0x0c] = b'f';
+    table[b'\r' as usize] = b'r';
+    table[b'"' as usize] = b'"';
+    table[b'\\' as usize] = b'\\';
+    table
+};
+
+/// Whether any of the 8 bytes needs an escape: a control character
+/// (< 0x20), '"' or '\\' (SWAR: a zero byte after the XORs, or a byte
+/// below 0x20, sets that byte's high bit).
+#[inline]
+fn needs_escape(word: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let quote = word ^ (ONES * b'"' as u64);
+    let backslash = word ^ (ONES * b'\\' as u64);
+    let zero_in = |x: u64| x.wrapping_sub(ONES) & !x;
+    let control = word.wrapping_sub(ONES * 0x20) & !word;
+    (zero_in(quote) | zero_in(backslash) | control) & HIGH != 0
+}
+
 pub fn write_str(s: &str, out: &mut Out) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(b'"');
     let bytes = s.as_bytes();
     let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        let escape: &[u8] = match b {
-            b'"' => b"\\\"",
-            b'\\' => b"\\\\",
-            0x08 => b"\\b",
-            b'\t' => b"\\t",
-            b'\n' => b"\\n",
-            0x0c => b"\\f",
-            b'\r' => b"\\r",
-            0..=0x1f => &[],
-            _ => continue,
-        };
-        out.extend_from_slice(&bytes[start..i]);
-        if escape.is_empty() {
+    let escape_byte = |i: usize, start: &mut usize, out: &mut Out| {
+        let b = bytes[i];
+        let escape = ESCAPE[b as usize];
+        if escape == 0 {
+            return;
+        }
+        out.extend_from_slice(&bytes[*start..i]);
+        if escape == b'u' {
             out.extend_from_slice(&[
                 b'\\',
                 b'u',
@@ -359,9 +406,22 @@ pub fn write_str(s: &str, out: &mut Out) {
                 HEX[(b & 15) as usize],
             ]);
         } else {
-            out.extend_from_slice(escape);
+            out.extend_from_slice(&[b'\\', escape]);
         }
-        start = i + 1;
+        *start = i + 1;
+    };
+    // Eight bytes at a time; a word with an escape goes through the table.
+    let mut i = 0;
+    while let Some(chunk) = bytes.get(i..i + 8) {
+        if needs_escape(u64::from_le_bytes(chunk.try_into().unwrap())) {
+            for j in i..i + 8 {
+                escape_byte(j, &mut start, out);
+            }
+        }
+        i += 8;
+    }
+    for j in i..bytes.len() {
+        escape_byte(j, &mut start, out);
     }
     out.extend_from_slice(&bytes[start..]);
     out.push(b'"');
@@ -372,38 +432,79 @@ pub fn write_str(s: &str, out: &mut Out) {
 /// written positionally (16 for f64, 13 for f32) and `min` the smallest
 /// written as `0.000ddd` (-5 for f64, -6 for f32).
 fn write_float(negative: bool, digits: &[u8], exponent: i32, max: i32, min: i32, out: &mut Out) {
-    let length = digits.len() as i32;
+    let mut padded = [b'0'; 32];
+    padded[..digits.len()].copy_from_slice(digits);
+    write_float_padded(negative, &padded, digits.len(), exponent, max, min, out);
+}
+
+/// [`write_float`] with the `length` digits left-aligned in `digits` and
+/// followed by '0's, so every piece is a fixed-size copy into one stack
+/// buffer (at most 17 digits; the zeros of "1200.0" and "0.0012" come from
+/// the padding and the buffer's fill).
+#[inline]
+fn write_float_padded(
+    negative: bool,
+    digits: &[u8; 32],
+    length: usize,
+    exponent: i32,
+    max: i32,
+    min: i32,
+    out: &mut Out,
+) {
+    let mut text = [b'0'; 48];
+    let mut n = 0;
+    if negative {
+        text[0] = b'-';
+        n = 1;
+    }
     // 10^(kk-1) <= |v| < 10^kk.
     let kk = exponent + 1;
-    let k = kk - length;
-    if negative {
-        out.push(b'-');
-    }
-    if 0 <= k && kk <= max {
-        out.extend_from_slice(digits);
-        for _ in 0..k {
-            out.push(b'0');
-        }
-        out.extend_from_slice(b".0");
+    if length as i32 <= kk && kk <= max {
+        // Integer: the digits, the padding's zeros up to kk, then ".0".
+        text[n..n + 24].copy_from_slice(&digits[..24]);
+        n += kk as usize;
+        text[n..n + 2].copy_from_slice(b".0");
+        n += 2;
     } else if 0 < kk && kk <= max {
-        out.extend_from_slice(&digits[..kk as usize]);
-        out.push(b'.');
-        out.extend_from_slice(&digits[kk as usize..]);
+        let kk = kk as usize;
+        text[n..n + 16].copy_from_slice(&digits[..16]);
+        text[n + kk] = b'.';
+        text[n + kk + 1..n + kk + 17].copy_from_slice(&digits[kk..kk + 16]);
+        n += length + 1;
     } else if min < kk && kk <= 0 {
-        out.extend_from_slice(b"0.");
-        for _ in kk..0 {
-            out.push(b'0');
-        }
-        out.extend_from_slice(digits);
+        // "0." then -kk zeros (the buffer's fill), then the digits.
+        text[n + 1] = b'.';
+        let at = n + 2 + (-kk) as usize;
+        text[at..at + 24].copy_from_slice(&digits[..24]);
+        n = at + length;
     } else {
-        out.push(digits[0]);
+        text[n] = digits[0];
+        n += 1;
         if length > 1 {
-            out.push(b'.');
-            out.extend_from_slice(&digits[1..]);
+            text[n] = b'.';
+            text[n + 1..n + 17].copy_from_slice(&digits[1..17]);
+            n += length;
         }
-        out.push(b'e');
-        write_integer(exponent < 0, exponent.unsigned_abs() as u64, out);
+        text[n] = b'e';
+        n += 1;
+        if exponent < 0 {
+            text[n] = b'-';
+            n += 1;
+        }
+        // At most 3 digits (|exponent| <= 324).
+        let e = exponent.unsigned_abs();
+        if e >= 100 {
+            text[n] = b'0' + (e / 100) as u8;
+            n += 1;
+        }
+        if e >= 10 {
+            text[n] = b'0' + (e / 10 % 10) as u8;
+            n += 1;
+        }
+        text[n] = b'0' + (e % 10) as u8;
+        n += 1;
     }
+    out.extend_from_slice(&text[..n]);
 }
 
 /// Rust's `{:e}` text of a float, formatted on the stack.
@@ -585,6 +686,46 @@ fn write_shortest(
     write_float(negative, &digits[..length], exponent, max, min, out);
 }
 
+/// `a` (positive, not integral) as `decimal * 10^-places` with 1..=3
+/// places when that is its shortest round-trip form, e.g. 2.8 or 0.125.
+///
+/// At each `places` every decimal that parses back to `a` lies within one of
+/// d = round(a * 10^places) (the division d / 10^places is correctly
+/// rounded since both are exact), so checking d - 1, d and d + 1 finds them
+/// all; a cheap distance test skips the places that cannot have any. The first `places` with exactly one is the shortest representation
+/// and therefore Ryu's; several candidates (Ryu then picks the closest) or
+/// none within three places leave it to Ryu.
+#[inline]
+fn short_decimal(a: f64) -> Option<(u64, i32)> {
+    for (places, scale) in [(1, 10.0), (2, 100.0), (3, 1000.0)] {
+        let scaled = a * scale;
+        if scaled >= 4.0e15 {
+            return None;
+        }
+        // A candidate c parses back to `a` only if |c - a * scale| is at
+        // most half an ulp of `a` times `scale`, so within scaled * 2^-53
+        // (plus the product's own rounding) of `scaled`: skip the divisions
+        // when the nearest integer is farther than that.
+        let d = (scaled + 0.5) as u64;
+        if (scaled - d as f64).abs() > scaled * 4.0e-16 {
+            continue;
+        }
+        let mut found = None;
+        for c in [d.wrapping_sub(1), d, d + 1] {
+            if c != 0 && c != u64::MAX && c as f64 / scale == a {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(c);
+            }
+        }
+        if let Some(c) = found {
+            return Some((c, places));
+        }
+    }
+    None
+}
+
 pub fn write_f64(f: f64, out: &mut Out) {
     if !f.is_finite() {
         out.extend_from_slice(b"null");
@@ -594,17 +735,23 @@ pub fn write_f64(f: f64, out: &mut Out) {
         } else {
             b"0.0"
         });
+    } else if f.abs() < 9_007_199_254_740_992.0 && (f as i64) as f64 == f {
+        // Integral below 2^53 (< 1e16): its shortest digits are the integer
+        // itself, laid out positionally with ".0" (as Ryu's would be).
+        write_integer(f < 0.0, f.abs() as u64, out);
+        out.extend_from_slice(b".0");
+    } else if let Some((decimal, places)) = short_decimal(f.abs()) {
+        let mut digits = [b'0'; 32];
+        let length = digits_left(decimal, &mut digits);
+        let exponent = length as i32 - 1 - places;
+        write_float_padded(f.is_sign_negative(), &digits, length, exponent, 16, -5, out);
     } else {
-        let (mantissa, binary_exponent) = odd_parts(f.to_bits() & !(1 << 63), 52, 1075);
-        write_shortest(
-            Scientific::new(format_args!("{f:e}")),
-            |exponent, length| may_tie(mantissa, binary_exponent, 53, exponent, length),
-            |n| format!("{f:.n$e}"),
-            |s| s.parse::<f64>() == Ok(f),
-            16,
-            -5,
-            out,
-        );
+        let bits = f.to_bits();
+        let (decimal, exponent) = ryu::d2d(bits & ((1 << 52) - 1), ((bits >> 52) & 0x7ff) as u32);
+        let mut digits = [b'0'; 32];
+        let length = digits_left(decimal, &mut digits);
+        let exponent = exponent + length as i32 - 1;
+        write_float_padded(f.is_sign_negative(), &digits, length, exponent, 16, -5, out);
     }
 }
 pub fn write_f32(f: f32, out: &mut Out) {
@@ -661,40 +808,93 @@ const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819\
 6061626364656667686970717273747576777879\
 8081828384858687888990919293949596979899";
 
-/// Decimal digits of `n` (preceded by '-' when `negative`).
+/// The decimal digits of `n` at the end of `buf`; returns where they start.
 #[inline]
-fn write_integer(negative: bool, mut n: u64, out: &mut Out) {
-    let mut buf = [0u8; 21];
+fn write_digits(mut n: u64, buf: &mut [u8; 20]) -> usize {
     let mut i = buf.len();
-    while n >= 1 << 32 {
-        let pair = (n % 100) as usize * 2;
-        n /= 100;
-        i -= 2;
-        buf[i..i + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    let pair = |buf: &mut [u8; 20], i: usize, d: usize| {
+        buf[i..i + 2].copy_from_slice(&PAIRS[d * 2..d * 2 + 2]);
+    };
+    while n >= 10_000 {
+        let rest = (n % 10_000) as usize;
+        n /= 10_000;
+        i -= 4;
+        pair(buf, i, rest / 100);
+        pair(buf, i + 2, rest % 100);
     }
-    let mut n = n as u32;
-    while n >= 100 {
-        let pair = (n % 100) as usize * 2;
-        n /= 100;
+    let mut n = n as usize;
+    if n >= 100 {
         i -= 2;
-        buf[i..i + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+        pair(buf, i, n % 100);
+        n /= 100;
     }
     if n >= 10 {
         i -= 2;
-        buf[i..i + 2].copy_from_slice(&PAIRS[n as usize * 2..n as usize * 2 + 2]);
+        pair(buf, i, n);
     } else {
         i -= 1;
         buf[i] = b'0' + n as u8;
     }
-    if negative {
-        i -= 1;
-        buf[i] = b'-';
+    i
+}
+
+/// Two decimal digits of `d` (< 100) at `buf[at..at + 2]`.
+#[inline]
+fn put_pair(buf: &mut [u8; 32], at: usize, d: u32) {
+    buf[at..at + 2].copy_from_slice(&PAIRS[d as usize * 2..d as usize * 2 + 2]);
+}
+/// Exactly 8 digits of `n` (< 10^8, zero-padded) at `buf[at..at + 8]`.
+#[inline]
+fn put8(buf: &mut [u8; 32], at: usize, n: u32) {
+    let (high, low) = (n / 10_000, n % 10_000);
+    put_pair(buf, at, high / 100);
+    put_pair(buf, at + 2, high % 100);
+    put_pair(buf, at + 4, low / 100);
+    put_pair(buf, at + 6, low % 100);
+}
+/// The digits of `n` (< 10^9) at the start of `buf`; returns their count.
+#[inline]
+fn put_u32(buf: &mut [u8; 32], n: u32) -> usize {
+    let length = n.ilog10() as usize + 1;
+    let (mut n, mut end) = (n, length);
+    while end >= 2 {
+        put_pair(buf, end - 2, n % 100);
+        n /= 100;
+        end -= 2;
     }
-    out.extend_from_slice(&buf[i..]);
+    if end == 1 {
+        buf[0] = b'0' + n as u8;
+    }
+    length
+}
+
+/// The decimal digits of a nonzero `n` (< 10^17) at the start of `buf`;
+/// returns their count.
+#[inline]
+fn digits_left(n: u64, buf: &mut [u8; 32]) -> usize {
+    if n < 100_000_000 {
+        put_u32(buf, n as u32)
+    } else {
+        let length = put_u32(buf, (n / 100_000_000) as u32);
+        put8(buf, length, (n % 100_000_000) as u32);
+        length + 8
+    }
+}
+
+/// Decimal digits of `n` (preceded by '-' when `negative`).
+#[inline]
+fn write_integer(negative: bool, n: u64, out: &mut Out) {
+    let mut buf = [0u8; 20];
+    let start = write_digits(n, &mut buf);
+    if negative {
+        out.push(b'-');
+    }
+    out.extend_from_slice(&buf[start..]);
 }
 macro_rules! unsigned {
     ($($t:ty),*) => {$(
         impl ToJson for $t {
+            #[inline]
             fn write_json(&self, out: &mut Out) {
                 write_integer(false, *self as u64, out);
             }
@@ -708,6 +908,7 @@ unsigned!(u8, u16, u32, u64, usize);
 macro_rules! signed {
     ($($t:ty),*) => {$(
         impl ToJson for $t {
+            #[inline]
             fn write_json(&self, out: &mut Out) {
                 write_integer(*self < 0, (*self as i64).unsigned_abs(), out);
             }
@@ -1321,6 +1522,99 @@ mod tests {
                 reference::to_value(f).unwrap().to_string(),
                 "{f:e}"
             );
+        }
+    }
+
+    /// Escapes at every offset around the 8-byte scan, multi-byte UTF-8
+    /// next to them, and integers at every digit-count boundary.
+    #[test]
+    fn escapes_at_every_offset_and_integer_boundaries_match_serde_json() {
+        for len in 0..40 {
+            for pos in 0..len.max(1) {
+                for special in [
+                    "\"", "\\", "\n", "\u{1}", "\u{1f}", " ", "\u{7f}", "é", "😀", "\u{2028}",
+                ] {
+                    let mut text = "a".repeat(pos);
+                    text.push_str(special);
+                    text.push_str(&"b".repeat(len - pos.min(len)));
+                    assert_eq!(
+                        to_string(text.as_str()),
+                        reference::to_string(&text).unwrap()
+                    );
+                }
+            }
+        }
+        let mut n = 1u64;
+        for _ in 0..20 {
+            for v in [n - 1, n, n + 1, n.wrapping_mul(10) - 1] {
+                assert_eq!(to_string(&v), reference::to_string(&v).unwrap());
+                let negative = -(v.min(i64::MAX as u64) as i64);
+                assert_eq!(
+                    to_string(&negative),
+                    reference::to_string(&negative).unwrap()
+                );
+            }
+            n = n.saturating_mul(10);
+        }
+    }
+
+    /// Pretty output beyond the 32-level indentation slice and with empty
+    /// containers, against serde_json.
+    #[test]
+    fn deep_pretty_output_matches_serde_json() {
+        let mut ours = crate::json!({"leaf": [1, -2.5, "x\ny", null, true, [], {}]});
+        let mut theirs = reference::json!({"leaf": [1, -2.5, "x\ny", null, true, [], {}]});
+        for depth in 0..45 {
+            ours = crate::json!({"k": [ours.clone(), depth, {}], "e": []});
+            theirs = reference::json!({"k": [theirs.clone(), depth, {}], "e": []});
+            assert_eq!(
+                to_string_pretty(&ours),
+                reference::to_string_pretty(&theirs).unwrap()
+            );
+        }
+    }
+
+    /// The native Ryu port against serde_json's (ryu crate) output on the
+    /// values reports hold: short decimals, integers, every power of two,
+    /// subnormals and neighbours of powers of ten.
+    #[test]
+    fn ryu_port_matches_serde_json_on_structured_values() {
+        let check = |f: f64| {
+            let mut ours = Out::new();
+            write_f64(f, &mut ours);
+            assert_eq!(
+                String::from_utf8(ours.into_bytes()).unwrap(),
+                reference::to_string(&f).unwrap(),
+                "{f:e} ({:#x})",
+                f.to_bits()
+            );
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..300_000 {
+            let r = xorshift(&mut seed);
+            let digits = 1 + (r % 17) as u32;
+            let mantissa = (r >> 8) % 10u64.pow(digits);
+            let exponent = ((r >> 60) as i32 * 7) % 61 - 30;
+            for sign in [1.0, -1.0] {
+                check(sign * format!("{mantissa}e{exponent}").parse::<f64>().unwrap());
+            }
+        }
+        for _ in 0..100_000 {
+            let r = xorshift(&mut seed);
+            check((r >> (r % 64)) as f64);
+            check(f64::from_bits(r & ((1 << 52) - 1)));
+        }
+        for e in -1074..=1023 {
+            check(2f64.powi(e));
+        }
+        for e in -323..=308 {
+            let p: f64 = format!("1e{e}").parse().unwrap();
+            for d in [-2i64, -1, 0, 1, 2] {
+                let b = p.to_bits() as i64 + d;
+                if b > 0 {
+                    check(f64::from_bits(b as u64));
+                }
+            }
         }
     }
 

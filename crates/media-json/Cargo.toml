@@ -10,5 +10,6 @@ license = "LGPL-2.1-or-later"
 # Independent oracle for the tests only.
 serde_json_reference = { package = "serde_json", version = "=1.0.140" }
 
-[lints]
-workspace = true
+# One `String::from_utf8_unchecked` (lib.rs `utf8`) needs unsafe.
+[lints.rust]
+unsafe_code = "deny"

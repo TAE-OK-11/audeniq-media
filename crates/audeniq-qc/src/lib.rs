@@ -6,17 +6,14 @@ mod bits;
 #[cfg(not(feature = "reference-codecs"))]
 mod compressed;
 mod crc16;
-mod crc32;
 pub mod flac;
 #[cfg(not(feature = "reference-codecs"))]
 mod flac_decode;
-mod hash_fused;
 mod inflate;
 mod jpeg;
 pub mod json;
 pub mod kernels;
 mod m4a;
-mod md5;
 pub mod meter;
 mod mp4;
 #[cfg(not(feature = "reference-codecs"))]
@@ -26,11 +23,10 @@ mod pcm_hash;
 mod png;
 pub mod probe;
 mod profile;
-mod sha256;
+/// The canonical PCM SHA-256 implementation, shared with the tools crate.
+pub use media_hash::Sha256;
 #[cfg(feature = "profile-native")]
 pub use profile::report as native_profile;
-/// The canonical PCM SHA-256 implementation, shared with the tools crate.
-pub use sha256::Sha256;
 pub mod resample;
 mod tta;
 mod wavpack;

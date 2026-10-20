@@ -8,12 +8,12 @@ license = "Apache-2.0 OR MIT"
 
 [features]
 default = ["std", "images"]
-std = ["photo-hash/std", "photo-pdf-jbig2?/std", "photo-pdf-jpeg2000?/std", "dep:rustc-hash"]
+std = ["media-hash/std", "photo-pdf-jbig2?/std", "photo-pdf-jpeg2000?/std", "dep:rustc-hash"]
 images = ["std", "dep:photo-core", "dep:photo-jpeg", "dep:photo-pdf-ccitt", "dep:photo-pdf-jbig2", "dep:photo-pdf-jpeg2000"]
 logging = ["dep:log", "photo-pdf-jpeg2000?/logging"]
 
 [dependencies]
-photo-hash.workspace = true
+media-hash.workspace = true
 photo-deflate.workspace = true
 photo-core = { workspace = true, optional = true }
 photo-jpeg = { workspace = true, optional = true }

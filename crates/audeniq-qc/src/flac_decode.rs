@@ -2,8 +2,8 @@
 //! ported/reworked from FFmpeg flac.c, flacdec.c, flacdsp.c (LGPL-2.1-or-later).
 //! Copyright (c) 2003 Alex Beregszaszi; (c) 2012 Mans Rullgard.
 //! See THIRD_PARTY.md.
-use crate::md5::Md5;
 use crate::{kernels::Backend, msb::Bits, AudioSpec, Error, Limits, Result};
+use media_hash::Md5;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -1117,7 +1117,7 @@ impl Decoder {
         out: &mut Vec<i32>,
         limits: &Limits,
         retain: bool,
-        sha: Option<&mut crate::sha256::Sha256>,
+        sha: Option<&mut media_hash::Sha256>,
     ) -> Result<()> {
         self.retained = None;
         if self.decoded == self.spec.frames.unwrap() {
@@ -1172,7 +1172,7 @@ impl Decoder {
                             let _profile = crate::profile::scope(crate::profile::Stage::FlacMd5);
                             crate::audio::compact_pcm(out, bits, &mut self.packed);
                             match sha {
-                                Some(sha) => crate::pcm_hash::update_both(
+                                Some(sha) => media_hash::update_both(
                                     sha,
                                     &crate::audio::pcm_bytes(out),
                                     md5,

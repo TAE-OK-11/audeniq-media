@@ -727,13 +727,38 @@ impl<P: Px> Quirc<P> {
         let a = perspective_map(&c0, u, v + 1.0);
         let (u, v) = perspective_unmap(&c2, b);
         let c = perspective_map(&c2, u + 1.0, v);
-        let size_estimate = (i64::from(a.x - b.x) * -i64::from(c.y - b.y)
-            + i64::from(a.y - b.y) * i64::from(c.x - b.x))
-        .abs();
+        // Degenerate geometry can put these points anywhere in i32
+        // (CVE-2026-110596 in quirc: an overflowing estimate made the spiral
+        // below run ~10^11 steps), so the arithmetic is widened and the
+        // search ends once it can no longer reach the image.
+        let d = |p: Point, q: Point| {
+            (
+                i128::from(p.x) - i128::from(q.x),
+                i128::from(p.y) - i128::from(q.y),
+            )
+        };
+        let ((ax, ay), (cx, cy)) = (d(a, b), d(c, b));
+        let size_estimate = i64::try_from((ax * -cy + ay * cx).abs()).unwrap_or(i64::MAX);
+        let limit = size_estimate.saturating_mul(100);
+        // The spiral around the start covers the whole image once its side
+        // exceeds twice the start's distance to the farthest image edge; no
+        // region can be found after that.
+        let (w, h) = (self.w as i64, self.h as i64);
+        let (bx, by) = (i64::from(b.x), i64::from(b.y));
+        let reach = bx
+            .abs()
+            .max((bx - w).abs())
+            .max(by.abs())
+            .max((by - h).abs());
+        if reach > 4 * w.max(h) {
+            // Not near the image: no plausible alignment pattern.
+            return;
+        }
+        let max_step = 2 * reach + 4;
         let (dx, dy) = ([1, 0, -1, 0], [0, -1, 0, 1]);
         let mut step = 1i64;
         let mut dir = 0;
-        while step * step < size_estimate * 100 {
+        while step * step < limit && step <= max_step {
             for _ in 0..step {
                 let code = self.region_code(b.x, b.y);
                 if code >= 0 {

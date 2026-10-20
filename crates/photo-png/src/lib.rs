@@ -7,7 +7,7 @@ mod decode;
 mod encode;
 mod signature;
 
-pub use decode::{decode, read_info};
+pub use decode::{decode, decode_gray, read_info};
 pub use encode::{Encoder, encode};
 pub use signature::validate_signature;
 

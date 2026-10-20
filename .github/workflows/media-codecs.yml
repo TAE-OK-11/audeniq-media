@@ -4,9 +4,9 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
-      - src/**
-      - tools/**
-      - tests/**
+      - crates/audeniq-qc/src/**
+      - crates/audeniq-qc-tools/**
+      - crates/audeniq-qc/tests/**
       - .github/workflows/media-codecs.yml
   workflow_dispatch:
 permissions:
@@ -29,11 +29,11 @@ jobs:
           sudo apt-get install -y -qq ffmpeg time
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - run: cargo clippy --workspace --features reference-codecs --locked --all-targets -- -D warnings
+      - run: cargo clippy --workspace --features audeniq-qc/reference-codecs --locked --all-targets -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo test --workspace --features reference-codecs --locked --target-dir reference-target
+      - run: cargo test --workspace --features audeniq-qc/reference-codecs --locked --target-dir reference-target
       - run: cargo build --workspace --release --locked
-      - run: cargo build --release --features reference-codecs --locked --target-dir reference-target
+      - run: cargo build -p audeniq-qc --release --features reference-codecs --locked --target-dir reference-target
       - name: Identify both builds
         run: |
           target/release/audeniq-qc capabilities
@@ -54,8 +54,8 @@ jobs:
       - name: Build native predecessor and diagnostic build
         run: |
           cargo build --manifest-path predecessor/Cargo.toml --release --locked --target-dir predecessor-target
-          cargo clippy --workspace --features profile-native --locked --all-targets -- -D warnings
-          cargo build --features profile-native --release --locked --target-dir profile-target
+          cargo clippy --workspace --features audeniq-qc/profile-native --locked --all-targets -- -D warnings
+          cargo build -p audeniq-qc --features profile-native --release --locked --target-dir profile-target
       - name: Same-host native before and after comparisons
         run: |
           target/release/audeniq-qc-tools benchmark-decode --seconds 240 --repeats 7 --comparison-binary predecessor-target/release/audeniq-qc --output streaming-decoding-benchmark.json

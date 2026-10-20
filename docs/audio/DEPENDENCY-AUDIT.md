@@ -187,7 +187,7 @@ applicable to future internalization/rewrites.
 
 ## Evidence and upstream documentation
 
-* [Cargo.toml](../Cargo.toml), [Cargo.lock](../Cargo.lock), [THIRD_PARTY.md](../THIRD_PARTY.md).
+* [Cargo.toml](../../crates/audeniq-qc/Cargo.toml), [Cargo.lock](../../Cargo.lock), [THIRD_PARTY.md](../../THIRD_PARTY.md).
 * [Fresh rerun](BENCHMARK-THREEWAY-RERUN.md); [raw ARM](benchmark-threeway-rerun-arm.json).
 * [Default dependency tree job, attempt 3](https://github.com/TAE-OK-11/audeniq-qc/actions/runs/37209634333/attempts/3), job 111467079517.
 * [sha2 0.11.0](https://docs.rs/crate/sha2/0.11.0): runtime SHA2/SHA-NI and fallback.

@@ -15,7 +15,7 @@ audeniq-photo.workspace = true
 photo-png.workspace = true
 photo-jpeg.workspace = true
 photo-deflate.workspace = true
-serde_json = "1"
+media-json.workspace = true
 mimalloc.workspace = true
 libc = "0.2"
 

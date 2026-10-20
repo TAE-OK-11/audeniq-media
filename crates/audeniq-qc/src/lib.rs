@@ -11,7 +11,9 @@ pub mod flac;
 mod flac_decode;
 mod inflate;
 mod jpeg;
-pub mod json;
+/// Report JSON (serde_json-identical output), shared with audeniq-photo.
+pub use media_json as json;
+pub use media_json::{json, json_enum, json_struct};
 pub mod kernels;
 mod m4a;
 pub mod meter;

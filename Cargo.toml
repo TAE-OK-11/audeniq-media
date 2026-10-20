@@ -1,34 +1,97 @@
-[package]
-name = "audeniq-qc"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.89"
-license = "LGPL-2.1-or-later"
-description = "Bounded, lossless-only audio normalization and QC for AUDENIQ"
-repository = "https://github.com/TAE-OK-11/audeniq-qc"
-
 [workspace]
-members = ["tools"]
-default-members = ["."]
+members = ["crates/*"]
 resolver = "2"
 
-[dependencies]
-symphonia = { version = "=0.5.4", optional = true, default-features = false, features = ["flac", "alac", "isomp4"] }
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "UNLICENSED"
+repository = "https://github.com/TAE-OK-11/audeniq-qc"
 
-[dev-dependencies]
-# Independent oracles for the native MD5, SHA-256, CRC-32, cover and JSON tests only.
-md5_reference = { package = "md-5", version = "=0.10.6" }
-sha2_reference = { package = "sha2", version = "=0.11.0" }
-crc32fast_reference = { package = "crc32fast", version = "=1.5.2" }
-image_reference = { package = "image", version = "=0.24.9", default-features = false, features = ["jpeg", "png"] }
-serde_json_reference = { package = "serde_json", version = "=1.0.140" }
+[workspace.dependencies]
+media-hash = { path = "crates/media-hash", default-features = false }
+media-json = { path = "crates/media-json" }
+photo-core = { path = "crates/photo-core" }
+photo-deflate = { path = "crates/photo-deflate" }
+photo-png = { path = "crates/photo-png" }
+photo-jpeg = { path = "crates/photo-jpeg" }
+photo-icc = { path = "crates/photo-icc" }
+photo-meta = { path = "crates/photo-meta" }
+photo-qr = { path = "crates/photo-qr" }
+photo-ocr = { path = "crates/photo-ocr" }
+audeniq-photo = { path = "crates/audeniq-photo" }
+photo-pdf = { path = "crates/photo-pdf" }
+photo-pdf-syntax = { path = "crates/photo-pdf-syntax" }
+photo-pdf-interpret = { path = "crates/photo-pdf-interpret" }
+photo-pdf-ccitt = { path = "crates/photo-pdf-ccitt" }
+photo-pdf-jbig2 = { path = "crates/photo-pdf-jbig2" }
+photo-pdf-jpeg2000 = { path = "crates/photo-pdf-jpeg2000" }
+photo-pdf-cmap = { path = "crates/photo-pdf-cmap" }
+photo-pdf-postscript = { path = "crates/photo-pdf-postscript" }
 
-[features]
-default = []
-reference-codecs = ["dep:symphonia"]
-profile-native = []
+# Third-party crates the PDF renderer (from hayro) still uses; candidates
+# for later merging (see docs/PORTING.md).
+bitflags = "2.10"
+# Global allocator of the binaries (libraries never pick one).
+mimalloc = { version = "0.1.52", default-features = false }
+bytemuck = "1"
+brotli = { version = "8", default-features = false, features = ["std"] }
+fearless_simd = "1.0.0"
+kurbo = "0.13.0"
+log = "0.4"
+memchr = { version = "2.8.0", default-features = false, features = ["alloc"] }
+moxcms = "0.8.1"
+phf = { version = "0.13.1", default-features = false }
+pic-scale = { version = "0.7.9", default-features = false }
+rustc-hash = "2"
+siphasher = "1"
+skrifa = "0.46.0"
+smallvec = "1"
+vello_cpu = { version = "0.3", default-features = false, features = ["std", "u8_pipeline"] }
+yoke = "0.8"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Codec loops index several parallel arrays by the same position; iterator
+# rewrites are less readable there. `as_chunks` needs Rust 1.88+ APIs we
+# keep optional for now.
+needless_range_loop = "allow"
+chunks_exact_to_as_chunks = "allow"
+# Rasterizer and decoder kernels (from hayro) pass many scalars.
+too_many_arguments = "allow"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
+
+# `release` is the audio engine's measured profile: runtime-dispatched SIMD
+# kernels, no LTO (fat LTO or one codegen unit made ALAC conversion ~13%
+# slower) and abort on panic (no unwind runtime to resolve at start-up).
 [profile.release]
 opt-level = 3
 panic = "abort"
-# CPU acceleration is implemented in runtime-dispatched kernels, not LTO.
+
+# audeniq-photo binaries: cross-crate inlining matters there (OCR is ~11%
+# slower without LTO), and decoder panics are isolated with catch_unwind, so
+# audeniq-photo refuses to build without unwinding. Build with
+# `--profile release-photo`.
+[profile.release-photo]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.profiling]
+inherits = "release-photo"
+debug = true
+strip = false
+
+# The LSTM forward pass is unusably slow unoptimized; keep tests fast.
+[profile.dev.package.photo-ocr]
+opt-level = 3

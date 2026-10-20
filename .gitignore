@@ -4,3 +4,4 @@
 __pycache__/
 /reference-target/
 /profile-target/
+*.profraw

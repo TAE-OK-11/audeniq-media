@@ -119,7 +119,16 @@ pub fn qr_count(data: &[u8], deadline: &Deadline) -> Result<usize> {
 pub(crate) fn intensity(data: &[u8], deadline: &Deadline) -> Result<(usize, usize, Vec<u8>)> {
     let img = match Format::detect(data) {
         Some(Format::Jpeg) => photo_jpeg::decode_luma(data, &Limits::default(), deadline)?.1,
-        _ => decode_image(data, &Limits::default(), deadline)?.image,
+        Some(Format::Png) => {
+            // Row by row straight to luma (same values and errors as
+            // decoding all pixels first, without the full-color image).
+            let (info, gray) = photo_png::decode_gray(data, &Limits::default(), deadline)?;
+            if info.animation_frames.is_some_and(|n| n != 1) {
+                return Err(Error::Invalid("static JPEG/PNG required"));
+            }
+            return Ok((info.width as usize, info.height as usize, gray));
+        }
+        None => decode_image(data, &Limits::default(), deadline)?.image,
     };
     let (width, height) = (img.width as usize, img.height as usize);
     let gray = if img.format == PixelFormat::Gray8 {

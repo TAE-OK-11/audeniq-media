@@ -317,3 +317,110 @@ fn parallel_pieces_roundtrip_and_are_deterministic() {
         }
     }
 }
+
+/// Luma of `decode`'s pixels, the reference for `decode_gray`.
+fn luma(img: &Image) -> Vec<u8> {
+    let ch = img.format.channels();
+    img.data
+        .chunks_exact(ch)
+        .map(|p| match ch {
+            1 | 2 => p[0],
+            _ => {
+                ((u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500)
+                    / 1000) as u8
+            }
+        })
+        .collect()
+}
+
+fn same_as_decode(png: &[u8], limits: &Limits) {
+    let reference =
+        decode(png, limits, &Deadline::NONE).map(|(i, img)| (i.width, i.height, luma(&img)));
+    let streamed =
+        photo_png::decode_gray(png, limits, &Deadline::NONE).map(|(i, g)| (i.width, i.height, g));
+    assert_eq!(format!("{reference:?}"), format!("{streamed:?}"));
+}
+
+/// Rebuild `png` with its IDAT stream replaced (CRCs recomputed).
+fn with_idat(png: &[u8], stream: &[u8]) -> Vec<u8> {
+    let mut out = png[..8].to_vec();
+    let mut idat_written = false;
+    for chunk in photo_png::ChunkIter::new(png).unwrap() {
+        let chunk = chunk.unwrap();
+        let data = if &chunk.kind == b"IDAT" {
+            if idat_written {
+                continue;
+            }
+            idat_written = true;
+            stream
+        } else {
+            chunk.data
+        };
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&chunk.kind);
+        out.extend_from_slice(data);
+        let mut kd = chunk.kind.to_vec();
+        kd.extend_from_slice(data);
+        out.extend_from_slice(&photo_deflate::crc32(&kd).to_be_bytes());
+    }
+    out
+}
+
+/// Row-streamed luma equals full decoding plus conversion: values, and on
+/// truncated or corrupt streams the same error.
+#[test]
+fn decode_gray_matches_decode_then_luma() {
+    let limits = [
+        Limits::default(),
+        Limits {
+            max_pixels: 600,
+            ..Limits::default()
+        },
+    ];
+    for format in [
+        PixelFormat::Gray8,
+        PixelFormat::GrayAlpha8,
+        PixelFormat::Rgb8,
+        PixelFormat::Rgba8,
+    ] {
+        for (w, h) in [(1, 1), (3, 5), (64, 33), (257, 70)] {
+            let png = encode(&gradient(w, h, format), Level::DEFAULT).unwrap();
+            for l in &limits {
+                same_as_decode(&png, l);
+            }
+            for cut in [
+                9,
+                png.len() / 3,
+                png.len() / 2,
+                png.len() - 13,
+                png.len() - 1,
+            ] {
+                same_as_decode(&png[..cut], &limits[0]);
+            }
+            let stream: Vec<u8> = photo_png::ChunkIter::new(&png)
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|c| &c.kind == b"IDAT")
+                .flat_map(|c| c.data.to_vec())
+                .collect();
+            let mut raw = Vec::new();
+            photo_deflate::inflate_zlib(&stream, &mut raw, usize::MAX, false).unwrap();
+            let row = raw.len() / h as usize;
+            for edit in 0..4 {
+                let mut bad = raw.clone();
+                match edit {
+                    0 => bad[(h as usize / 2) * row] = 9, // invalid filter type mid-image
+                    1 => bad.truncate(raw.len() - row / 2 - 1),
+                    2 => bad.extend_from_slice(&[0; 5]),
+                    _ => bad[0] = 200,
+                }
+                let png = with_idat(&png, &photo_deflate::compress_zlib(&bad, Level::DEFAULT));
+                same_as_decode(&png, &limits[0]);
+            }
+            let mut flipped = stream.clone();
+            let mid = flipped.len() / 2;
+            flipped[mid] ^= 0x10;
+            same_as_decode(&with_idat(&png, &flipped), &limits[0]);
+        }
+    }
+}

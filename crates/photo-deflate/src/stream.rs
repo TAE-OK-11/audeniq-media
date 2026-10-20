@@ -220,6 +220,90 @@ pub fn inflate_zlib(
     run(true, input, out, limit, truncate)
 }
 
+/// [`inflate_zlib`] without collecting the output: it is passed to `sink`
+/// in pieces of at most `chunk` bytes, so memory stays at one piece. The
+/// limit, truncation, checksum and error behaviour are the same; only the
+/// output buffer the engine fills differs, which does not change what it
+/// decodes.
+pub fn inflate_zlib_chunks(
+    input: &[u8],
+    limit: usize,
+    truncate: bool,
+    chunk: usize,
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<Inflated> {
+    let mut st = take_inflate(true);
+    let r = run_chunks(&mut st, input, limit, truncate, chunk.max(1), sink);
+    if r.is_ok() {
+        give_inflate(true, st);
+    }
+    r
+}
+
+fn run_chunks(
+    st: &mut InflateState,
+    input: &[u8],
+    limit: usize,
+    truncate: bool,
+    chunk: usize,
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<Inflated> {
+    let mut pos = 0;
+    let mut total = 0usize;
+    let mut buf = Vec::with_capacity(chunk);
+    loop {
+        if total >= limit {
+            // Same probe as `run_with`: is there more output?
+            let mut probe = Vec::with_capacity(1);
+            let (code, used, produced) = st.step(&input[pos..], &mut probe, 1);
+            pos += used;
+            if produced > 0 {
+                return if truncate {
+                    Ok(Inflated {
+                        consumed: pos,
+                        complete: false,
+                    })
+                } else {
+                    Err(Error::Limit("decompressed size"))
+                };
+            }
+            match code {
+                ReturnCode::StreamEnd => {
+                    return Ok(Inflated {
+                        consumed: pos,
+                        complete: true,
+                    })
+                }
+                ReturnCode::Ok | ReturnCode::BufError if used > 0 => continue,
+                ReturnCode::Ok | ReturnCode::BufError => return Err(Error::Truncated),
+                other => return Err(engine_error(other)),
+            }
+        }
+        buf.clear();
+        let room = (limit - total).min(chunk);
+        let (code, used, produced) = st.step(&input[pos..], &mut buf, room);
+        pos += used;
+        total += produced;
+        if produced > 0 {
+            sink(&buf);
+        }
+        match code {
+            ReturnCode::StreamEnd => {
+                return Ok(Inflated {
+                    consumed: pos,
+                    complete: true,
+                })
+            }
+            ReturnCode::Ok | ReturnCode::BufError => {
+                if produced == 0 && used == 0 {
+                    return Err(Error::Truncated);
+                }
+            }
+            other => return Err(engine_error(other)),
+        }
+    }
+}
+
 /// Decode a complete zlib stream that must produce exactly `expected` bytes
 /// and be followed by nothing. Used where the exact bytes are evidence.
 pub fn inflate_zlib_exact(input: &[u8], expected: usize) -> Result<Vec<u8>> {

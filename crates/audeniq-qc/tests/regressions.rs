@@ -534,6 +534,9 @@ fn reencoded_flac_streaminfo_md5_is_correct_for_known_unknown_and_bad_source_md5
 /// the source PCM, while a channel mismatch, any other false depth and AAC
 /// in an .m4a stay refused.
 #[test]
+// The sample entry check lives in the native MP4 parser (m4a.rs), which the
+// reference-codecs (symphonia) build replaces.
+#[cfg(not(feature = "reference-codecs"))]
 fn alac_sample_entry_legacy_depth_is_accepted_and_decoded() {
     let d = Dir::new();
     let src = d.0.join("source.wav");

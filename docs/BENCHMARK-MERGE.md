@@ -172,3 +172,36 @@
 
 - 하네스: `ab.py`(교차 실행, CPU 고정, 부트스트랩 CI, 출력 해시 비교)와 cachegrind Ir 비교 스크립트로 측정했습니다. 케이스 목록은 위 표와 같습니다.
 - JSON 대조: `cargo test -p media-json --release` (1M 무작위 f64, 짧은 십진수·정수·2^k·비정규수·10^k 인접값, 이스케이프 위치, 깊은 중첩).
+
+## 할당자 비교 (통합 후 추가 실험)
+
+photo는 mimalloc v3, qc는 glibc를 씁니다. 같은 코드에 할당자만 바꿔 비교했습니다. jemalloc 5.3과 tcmalloc(gperftools 2.15)은 시스템 malloc 빌드에 `LD_PRELOAD`로 붙였습니다.
+
+### photo: 최대 RSS (MB)
+
+| 케이스 | mimalloc v3 (현재) | mimalloc v2 | jemalloc | tcmalloc | tcmalloc-minimal | glibc |
+|---|---:|---:|---:|---:|---:|---:|
+| probe 3000 jpg | 10.6 | 6.6 | 7.5 | 11.3 | 10.6 | 4.7 |
+| cover 3000 jpg+qr | 23.1 | 17.1 | 16.4 | 20.6 | 19.8 | 14.0 |
+| cover 3000 progressive | 51.1 | 42.6 | 41.9 | 37.7 | 37.0 | 30.9 |
+| ocr 1400 png | 63.5 | 39.2 | 33.8 | 38.6 | 37.7 | 30.6 |
+| sanitize 3000 png | 67.1 | 63.0 | 38.5 | 43.2 | 42.4 | 37.1 |
+| sanitize pdf scan3 | 61.1 | 52.4 | 36.9 | 62.9 | 62.1 | 44.5 |
+| convert 3000 jpg->png | 71.2 | 63.3 | 39.8 | 44.5 | 43.6 | 38.6 |
+
+### photo: CPU 시간 (v3 대비, 정밀 교차 측정에서 유의한 차이만)
+
+| 할당자 | 빨라진 곳 | 느려진 곳 |
+|---|---|---|
+| mimalloc v2 | 작은 명령 −8~19%, 프로그레시브 −15%, PNG 정화 −7% | `pdf-rasterize` +12% |
+| jemalloc | OCR PNG −19% | PDF 정화 +21~24%, `pdf-rasterize` +20%, JPEG 정화(1400px) +7% |
+| glibc | 작은 명령 −20~30% | PDF +11~22%, 프로그레시브 JPEG +22% |
+| mimalloc v3 + `purge_delay=0`·`arena_eager_commit=0` | — | PDF +11~21%, JPEG 정화 +10% |
+
+PDF가 mimalloc v3에서만 빠른 이유는 할당 횟수가 아니라(1~5천 회), 페이지마다 큰 버퍼(래스터 12 MB, 이미지 12 MB, 내장 JPEG 11 MB)를 새로 잡았다 놓는 패턴 때문입니다. mimalloc v3은 놓은 페이지를 붙들고 재사용해서 빠르지만 RSS가 큽니다. 다른 할당자는 매번 새 페이지를 받아 0으로 채웁니다.
+
+**결론**: 모든 경로에서 느려지지 않는 할당자는 현재 mimalloc v3뿐이라 photo는 그대로 둡니다. RSS는 코드에서 큰 버퍼를 줄이는 방식으로 낮춥니다(QR 탐지: 3000px 41→23 MB). PDF 렌더러가 페이지 버퍼를 재사용하도록 바꾸면 jemalloc(백엔드와 같은 할당자)으로 옮겨 RSS를 약 40% 더 줄일 수 있습니다.
+
+### qc
+
+qc는 RSS가 3~6 MB이고, jemalloc·tcmalloc을 붙이면 라이브러리만큼 RSS가 늘며(+2.5~6 MB) 속도 차이는 유의하지 않습니다. glibc를 유지합니다.

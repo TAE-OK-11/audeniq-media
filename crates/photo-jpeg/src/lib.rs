@@ -16,8 +16,8 @@ mod huffman;
 mod idct;
 mod markers;
 
-pub use decoder::{DecodeOptions, decode, decode_luma, decode_with};
-pub use encoder::{Encoder, Subsampling, encode};
+pub use decoder::{DecodeOptions, Rows, decode, decode_luma, decode_rows, decode_with};
+pub use encoder::{Encoder, RowEncoder, Subsampling, encode};
 pub use markers::{ColorTransform, Component, FrameInfo, Info, Segment, read_info, segments};
 
 /// Natural-order index of the k-th zigzag coefficient (`jpeg_natural_order`),

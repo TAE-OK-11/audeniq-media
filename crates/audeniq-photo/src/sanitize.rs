@@ -89,6 +89,23 @@ fn xmp_orientation(xmp: &[u8]) -> Option<i64> {
     digits.parse().ok()
 }
 
+fn jpeg_orientation(info: &photo_jpeg::Info) -> Option<i64> {
+    info.exif
+        .as_deref()
+        .and_then(exif_orientation)
+        .or_else(|| info.xmp.as_deref().and_then(xmp_orientation))
+}
+
+/// Pillow opens multi-picture JPEGs as MPO, which the sanitizer refused.
+fn is_mpo(data: &[u8]) -> Result<bool> {
+    let (segs, _) = photo_jpeg::segments(data)?;
+    Ok(segs.iter().any(|s| {
+        s.marker == 0xE2
+            && s.data.starts_with(b"MPF\0")
+            && mpf_images(&s.data[4..]).is_some_and(|n| n > 1)
+    }))
+}
+
 /// Decode PNG or JPEG with sanitizer limits and gather orientation/ICC.
 pub fn decode_image(data: &[u8], limits: &Limits, deadline: &Deadline) -> Result<Decoded> {
     let format = Format::detect(data).ok_or(Error::Invalid("static JPEG/PNG required"))?;
@@ -125,22 +142,11 @@ pub fn decode_image(data: &[u8], limits: &Limits, deadline: &Deadline) -> Result
             })
         }
         Format::Jpeg => {
-            let (segs, _) = photo_jpeg::segments(data)?;
-            // Pillow opens multi-picture JPEGs as MPO, which the sanitizer refused.
-            let mpo = segs.iter().any(|s| {
-                s.marker == 0xE2
-                    && s.data.starts_with(b"MPF\0")
-                    && mpf_images(&s.data[4..]).is_some_and(|n| n > 1)
-            });
-            if mpo {
+            if is_mpo(data)? {
                 return Err(Error::Invalid("static JPEG/PNG required"));
             }
             let (info, image) = photo_jpeg::decode(data, limits, deadline)?;
-            let orientation = info
-                .exif
-                .as_deref()
-                .and_then(exif_orientation)
-                .or_else(|| info.xmp.as_deref().and_then(xmp_orientation));
+            let orientation = jpeg_orientation(&info);
             Ok(Decoded {
                 format,
                 image,
@@ -212,12 +218,16 @@ fn raw_profile(text: &str) -> Option<Vec<u8>> {
 
 /// The script's `pixels()`: static JPEG/PNG → orientation-baked,
 /// sRGB, metadata-free RGB8 pixels.
-pub fn pixels(data: &[u8], deadline: &Deadline) -> Result<Image> {
-    let limits = Limits {
+fn sanitizer_limits() -> Limits {
+    Limits {
         max_pixels: MAX_PIXELS,
         max_alloc: 256 * 1024 * 1024,
         ..Limits::default()
-    };
+    }
+}
+
+pub fn pixels(data: &[u8], deadline: &Deadline) -> Result<Image> {
+    let limits = sanitizer_limits();
     let d = decode_image(data, &limits, deadline)?;
     let mut image = orient::apply(d.image, d.orientation.unwrap_or(1));
     if image.width > MAX_SIDE || image.height > MAX_SIDE {
@@ -279,17 +289,129 @@ pub fn sanitize(data: &[u8], kind: Kind, deadline: &Deadline) -> Result<Vec<u8>>
         if kind == Kind::Signature {
             photo_png::validate_signature(data)?;
         }
+        if kind == Kind::Jpeg
+            && let Some(out) = jpeg_to_jpeg_streaming(data, deadline)
+        {
+            return check_output(out);
+        }
         let clean = pixels(data, deadline)?;
         deadline.check()?;
         let out = match kind {
             Kind::Png | Kind::Signature => photo_png::encode(&clean, Level::DEFAULT)?,
             Kind::Jpeg => photo_jpeg::encode(&clean, 95, photo_jpeg::Subsampling::S444)?,
         };
-        if out.is_empty() || out.len() > MAX_OUTPUT {
-            return Err(Error::Limit("output exceeded limit"));
-        }
-        Ok(out)
+        check_output(out)
     })
+}
+
+fn check_output(out: Vec<u8>) -> Result<Vec<u8>> {
+    if out.is_empty() || out.len() > MAX_OUTPUT {
+        return Err(Error::Limit("output exceeded limit"));
+    }
+    Ok(out)
+}
+
+/// JPEG to JPEG without the whole image in memory: decoded row groups go
+/// through the same color normalization as [`pixels`] into a [`RowEncoder`]
+/// as they arrive. Only taken when that is exactly [`pixels`] + encode
+/// (sequential single-scan input, no EXIF/XMP rotation, within the size
+/// limit, usable or no ICC profile, the same metadata after the scans);
+/// anything else, errors included, returns `None` and the caller takes the
+/// whole-image path, which then defines the result.
+fn jpeg_to_jpeg_streaming(data: &[u8], deadline: &Deadline) -> Option<Vec<u8>> {
+    if Format::detect(data) != Some(Format::Jpeg) || is_mpo(data).ok()? {
+        return None;
+    }
+    let pre = photo_jpeg::read_info(data).ok()?;
+    let orientation = jpeg_orientation(&pre);
+    let (w, h) = (pre.frame.width, pre.frame.height);
+    if pre.frame.progressive()
+        || orientation.is_some_and(|o| (2..=8).contains(&o))
+        || w > MAX_SIDE
+        || h > MAX_SIDE
+    {
+        return None;
+    }
+    let icc = pre.icc_profile.clone().filter(|p| !p.is_empty());
+    let profile = match &icc {
+        Some(p) => Some(photo_icc::Profile::parse(p).ok()?),
+        None => None,
+    };
+    let mut enc = photo_jpeg::RowEncoder::new(
+        photo_jpeg::Encoder::new(95, photo_jpeg::Subsampling::S444),
+        w,
+        h,
+        PixelFormat::Rgb8,
+    )
+    .ok()?;
+    // Built on the first rows, once the decoder's output format is known.
+    let mut transform: Option<photo_icc::Transform> = None;
+    let mut rgb = Vec::new();
+    let mut failed = false;
+    let decoded = photo_jpeg::decode_rows(data, &sanitizer_limits(), deadline, &mut |r| {
+        if failed {
+            return;
+        }
+        let ch = r.format.channels();
+        let n = r.data.len() / ch;
+        let rows: &[u8] = if let Some(profile) = &profile {
+            if transform.is_none() {
+                match photo_icc::Transform::to_srgb(profile, ch) {
+                    Ok(t) => transform = Some(t),
+                    Err(_) => {
+                        failed = true;
+                        return;
+                    }
+                }
+            }
+            // `convert` is what `convert_rgb_in_place` runs per pixel,
+            // here without its copies; it writes all `n` pixels (no
+            // clearing: only a size change fills).
+            rgb.resize(n * 3, 0);
+            transform
+                .as_ref()
+                .expect("built above")
+                .convert(r.data, &mut rgb);
+            &rgb
+        } else {
+            match r.format {
+                PixelFormat::Rgb8 => r.data,
+                PixelFormat::Gray8 => {
+                    rgb.clear();
+                    rgb.extend(r.data.iter().flat_map(|&g| [g, g, g]));
+                    &rgb
+                }
+                PixelFormat::Cmyk8 => {
+                    rgb.clear();
+                    rgb.extend(
+                        r.data
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .flat_map(|p| photo_core::cmyk_to_rgb(*p)),
+                    );
+                    &rgb
+                }
+                _ => {
+                    failed = true;
+                    return;
+                }
+            }
+        };
+        failed |= enc.push_rows(rows).is_err();
+    });
+    let (info, image) = decoded.ok()?;
+    // A frame decoded whole (multi-scan), a failed step, or metadata after
+    // the scans that changes orientation or profile: not this path.
+    if image.is_some()
+        || failed
+        || jpeg_orientation(&info) != orientation
+        || info.icc_profile.filter(|p| !p.is_empty()) != icc
+    {
+        return None;
+    }
+    deadline.check().ok()?;
+    enc.finish().ok()
 }
 
 /// Encode RGB/gray pixels as a metadata-free PNG (adaptive filters, zlib

@@ -48,13 +48,28 @@ struct Stream {
     planes: Vec<Plane>,
     conv: Converter,
     format: PixelFormat,
+    /// The whole image, or one row group when the rows go to a sink.
     data: Vec<u8>,
+    band: bool,
     /// Output rows per row group (MCU row, or block row of a one-component
     /// scan).
     rows: usize,
 }
 
-struct State {
+/// Rows of a sequential frame handed to [`decode_rows`]' sink.
+pub struct Rows<'a> {
+    pub format: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    /// First image row in `data`.
+    pub y: u32,
+    /// Whole rows, `width * format.channels()` bytes each.
+    pub data: &'a [u8],
+}
+
+struct State<'s> {
+    /// Takes the rows of a direct frame instead of an output image.
+    sink: Option<&'s mut dyn FnMut(Rows<'_>)>,
     qt: [Option<[u16; 64]>; 4],
     dc: [Option<HuffTable>; 4],
     ac: [Option<HuffTable>; 4],
@@ -191,6 +206,7 @@ impl Frame {
         &mut self,
         buffered: bool,
         output: Option<(ColorTransform, bool)>,
+        band: bool,
         limits: &Limits,
     ) -> Result<()> {
         self.buffered = Some(buffered);
@@ -228,12 +244,14 @@ impl Frame {
         let rings: usize = planes.iter().map(|p| p.data.len()).sum();
         limits.alloc_size((w * h * format.channels() + rings) as u64, 1)?;
         let conv = Converter::new(&planes, transform, invert, w)?;
+        let rows = if one { 8 } else { 8 * self.max_v };
         self.stream = Some(Stream {
             planes,
             conv,
             format,
-            data: vec![0; w * h * format.channels()],
-            rows: if one { 8 } else { 8 * self.max_v },
+            data: vec![0; if band { rows.min(h) } else { h } * w * format.channels()],
+            band,
+            rows,
         });
         Ok(())
     }
@@ -241,15 +259,20 @@ impl Frame {
 
 impl Stream {
     /// Convert row group `g`; its neighbours must still be in the rings.
-    fn emit(&mut self, g: usize, width: usize, height: usize) {
+    /// In band mode the rows land at the start of `data` and their first
+    /// row and byte length are returned for the sink.
+    fn emit(&mut self, g: usize, width: usize, height: usize) -> Option<(usize, usize)> {
         let y0 = g * self.rows;
         let y1 = ((g + 1) * self.rows).min(height);
         if y0 >= y1 {
-            return;
+            return None;
         }
         let row = width * self.format.channels();
+        let at = if self.band { 0 } else { y0 * row };
+        let len = (y1 - y0) * row;
         self.conv
-            .rows(&self.planes, y0, &mut self.data[y0 * row..y1 * row]);
+            .rows(&self.planes, y0, &mut self.data[at..at + len]);
+        self.band.then_some((y0, len))
     }
 }
 
@@ -307,11 +330,44 @@ pub fn decode_with(
     deadline: &Deadline,
     opts: &DecodeOptions,
 ) -> Result<(Info, Image)> {
+    let (info, image) = decode_impl(data, limits, deadline, opts, None)?;
+    Ok((info, image.expect("no sink: the image is returned")))
+}
+
+/// [`decode`] that hands a single-scan sequential frame to `sink` one row
+/// group at a time (top to bottom, each row once) instead of keeping the
+/// whole image: then `None` is returned for the image. Progressive and
+/// multi-scan frames are decoded whole and returned as with [`decode`].
+/// The rows, the [`Info`] and the errors are those of [`decode`]; after an
+/// error the rows already passed are meaningless.
+pub fn decode_rows(
+    data: &[u8],
+    limits: &Limits,
+    deadline: &Deadline,
+    sink: &mut dyn FnMut(Rows<'_>),
+) -> Result<(Info, Option<Image>)> {
+    decode_impl(
+        data,
+        limits,
+        deadline,
+        &DecodeOptions::default(),
+        Some(sink),
+    )
+}
+
+fn decode_impl(
+    data: &[u8],
+    limits: &Limits,
+    deadline: &Deadline,
+    opts: &DecodeOptions,
+    sink: Option<&mut dyn FnMut(Rows<'_>)>,
+) -> Result<(Info, Option<Image>)> {
     let luma = opts.luma_only;
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
         return Err(Error::Invalid("not a JPEG file"));
     }
     let mut st = State {
+        sink,
         qt: [None; 4],
         dc: Default::default(),
         ac: Default::default(),
@@ -405,14 +461,20 @@ pub fn decode_with(
     let (jfif, adobe) = (st.jfif, st.adobe);
     let transform = color_transform(&frame.info, jfif, adobe);
     let image = if let Some(stream) = frame.stream.take() {
-        Image {
+        (!stream.band).then_some(Image {
             width: frame.info.width,
             height: frame.info.height,
             format: stream.format,
             data: stream.data,
-        }
+        })
     } else {
-        buffered_image(&mut frame, transform, st.luma_only, opts, deadline)?
+        Some(buffered_image(
+            &mut frame,
+            transform,
+            st.luma_only,
+            opts,
+            deadline,
+        )?)
     };
     let info = Info {
         icc_profile: assemble_icc(&mut icc_chunks),
@@ -504,7 +566,7 @@ photo_core::multiversion! {
         data: &[u8],
         header: &[u8],
         start: usize,
-        st: &mut State,
+        st: &mut State<'_>,
         limits: &Limits,
         deadline: &Deadline,
     ) -> Result<usize> = scan_body;
@@ -515,7 +577,7 @@ fn scan_body(
     data: &[u8],
     header: &[u8],
     start: usize,
-    st: &mut State,
+    st: &mut State<'_>,
     limits: &Limits,
     deadline: &Deadline,
 ) -> Result<usize> {
@@ -571,7 +633,7 @@ fn scan_body(
                 st.opts.invert_cmyk,
             )
         });
-        frame.allocate(!direct, output, limits)?;
+        frame.allocate(!direct, output, st.sink.is_some(), limits)?;
     } else if frame.buffered == Some(false) {
         return Err(Error::Invalid("extra scan in single-scan sequential JPEG"));
     }
@@ -702,21 +764,11 @@ fn scan_body(
             }
         }
         if !buffered && uy > 0 {
-            let (w, h) = (frame.info.width as usize, frame.info.height as usize);
-            frame
-                .stream
-                .as_mut()
-                .expect("direct frame")
-                .emit(uy - 1, w, h);
+            emit_group(frame, &mut st.sink, uy - 1);
         }
     }
     if !buffered && units_y > 0 {
-        let (w, h) = (frame.info.width as usize, frame.info.height as usize);
-        frame
-            .stream
-            .as_mut()
-            .expect("direct frame")
-            .emit(units_y - 1, w, h);
+        emit_group(frame, &mut st.sink, units_y - 1);
     }
     let (m, at) = match r.finish_segment() {
         Ok(v) => v,
@@ -725,6 +777,24 @@ fn scan_body(
     };
     let _ = m;
     Ok(at)
+}
+
+/// Convert row group `g` of a direct frame and pass it to the sink, if any.
+#[inline(always)]
+fn emit_group(frame: &mut Frame, sink: &mut Option<&mut dyn FnMut(Rows<'_>)>, g: usize) {
+    let (w, h) = (frame.info.width as usize, frame.info.height as usize);
+    let stream = frame.stream.as_mut().expect("direct frame");
+    if let Some((y0, len)) = stream.emit(g, w, h)
+        && let Some(sink) = sink
+    {
+        sink(Rows {
+            format: stream.format,
+            width: frame.info.width,
+            height: frame.info.height,
+            y: y0 as u32,
+            data: &stream.data[..len],
+        });
+    }
 }
 
 #[inline(always)]

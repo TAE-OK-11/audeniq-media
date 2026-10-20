@@ -4,8 +4,7 @@ use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecod
 use alloc::borrow::Cow;
 use photo_core::{Deadline, Limits, PixelFormat};
 
-/// Largest embedded JPEG decoded (pixels); a 600 dpi A3 scan fits.
-const MAX_PIXELS: u64 = 128_000_000;
+use super::MAX_IMAGE_PIXELS as MAX_PIXELS;
 
 pub(crate) fn decode(
     data: &[u8],

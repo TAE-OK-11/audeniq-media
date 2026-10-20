@@ -21,6 +21,11 @@ pub(crate) fn decode(
         .and_then(|g| g.decoded().ok());
 
     let image = photo_pdf_jbig2::Image::new_embedded(data, globals.as_deref()).ok()?;
+    // The page size comes from the file and the output is allocated up
+    // front.
+    if u64::from(image.width()) * u64::from(image.height()) > super::MAX_IMAGE_PIXELS {
+        return None;
+    }
 
     // Whenever possible (if we don't have an indexed color space), we convert
     // the data as 8-bit instead of 1-bit, so that it can be easier converted

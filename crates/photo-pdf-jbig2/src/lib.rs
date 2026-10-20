@@ -190,6 +190,7 @@ impl<'a> Image<'a> {
     /// This is useful in case you want to convert multiple JBIG2 images,
     /// as it allows `hayro-jbig2` to reuse allocations during decoding.
     pub fn decode_with<D: Decoder>(&self, decoder: &mut D, ctx: &mut DecoderContext) -> Result<()> {
+        let _budget = bitmap::BudgetScope::new();
         decode_segments(&self.segments, self.height_from_stripes, ctx)?;
         emit_bitmap(&ctx.page_bitmap, decoder);
 

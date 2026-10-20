@@ -14,6 +14,11 @@ mod lzw_flate;
 mod png;
 mod run_length;
 
+/// Largest embedded image decoded (pixels): a 600 dpi A3 scan fits. Image
+/// sizes come from the file, and pages are rendered at a bounded size, so
+/// anything larger is refused instead of allocated.
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 128_000_000;
+
 use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::*;

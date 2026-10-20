@@ -14,6 +14,60 @@ use alloc::vec::Vec;
 // to `u16::MAX`, which should be more than enough.
 pub(crate) const MAX_DIMENSION: u32 = u16::MAX as u32;
 
+/// Largest bitmap (pixels): a 600 dpi A3 page fits. Sizes come from the
+/// file, and MMR-coded blank rows cost about a bit each, so without this a
+/// few bytes could ask for `MAX_DIMENSION`² pixels.
+pub(crate) const MAX_PIXELS: u64 = 128_000_000;
+
+/// Pixels all bitmaps of one decode may allocate in total (symbol
+/// dictionaries hold up to 65535 bitmaps).
+pub(crate) const MAX_TOTAL_PIXELS: u64 = 1 << 32;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static BUDGET: core::cell::Cell<u64> = const { core::cell::Cell::new(MAX_TOTAL_PIXELS) };
+}
+
+/// Resets the pixel budget for one decode (and again when dropped).
+pub(crate) struct BudgetScope(());
+
+impl BudgetScope {
+    pub(crate) fn new() -> Self {
+        #[cfg(feature = "std")]
+        BUDGET.with(|b| b.set(MAX_TOTAL_PIXELS));
+        BudgetScope(())
+    }
+}
+
+impl Drop for BudgetScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        BUDGET.with(|b| b.set(MAX_TOTAL_PIXELS));
+    }
+}
+
+/// Check a bitmap size against the limits and charge it to the budget.
+fn charge(width: u32, height: u32) -> Result<()> {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        bail!(OverflowError::BitmapDimension);
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PIXELS {
+        bail!(OverflowError::BitmapDimension);
+    }
+    #[cfg(feature = "std")]
+    if !BUDGET.with(|b| match b.get().checked_sub(pixels) {
+        Some(left) => {
+            b.set(left);
+            true
+        }
+        None => false,
+    }) {
+        bail!(OverflowError::BitmapDimension);
+    }
+    Ok(())
+}
+
 /// The underlying word type for packed pixel storage.
 /// Change this to `u32` to switch back to 32-bit words.
 pub(crate) type Word = u32;
@@ -62,9 +116,7 @@ impl Bitmap {
         y_location: u32,
         default_pixel: bool,
     ) -> Result<Self> {
-        if width > MAX_DIMENSION || height > MAX_DIMENSION {
-            bail!(OverflowError::BitmapDimension);
-        }
+        charge(width, height)?;
 
         let stride = width.div_ceil(WORD_BITS);
         let default_word: Word = if default_pixel { !0 } else { 0 };
@@ -85,9 +137,7 @@ impl Bitmap {
         height: u32,
         default_pixel: bool,
     ) -> Result<()> {
-        if width > MAX_DIMENSION || height > MAX_DIMENSION {
-            return Err(OverflowError::BitmapDimension.into());
-        }
+        charge(width, height)?;
 
         let stride = width.div_ceil(WORD_BITS);
         let default_word: Word = if default_pixel { !0 } else { 0 };
@@ -137,7 +187,7 @@ impl Bitmap {
         // TODO: Figure out how we can optimize this, especially since this is a
         // bottleneck for symbols/patterns.
         let dest_x_start = x.max(0);
-        let dest_x_end = (x + other.width as i32).min(self.width as i32);
+        let dest_x_end = x.saturating_add(other.width as i32).min(self.width as i32);
 
         if dest_x_start >= dest_x_end {
             return;
@@ -148,7 +198,7 @@ impl Bitmap {
         let dest_x_end = dest_x_end as u32;
 
         for src_y in 0..other.height {
-            let dest_y = y + src_y as i32;
+            let dest_y = y.saturating_add(src_y as i32);
             if dest_y < 0 || dest_y >= self.height as i32 {
                 continue;
             }
@@ -211,5 +261,19 @@ impl Bitmap {
         }
 
         self.data[(row * self.stride + word_idx) as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_far_away() {
+        let mut page = Bitmap::new(8, 8).unwrap();
+        let region = Bitmap::new_with(8, 8, 0, 0, true).unwrap();
+        page.combine(&region, i32::MAX - 1, 0, CombinationOperator::Or);
+        page.combine(&region, 0, i32::MAX - 1, CombinationOperator::Or);
+        assert!(page.data.iter().all(|&w| w == 0));
     }
 }

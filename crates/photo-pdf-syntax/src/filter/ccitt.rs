@@ -23,7 +23,14 @@ pub(crate) fn decode(
         .get::<u32>(ROWS)
         .unwrap_or(0)
         .max(image_params.height);
+    // `Rows` 0: unknown, decode until the data ends (the output grows as
+    // rows arrive). Either way at most `MAX_IMAGE_PIXELS` pixels, as the
+    // sizes come from the file.
+    let max_pixels = super::MAX_IMAGE_PIXELS as usize;
     let output_len = (columns as usize).checked_mul(rows as usize)?;
+    if output_len > max_pixels {
+        return None;
+    }
     let end_of_block = params.get::<bool>(END_OF_BLOCK).unwrap_or(true);
 
     let settings = DecodeSettings {
@@ -46,9 +53,11 @@ pub(crate) fn decode(
     // the data as 8-bit instead of 1-bit, so that it can be easier converted
     // into an RGBA8 image.
 
-    let (decoded, bpc) = if image_params.is_indexed {
+    let (decoded, bpc, decoded_rows) = if image_params.is_indexed {
         struct BitPackDecoder {
             output: Vec<u8>,
+            max_len: usize,
+            too_large: bool,
             decoded_rows: u32,
             buffer: u8,
             bit_count: u8,
@@ -67,6 +76,11 @@ pub(crate) fn decode(
 
         impl Decoder for BitPackDecoder {
             fn push_pixels(&mut self, white: bool, mut count: u32) {
+                if self.too_large || self.output.len() + (count as usize).div_ceil(8) > self.max_len
+                {
+                    self.too_large = true;
+                    return;
+                }
                 if self.bit_count > 0 {
                     let head = count.min(u32::from(8 - self.bit_count)) as u8;
                     self.buffer <<= head;
@@ -109,6 +123,8 @@ pub(crate) fn decode(
 
         let mut decoder = BitPackDecoder {
             output: Vec::new(),
+            max_len: max_pixels.div_ceil(8),
+            too_large: false,
             decoded_rows: 0,
             buffer: 0,
             bit_count: 0,
@@ -118,21 +134,31 @@ pub(crate) fn decode(
 
         // If we decoded at least one row, let's be lenient and return what we got.
         // See also 0001763.pdf.
-        if result.is_err() && decoder.decoded_rows == 0 {
+        if decoder.too_large || (result.is_err() && decoder.decoded_rows == 0) {
             return None;
         }
 
-        (decoder.output, 1)
+        (decoder.output, 1, decoder.decoded_rows)
     } else {
         struct Luma8Decoder {
             output: Vec<u8>,
             idx: usize,
+            max_len: usize,
+            too_large: bool,
             decoded_rows: u32,
         }
 
         impl Decoder for Luma8Decoder {
             fn push_pixels(&mut self, white: bool, count: u32) {
                 let len = count as usize;
+                if self.too_large || self.idx + len > self.max_len {
+                    self.too_large = true;
+                    return;
+                }
+                // With an unknown number of rows the output grows on demand.
+                if self.output.len() < self.idx + len {
+                    self.output.resize(self.idx + len, 0xFF);
+                }
 
                 if !white {
                     self.output[self.idx..self.idx + len].fill(0x00);
@@ -149,20 +175,22 @@ pub(crate) fn decode(
         let mut decoder = Luma8Decoder {
             output: vec![0xFF; output_len],
             idx: 0,
+            max_len: max_pixels,
+            too_large: false,
             decoded_rows: 0,
         };
         let mut context = DecoderContext::new(settings);
         let result = photo_pdf_ccitt::decode(data, &mut decoder, &mut context);
 
-        if result.is_err() && decoder.decoded_rows == 0 {
+        if decoder.too_large || (result.is_err() && decoder.decoded_rows == 0) {
             return None;
         }
 
-        if result.is_err() {
-            decoder.output.truncate(decoder.idx);
+        if result.is_err() || rows == 0 {
+            decoder.output.resize(decoder.idx, 0xFF);
         }
 
-        (decoder.output, 8)
+        (decoder.output, 8, decoder.decoded_rows)
     };
 
     Some(FilterResult {
@@ -172,7 +200,7 @@ pub(crate) fn decode(
             color_space: Some(ImageColorSpace::Gray),
             bits_per_component: bpc,
             width: settings.columns,
-            height: rows,
+            height: if rows == 0 { decoded_rows } else { rows },
         }),
     })
 }
@@ -192,5 +220,29 @@ mod tests {
 
         assert_eq!(decoded.data.as_ref(), &[0; 8]);
         assert_eq!(decoded.image_data.unwrap().height, 1);
+    }
+
+    #[test]
+    fn unknown_rows() {
+        let params = Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap();
+
+        let decoded = decode(&[0x35, 0x14], &params, &ImageDecodeParams::default()).unwrap();
+        assert_eq!(decoded.data.as_ref(), &[0; 8]);
+        assert_eq!(decoded.image_data.unwrap().height, 1);
+
+        let image_params = ImageDecodeParams {
+            is_indexed: true,
+            ..Default::default()
+        };
+        let decoded = decode(&[0x35, 0x14], &params, &image_params).unwrap();
+        assert_eq!(decoded.data.as_ref(), &[0]);
+        assert_eq!(decoded.image_data.unwrap().height, 1);
+    }
+
+    /// Sizes from the file are capped, not allocated.
+    #[test]
+    fn huge_declared_size_is_refused() {
+        let params = Dict::from_bytes(b"<< /K -1 /Columns 100000 /Rows 100000 >>").unwrap();
+        assert!(decode(&[0; 16], &params, &ImageDecodeParams::default()).is_none());
     }
 }

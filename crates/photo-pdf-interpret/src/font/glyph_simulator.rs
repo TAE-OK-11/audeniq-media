@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use photo_pdf_syntax::fxhash::FxHashMap;
 use skrifa::GlyphId;
 use std::cell::{Cell, RefCell};
 

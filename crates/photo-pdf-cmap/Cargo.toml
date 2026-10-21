@@ -9,11 +9,14 @@ license = "Apache-2.0 OR MIT"
 [features]
 default = ["embed-cmaps"]
 std = []
-embed-cmaps = ["std", "dep:brotli"]
+embed-cmaps = ["std", "dep:photo-deflate"]
 
 [dependencies]
 photo-pdf-postscript.workspace = true
-brotli = { workspace = true, optional = true }
+photo-deflate = { workspace = true, optional = true }
+
+[dev-dependencies]
+media-hash = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

@@ -19,7 +19,6 @@ bytemuck = { workspace = true, features = ["bytemuck_derive"] }
 fearless_simd.workspace = true
 kurbo.workspace = true
 pic-scale.workspace = true
-rustc-hash.workspace = true
 vello_cpu.workspace = true
 
 [lints]

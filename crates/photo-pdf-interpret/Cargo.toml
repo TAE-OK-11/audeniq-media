@@ -15,13 +15,9 @@ logging = ["dep:log", "photo-pdf-syntax/logging"]
 [dependencies]
 photo-pdf-cmap.workspace = true
 photo-pdf-syntax = { workspace = true, features = ["std", "images"] }
-bitflags.workspace = true
 kurbo.workspace = true
 log = { workspace = true, optional = true }
 moxcms = { workspace = true, features = ["in_place"] }
-phf = { workspace = true, features = ["macros"] }
-rustc-hash.workspace = true
-siphasher.workspace = true
 skrifa.workspace = true
 smallvec.workspace = true
 yoke = { workspace = true, features = ["derive"] }

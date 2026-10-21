@@ -29,4 +29,15 @@
 ## 아직 외부 크레이트를 쓰는 부분 (이후 합칠 후보)
 
 `vello_cpu`(래스터라이저), `skrifa`(글꼴), `kurbo`(기하), `moxcms`(ICC — `photo-icc`로 대체 예정),
-`pic-scale`(이미지 리샘플링), `fearless_simd`, `phf`, `yoke`, `smallvec`, `rustc-hash`, `brotli`, `memchr`.
+`pic-scale`(이미지 리샘플링), `fearless_simd`, `yoke`, `smallvec`, `bytemuck`, `log`(선택 기능).
+
+자체 코드로 바꾼 것(출력 동일, hayro 시험 PDF 294개에서 `pdf-info`·`pdf-render`·`sanitize` 결과 바이트 동일):
+
+| 크레이트 | 대체 |
+|---|---|
+| `phf` | 생성 표를 키로 정렬한 정적 배열 + 이진 탐색(`photo-pdf-interpret` `font::table`). 정렬은 테스트로 고정 |
+| `siphasher` | SipHash-1-3 128비트를 `util::hash128`에 직접 구현. siphasher 1.0.4와 같은 값(테스트 벡터) |
+| `rustc-hash` | FxHasher를 `photo-pdf-syntax::fxhash`로 이식. rustc-hash 2.1.3과 같은 값(테스트 벡터) |
+| `memchr` | `util::find_needle`/`findr_needle`: 첫 두 바이트를 16바이트씩 SWAR로 찾고 후보만 비교. CPU 시간 차이는 측정 노이즈 안 |
+| `bitflags` | `FontFlags`를 상수와 비트 연산으로(`from_bits`·`from_bits_truncate`·`contains` 의미 동일) |
+| `brotli` | 내장 CMap 묶음을 zlib로 다시 압축해 `photo-deflate`로 해제(`assets/README.md`, 해제 결과 SHA-256 고정) |

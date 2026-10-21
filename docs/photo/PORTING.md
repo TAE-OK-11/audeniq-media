@@ -62,7 +62,8 @@
 ## 5. 장기 계획
 
 1. **2차 (완료)**: PDF — hayro를 가져와 합치고 Poppler 제거. 남은 합칠 대상: `moxcms` → `photo-icc`, `pic-scale` → 자체 리샘플러,
-   이후 `vello_cpu`·`skrifa`·`kurbo`
+   이후 `vello_cpu`·`skrifa`·`kurbo`. `phf`·`siphasher`·`rustc-hash`·`memchr`·`bitflags`·`brotli`는 자체 코드로 바꿈
+   (`crates/photo-pdf/UPSTREAM.md`)
 2. **3차 (완료)**: OCR — `photo-ocr`.
    - 1단계 완료: traineddata 로더, int8 LSTM 망(Convolve·Maxpool·LSTM·요약 LSTM·역방향·전치·Softmax), `TRand`(minstd)까지
      같은 난수, Leptonica 전처리(`pixScale`의 LI·면적 평균·2x/4x·unsharp mask, 컬러는 채널별 축소 후 휘도, 반전 재시도),

@@ -12,7 +12,6 @@ use crate::font::type1::Type1Font;
 use crate::font::type3::Type3;
 use crate::interpret::state::State;
 use crate::{CMapResolverFn, CacheKey, FontResolverFn, InterpreterSettings, Paint};
-use bitflags::bitflags;
 use kurbo::{Affine, BezPath, Vec2};
 use outline::OutlineFont;
 use photo_pdf_syntax::object::Name;
@@ -34,6 +33,7 @@ mod generated;
 mod glyph_simulator;
 pub(crate) mod outline;
 mod standard_font;
+pub(crate) mod table;
 mod true_type;
 mod type1;
 pub(crate) mod type3;
@@ -500,19 +500,46 @@ impl FontStretch {
     }
 }
 
-bitflags! {
-    /// Bitflags describing various characteristics of fonts.
-    #[derive(Debug)]
-    pub(crate) struct FontFlags: u32 {
-        const FIXED_PITCH = 1 << 0;
-        const SERIF = 1 << 1;
-        const SYMBOLIC = 1 << 2;
-        const SCRIPT = 1 << 3;
-        const NON_SYMBOLIC = 1 << 5;
-        const ITALIC = 1 << 6;
-        const ALL_CAP = 1 << 16;
-        const SMALL_CAP = 1 << 17;
-        const FORCE_BOLD = 1 << 18;
+/// Bitflags describing various characteristics of fonts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FontFlags(u32);
+
+impl FontFlags {
+    pub(crate) const FIXED_PITCH: Self = Self(1 << 0);
+    pub(crate) const SERIF: Self = Self(1 << 1);
+    #[allow(dead_code)] // part of the PDF flag set (PDF 32000-1, Table 123)
+    pub(crate) const SYMBOLIC: Self = Self(1 << 2);
+    #[allow(dead_code)] // part of the PDF flag set (PDF 32000-1, Table 123)
+    pub(crate) const SCRIPT: Self = Self(1 << 3);
+    pub(crate) const NON_SYMBOLIC: Self = Self(1 << 5);
+    pub(crate) const ITALIC: Self = Self(1 << 6);
+    #[allow(dead_code)] // part of the PDF flag set (PDF 32000-1, Table 123)
+    pub(crate) const ALL_CAP: Self = Self(1 << 16);
+    pub(crate) const SMALL_CAP: Self = Self(1 << 17);
+    #[allow(dead_code)] // part of the PDF flag set (PDF 32000-1, Table 123)
+    pub(crate) const FORCE_BOLD: Self = Self(1 << 18);
+    const ALL: u32 = (1 << 0)
+        | (1 << 1)
+        | (1 << 2)
+        | (1 << 3)
+        | (1 << 5)
+        | (1 << 6)
+        | (1 << 16)
+        | (1 << 17)
+        | (1 << 18);
+
+    /// `None` if `bits` sets a flag that is not defined above.
+    pub(crate) fn from_bits(bits: u32) -> Option<Self> {
+        (bits & !Self::ALL == 0).then_some(Self(bits))
+    }
+
+    /// Drops undefined flags.
+    pub(crate) fn from_bits_truncate(bits: u32) -> Self {
+        Self(bits & Self::ALL)
+    }
+
+    pub(crate) fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
     }
 }
 
@@ -701,4 +728,21 @@ pub(crate) fn normalized_glyph_name(mut name: &str) -> &str {
     }
 
     name
+}
+
+#[cfg(test)]
+mod font_flags_tests {
+    use super::FontFlags;
+
+    /// Same semantics as the `bitflags` 2 type it replaces.
+    #[test]
+    fn from_bits_rejects_undefined_flags_and_truncate_drops_them() {
+        assert!(FontFlags::from_bits(1 << 4).is_none());
+        let f = FontFlags::from_bits((1 << 1) | (1 << 6)).unwrap();
+        assert!(f.contains(FontFlags::SERIF) && f.contains(FontFlags::ITALIC));
+        assert!(!f.contains(FontFlags::FIXED_PITCH));
+        let t = FontFlags::from_bits_truncate((1 << 4) | (1 << 17));
+        assert!(t.contains(FontFlags::SMALL_CAP));
+        assert_eq!(FontFlags::from_bits(t.0), Some(t));
+    }
 }

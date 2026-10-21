@@ -1,0 +1,19 @@
+[package]
+name = "audeniq-music"
+description = "AUDENIQ media engine command line: audio QC (audeniq-qc) and image/PDF tools (audeniq-photo) in one binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "audeniq-music"
+path = "src/main.rs"
+
+[dependencies]
+audeniq-qc = { path = "../audeniq-qc" }
+photo-cli = { path = "../photo-cli" }
+mimalloc.workspace = true
+
+[lints]
+workspace = true

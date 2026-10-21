@@ -16,10 +16,10 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use kurbo::{Affine, Point, Shape};
 use photo_pdf_syntax::content::TypedIter;
 use photo_pdf_syntax::content::ops::TypedInstruction;
+use photo_pdf_syntax::fxhash::FxHashMap;
 use photo_pdf_syntax::object::dict::keys::{ANNOTS, AP, AS, F, MCID, N, OC, RECT};
 use photo_pdf_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
 use photo_pdf_syntax::page::{Page, Resources};
-use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 

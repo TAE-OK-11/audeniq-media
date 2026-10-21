@@ -5,7 +5,7 @@ pub(crate) use std::collections::HashMap;
 pub(crate) use alloc::collections::BTreeMap as HashMap;
 
 #[cfg(feature = "std")]
-pub(crate) use rustc_hash::{FxHashMap, FxHashSet};
+pub(crate) use crate::fxhash::{FxHashMap, FxHashSet};
 
 #[cfg(not(feature = "std"))]
 pub(crate) use alloc::collections::BTreeMap as FxHashMap;

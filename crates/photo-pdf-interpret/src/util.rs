@@ -1,7 +1,6 @@
 //! A number of utility methods.
 
 use kurbo::{BezPath, PathEl, Rect};
-use siphasher::sip128::{Hasher128, SipHasher13};
 use std::hash::Hash;
 use std::ops::Sub;
 
@@ -109,11 +108,110 @@ impl PointExt for kurbo::Point {
     }
 }
 
-/// Calculate a 128-bit siphash of a value.
+/// Calculate a 128-bit siphash of a value (SipHash-1-3, 128-bit output, zero
+/// key; the same values as `siphasher::sip128::SipHasher13`).
 pub(crate) fn hash128<T: Hash + ?Sized>(value: &T) -> u128 {
     let mut state = SipHasher13::new();
     value.hash(&mut state);
-    state.finish128().as_u128()
+    state.finish128()
+}
+
+/// SipHash-1-3 with the 128-bit finalization. Integers are hashed through
+/// `write` as native-endian bytes, which matches the reference on the
+/// little-endian targets this crate builds for.
+struct SipHasher13 {
+    v: [u64; 4],
+    tail: u64,
+    ntail: usize,
+    length: usize,
+}
+
+impl SipHasher13 {
+    fn new() -> Self {
+        Self {
+            v: [
+                0x736f6d6570736575,
+                0x646f72616e646f83,
+                0x6c7967656e657261,
+                0x7465646279746573,
+            ],
+            tail: 0,
+            ntail: 0,
+            length: 0,
+        }
+    }
+
+    #[inline]
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(13) ^ v[0];
+        v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(16) ^ v[2];
+        v[0] = v[0].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(21) ^ v[0];
+        v[2] = v[2].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(17) ^ v[2];
+        v[2] = v[2].rotate_left(32);
+    }
+
+    #[inline]
+    fn compress(&mut self, m: u64) {
+        self.v[3] ^= m;
+        Self::round(&mut self.v);
+        self.v[0] ^= m;
+    }
+
+    fn finish128(&self) -> u128 {
+        let mut v = self.v;
+        let b = ((self.length as u64 & 0xff) << 56) | self.tail;
+        v[3] ^= b;
+        Self::round(&mut v);
+        v[0] ^= b;
+        v[2] ^= 0xee;
+        for _ in 0..3 {
+            Self::round(&mut v);
+        }
+        let h1 = v[0] ^ v[1] ^ v[2] ^ v[3];
+        v[1] ^= 0xdd;
+        for _ in 0..3 {
+            Self::round(&mut v);
+        }
+        let h2 = v[0] ^ v[1] ^ v[2] ^ v[3];
+        u128::from(h1) | (u128::from(h2) << 64)
+    }
+}
+
+impl std::hash::Hasher for SipHasher13 {
+    fn write(&mut self, mut msg: &[u8]) {
+        self.length += msg.len();
+        if self.ntail != 0 {
+            let take = (8 - self.ntail).min(msg.len());
+            for (i, b) in msg[..take].iter().enumerate() {
+                self.tail |= u64::from(*b) << (8 * (self.ntail + i));
+            }
+            self.ntail += take;
+            msg = &msg[take..];
+            if self.ntail < 8 {
+                return;
+            }
+            self.compress(self.tail);
+            self.tail = 0;
+            self.ntail = 0;
+        }
+        let mut words = msg.chunks_exact(8);
+        for w in &mut words {
+            self.compress(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        for (i, b) in words.remainder().iter().enumerate() {
+            self.tail |= u64::from(*b) << (8 * i);
+        }
+        self.ntail = words.remainder().len();
+    }
+
+    fn finish(&self) -> u64 {
+        (self.finish128() >> 64) as u64
+    }
 }
 
 pub(crate) trait BezPathExt {
@@ -197,4 +295,40 @@ pub fn x_y_advances(transform: &kurbo::Affine) -> (kurbo::Vec2, kurbo::Vec2) {
         kurbo::Vec2::new(x_advance.x, x_advance.y),
         kurbo::Vec2::new(y_advance.x, y_advance.y),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash128;
+
+    /// Reference values from `siphasher` 1.0.4 `sip128::SipHasher13`.
+    #[test]
+    fn hash128_matches_siphasher() {
+        let bytes: [(&[u8], u128); 4] = [
+            (b"", 0x9ddcabcca2183c5fec4827ee54e8eed6),
+            (b"a", 0x97f2a473ba79840c3dcb2dc54f1a5652),
+            (b"abcdefg", 0xa79b74dac3df258dfdc8992f71b776cf),
+            (b"abcdefgh", 0x1b081bbd879867e84fd7859d2f47bfff),
+        ];
+        for (input, expected) in bytes {
+            assert_eq!(hash128(input), expected, "{input:?}");
+        }
+        let long: Vec<u8> = (0u8..=200).collect();
+        assert_eq!(hash128(long.as_slice()), 0x50fd5251d022b61af7482f33aa08f9fc);
+        let tuple = (
+            1u8,
+            2u16,
+            3u32,
+            4u64,
+            5usize,
+            "str",
+            (-1.5f64).to_bits(),
+            7u128,
+            [9u8; 13],
+            -3i32,
+        );
+        assert_eq!(hash128(&tuple), 0xad5c6060e169e89c195abb599254eb05);
+        let nested = (hash128(&42u32), vec!["x".to_string(), "yz".to_string()]);
+        assert_eq!(hash128(&nested), 0x7246631afdada83671ab34f867862888);
+    }
 }

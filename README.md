@@ -13,10 +13,11 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 오디오 엔진(
 |---|---|
 | `crates/media-hash` | **공통** MD5·SHA-256·CRC32 (SHA-NI/ARMv8 SHA2, PCLMUL/VPCLMUL/PMULL 런타임 선택), MD5+SHA-256 융합 경로 |
 | `crates/media-json` | **공통** JSON 값·출력·파서 — serde_json 1.0과 바이트 단위로 같은 출력, 외부 크레이트 없음 |
-| `crates/audeniq-qc` | 오디오 엔진 라이브러리와 `audeniq-qc` 바이너리 |
+| `crates/audeniq-qc` | 오디오 엔진 라이브러리·명령행(`cli`)과 `audeniq-qc` 바이너리 |
 | `crates/audeniq-qc-tools` | 오디오 검증·벤치마크 도구 (`audeniq-qc-tools`) |
 | `crates/audeniq-photo` | 이미지·PDF 통합 API |
-| `crates/photo-cli` | `audeniq-photo` 바이너리 |
+| `crates/photo-cli` | photo 명령행 라이브러리와 `audeniq-photo` 바이너리 |
+| `crates/audeniq-music` | 백엔드가 설치하는 단일 바이너리 `audeniq-music` (`qc …`, `photo …`) |
 | `crates/photo-bench` | 외부 도구 대비 벤치마크 (`audeniq-photo-bench`) |
 | `crates/photo-*` | 코덱·파서: core, deflate, png, jpeg, icc, meta, qr, ocr, pdf(+syntax/interpret/ccitt/jbig2/jpeg2000/cmap/postscript) |
 
@@ -29,7 +30,21 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 오디오 엔진(
 
 ## 빌드
 
-두 바이너리는 성능 특성이 달라 release 프로필을 나눕니다.
+백엔드는 오디오와 photo를 한 실행 파일 `audeniq-music`으로 씁니다.
+
+```sh
+cargo build --profile release-music --locked -p audeniq-music  # target/release-music/audeniq-music
+```
+
+```text
+audeniq-music qc <명령> ...      audeniq-qc와 같은 명령·JSON (예: audeniq-music qc analyze FILE --fingerprint)
+audeniq-music photo <명령> ...   audeniq-photo와 같은 명령·출력 (예: audeniq-music photo sanitize SRC DST MIME)
+audeniq-music --version          audeniq-music 0.1.0 (audeniq-qc/0.1.0)
+```
+
+`qc` 쪽은 패닉 훅으로 통합 전과 같이 패닉 시 abort(SIGABRT)합니다. 엔진 버전(`audeniq-qc/0.1.0`)과 출력은 바뀌지 않습니다.
+
+측정·검증용으로 두 엔진을 따로 빌드할 수도 있습니다. 성능 특성이 달라 release 프로필을 나눕니다.
 
 ```sh
 cargo build --release --locked -p audeniq-qc                 # target/release/audeniq-qc
@@ -40,6 +55,7 @@ cargo build --profile release-photo --locked -p photo-cli    # target/release-ph
 |---|---|---|
 | `release` | opt-level 3, LTO 없음, panic=abort (통합 전 audeniq-qc와 동일) | 오디오 커널은 런타임 디스패치. fat LTO·codegen-units=1이면 ALAC→FLAC+QC CPU 시간이 약 13% 증가. unwind면 시작할 때마다 동적 심볼 해석이 늘어남 |
 | `release-photo` | `release` + fat LTO, codegen-units=1, strip, panic=unwind (통합 전 audeniq-photo와 동일) | 크레이트 사이 인라이닝이 중요(LTO 없이 OCR 약 11% 느림) |
+| `release-music` | `release-photo` + thin LTO, codegen-units 16 | 한 바이너리라 unwind가 필요. fat LTO면 ALAC 변환·분석이 약 11%, codegen-units=1이면 약 26% 느려짐. thin LTO는 오디오가 `release`와 같고 JPEG 정화만 약 10% 느림 ([docs/BENCHMARK-MUSIC.md](docs/BENCHMARK-MUSIC.md)) |
 
 photo는 디코더 패닉을 `catch_unwind`로 격리해야 하므로 `audeniq-photo`는 unwind가 아닌 프로필(`--release`)로는
 컴파일 오류를 내며 빌드되지 않습니다.
@@ -61,16 +77,15 @@ photo의 대조 테스트는 exiftool, zbarimg, qrencode, ffmpeg, poppler, pytho
 
 ## 배포(백엔드) 메모
 
-백엔드(`TAE-OK-11/audeniq`의 `deploy/install-audeniq-*.sh`)는 커밋을 고정해 설치하므로 지금 배포에는 영향이
-없습니다. 이 저장소의 새 커밋으로 올릴 때:
+백엔드(`TAE-OK-11/audeniq`의 `deploy/install-audeniq-music.sh`)는 `deploy/audeniq-music.rev`의 커밋을 고정해
+설치하므로 이 저장소의 새 커밋은 그 파일을 올려야 배포에 들어갑니다:
 
 ```sh
-cargo install --locked --git https://github.com/TAE-OK-11/audeniq-qc --rev <rev> --root "$dest" audeniq-qc
-cargo install --locked --git https://github.com/TAE-OK-11/audeniq-qc --rev <rev> --root "$dest" \
-  --profile release-photo photo-cli
+cargo install --locked --git https://github.com/TAE-OK-11/audeniq-media --rev <rev> --root "$dest" \
+  --profile release-music audeniq-music
 ```
 
-바이너리 이름(`audeniq-qc`, `audeniq-photo`)과 명령행·JSON 출력은 그대로입니다.
+명령 이름 앞에 `qc`/`photo`가 붙는 것 말고 명령행·JSON 출력은 `audeniq-qc`, `audeniq-photo`와 같습니다.
 
 ## 라이선스
 

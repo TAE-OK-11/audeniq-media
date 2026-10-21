@@ -1,7 +1,7 @@
 use crate::font::UNITS_PER_EM;
 use crate::font::outline::OutlinePath;
 use kurbo::BezPath;
-use rustc_hash::FxHashMap;
+use photo_pdf_syntax::fxhash::FxHashMap;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::metrics::GlyphMetrics;
 use skrifa::outline::{DrawSettings, Engine, HintingInstance, HintingOptions, Target};

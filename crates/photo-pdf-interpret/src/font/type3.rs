@@ -14,11 +14,11 @@ use kurbo::{Affine, BezPath, Rect};
 use photo_pdf_cmap::{BfString, CMap};
 use photo_pdf_syntax::content::TypedIter;
 use photo_pdf_syntax::content::ops::TypedInstruction;
+use photo_pdf_syntax::fxhash::FxHashMap;
 use photo_pdf_syntax::object::Dict;
 use photo_pdf_syntax::object::Stream;
 use photo_pdf_syntax::object::dict::keys::{CHAR_PROCS, FONT_BBOX, FONT_MATRIX, RESOURCES};
 use photo_pdf_syntax::page::Resources;
-use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 
 #[derive(Debug)]

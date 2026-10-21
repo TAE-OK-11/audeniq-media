@@ -7,10 +7,10 @@ use crate::font::{
 use crate::{CMapResolverFn, CacheKey, FontResolverFn};
 use kurbo::BezPath;
 use photo_pdf_cmap::{BfString, CMap};
+use photo_pdf_syntax::fxhash::FxHashMap;
 use photo_pdf_syntax::object::Dict;
 use photo_pdf_syntax::object::Stream;
 use photo_pdf_syntax::object::dict::keys::{FONT_DESC, FONT_FILE, FONT_FILE3};
-use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use std::sync::Arc;
 

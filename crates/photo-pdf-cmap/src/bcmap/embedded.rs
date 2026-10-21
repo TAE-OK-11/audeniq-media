@@ -5,17 +5,19 @@ use super::huffman::{self, HuffmanTable};
 use super::reader::Reader;
 use crate::CMapName;
 
+/// Size of the decompressed bundle.
+const BUNDLE_LEN: usize = 467235;
+
 pub(super) static BUNDLE: LazyLock<Bundle> = LazyLock::new(|| {
     // We already know the bundle is valid, so we can skip validation and just
     // unwrap everywhere.
 
-    let compressed = include_bytes!("../../assets/cmaps.brotli");
+    // The upstream brotli bundle, recompressed as zlib so the in-house
+    // DEFLATE decoder reads it (assets/README.md).
+    let compressed = include_bytes!("../../assets/cmaps.zlib");
     let mut decompressed = Vec::new();
-    let mut reader = compressed.as_slice();
-
-    brotli::BrotliDecompress(&mut reader, &mut decompressed)
-        .ok()
-        .unwrap();
+    photo_deflate::inflate_zlib(compressed, &mut decompressed, BUNDLE_LEN, false).unwrap();
+    assert_eq!(decompressed.len(), BUNDLE_LEN);
 
     let mut reader = Reader::new(&decompressed);
     let huff_size = reader.read_u32().unwrap() as usize;
@@ -126,4 +128,22 @@ pub fn load_embedded(name: CMapName<'_>) -> Option<&'static [u8]> {
     let range = BUNDLE.entries.get(idx)?;
 
     Some(&BUNDLE.data[range.clone()])
+}
+
+#[cfg(test)]
+mod tests {
+    /// The bundle decodes to the upstream bytes (SHA-256 of the decompressed
+    ///  it replaced).
+    #[test]
+    fn bundle_matches_upstream() {
+        let data = &super::BUNDLE.data;
+        assert_eq!(data.len(), super::BUNDLE_LEN);
+        let mut sha = media_hash::Sha256::new();
+        sha.update(data);
+        let digest: String = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            digest,
+            "230f46e3068770bf0e2c515e95473e46df6f0854eff3552e48e355e8ab148868"
+        );
+    }
 }

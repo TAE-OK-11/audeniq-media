@@ -1,7 +1,7 @@
 use crate::util::hash128;
 use kurbo::{Affine, Rect};
+use photo_pdf_syntax::fxhash::FxHashMap;
 use photo_pdf_syntax::object::{Array, Dict, MaybeRef, Name, Null, ObjRef, Object, Stream};
-use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};

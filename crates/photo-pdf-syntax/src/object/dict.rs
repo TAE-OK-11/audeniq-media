@@ -216,7 +216,7 @@ fn read_inner<'a>(
     // 2) Maybe have an efficient per-document allocator pool for hashmaps
     // that can be reused.
     #[cfg(feature = "std")]
-    let mut offsets = FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
+    let mut offsets = FxHashMap::with_capacity_and_hasher(8, crate::fxhash::FxBuildHasher);
     #[cfg(not(feature = "std"))]
     let mut offsets = FxHashMap::new();
 

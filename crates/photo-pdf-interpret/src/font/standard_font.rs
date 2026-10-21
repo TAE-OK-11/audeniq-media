@@ -7,10 +7,10 @@ use crate::font::{
     strip_subset_prefix,
 };
 use kurbo::BezPath;
+use photo_pdf_syntax::fxhash::FxHashMap;
 use photo_pdf_syntax::object::Dict;
 use photo_pdf_syntax::object::Name;
 use photo_pdf_syntax::object::dict::keys::{BASE_FONT, FONT_DESC, FONT_WEIGHT, ITALIC_ANGLE};
-use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use skrifa::raw::TableProvider;
 use std::cell::RefCell;

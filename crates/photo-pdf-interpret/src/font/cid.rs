@@ -7,13 +7,13 @@ use crate::font::{
 use crate::{CMapResolverFn, CacheKey, FontResolverFn};
 use kurbo::{BezPath, Vec2};
 use photo_pdf_cmap::{BfString, CMap, CharacterCollection, CidFamily, WritingMode};
+use photo_pdf_syntax::fxhash::FxHashMap;
 use photo_pdf_syntax::object;
 use photo_pdf_syntax::object::Dict;
 use photo_pdf_syntax::object::Name;
 use photo_pdf_syntax::object::Stream;
 use photo_pdf_syntax::object::dict::keys::*;
 use photo_pdf_syntax::object::{Array, Object};
-use rustc_hash::FxHashMap;
 use skrifa::attribute::Style;
 use skrifa::raw::collections::int_set::Domain;
 use skrifa::{FontRef, GlyphId, MetadataProvider};

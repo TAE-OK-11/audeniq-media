@@ -135,23 +135,16 @@ macro_rules! step {
     };
 }
 macro_rules! ff {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
-        step!(
-            $a,
-            $b,
-            $d ^ ($b & ($c ^ $d)),
-            core::hint::black_box(&K)[$i],
-            $m,
-            $s
-        )
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+        step!($a, $b, $d ^ ($b & ($c ^ $d)), $k[$i], $m, $s)
     };
 }
 macro_rules! gg {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
         // (b & d) | (c & !d) with disjoint bits: the `c & !d` term and the
         // constants are summed before `b` is needed.
         $a = $b.wrapping_add(
-            $a.wrapping_add(core::hint::black_box(&K)[$i])
+            $a.wrapping_add($k[$i])
                 .wrapping_add($m)
                 .wrapping_add($c & !$d)
                 .wrapping_add($b & $d)
@@ -160,32 +153,21 @@ macro_rules! gg {
     };
 }
 macro_rules! hh {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
-        step!(
-            $a,
-            $b,
-            $b ^ ($c ^ $d),
-            core::hint::black_box(&K)[$i],
-            $m,
-            $s
-        )
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+        step!($a, $b, $b ^ ($c ^ $d), $k[$i], $m, $s)
     };
 }
 macro_rules! ii {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
-        step!(
-            $a,
-            $b,
-            $c ^ ($b | !$d),
-            core::hint::black_box(&K)[$i],
-            $m,
-            $s
-        )
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+        step!($a, $b, $c ^ ($b | !$d), $k[$i], $m, $s)
     };
 }
 
 #[inline(always)]
 pub(crate) fn compress(state: &mut [u32; 4], blocks: &[[u8; 64]]) {
+    // One optimizer barrier per call: K read from memory stays an early
+    // operand of each step (a barrier per step made it about 15% slower).
+    let k = core::hint::black_box(&K);
     let [mut a, mut b, mut c, mut d] = *state;
     for block in blocks {
         let mut m = [0u32; 16];
@@ -194,73 +176,73 @@ pub(crate) fn compress(state: &mut [u32; 4], blocks: &[[u8; 64]]) {
         }
         let (a0, b0, c0, d0) = (a, b, c, d);
 
-        ff!(a, b, c, d, m[0], 0, 7);
-        ff!(d, a, b, c, m[1], 1, 12);
-        ff!(c, d, a, b, m[2], 2, 17);
-        ff!(b, c, d, a, m[3], 3, 22);
-        ff!(a, b, c, d, m[4], 4, 7);
-        ff!(d, a, b, c, m[5], 5, 12);
-        ff!(c, d, a, b, m[6], 6, 17);
-        ff!(b, c, d, a, m[7], 7, 22);
-        ff!(a, b, c, d, m[8], 8, 7);
-        ff!(d, a, b, c, m[9], 9, 12);
-        ff!(c, d, a, b, m[10], 10, 17);
-        ff!(b, c, d, a, m[11], 11, 22);
-        ff!(a, b, c, d, m[12], 12, 7);
-        ff!(d, a, b, c, m[13], 13, 12);
-        ff!(c, d, a, b, m[14], 14, 17);
-        ff!(b, c, d, a, m[15], 15, 22);
+        ff!(k, a, b, c, d, m[0], 0, 7);
+        ff!(k, d, a, b, c, m[1], 1, 12);
+        ff!(k, c, d, a, b, m[2], 2, 17);
+        ff!(k, b, c, d, a, m[3], 3, 22);
+        ff!(k, a, b, c, d, m[4], 4, 7);
+        ff!(k, d, a, b, c, m[5], 5, 12);
+        ff!(k, c, d, a, b, m[6], 6, 17);
+        ff!(k, b, c, d, a, m[7], 7, 22);
+        ff!(k, a, b, c, d, m[8], 8, 7);
+        ff!(k, d, a, b, c, m[9], 9, 12);
+        ff!(k, c, d, a, b, m[10], 10, 17);
+        ff!(k, b, c, d, a, m[11], 11, 22);
+        ff!(k, a, b, c, d, m[12], 12, 7);
+        ff!(k, d, a, b, c, m[13], 13, 12);
+        ff!(k, c, d, a, b, m[14], 14, 17);
+        ff!(k, b, c, d, a, m[15], 15, 22);
 
-        gg!(a, b, c, d, m[1], 16, 5);
-        gg!(d, a, b, c, m[6], 17, 9);
-        gg!(c, d, a, b, m[11], 18, 14);
-        gg!(b, c, d, a, m[0], 19, 20);
-        gg!(a, b, c, d, m[5], 20, 5);
-        gg!(d, a, b, c, m[10], 21, 9);
-        gg!(c, d, a, b, m[15], 22, 14);
-        gg!(b, c, d, a, m[4], 23, 20);
-        gg!(a, b, c, d, m[9], 24, 5);
-        gg!(d, a, b, c, m[14], 25, 9);
-        gg!(c, d, a, b, m[3], 26, 14);
-        gg!(b, c, d, a, m[8], 27, 20);
-        gg!(a, b, c, d, m[13], 28, 5);
-        gg!(d, a, b, c, m[2], 29, 9);
-        gg!(c, d, a, b, m[7], 30, 14);
-        gg!(b, c, d, a, m[12], 31, 20);
+        gg!(k, a, b, c, d, m[1], 16, 5);
+        gg!(k, d, a, b, c, m[6], 17, 9);
+        gg!(k, c, d, a, b, m[11], 18, 14);
+        gg!(k, b, c, d, a, m[0], 19, 20);
+        gg!(k, a, b, c, d, m[5], 20, 5);
+        gg!(k, d, a, b, c, m[10], 21, 9);
+        gg!(k, c, d, a, b, m[15], 22, 14);
+        gg!(k, b, c, d, a, m[4], 23, 20);
+        gg!(k, a, b, c, d, m[9], 24, 5);
+        gg!(k, d, a, b, c, m[14], 25, 9);
+        gg!(k, c, d, a, b, m[3], 26, 14);
+        gg!(k, b, c, d, a, m[8], 27, 20);
+        gg!(k, a, b, c, d, m[13], 28, 5);
+        gg!(k, d, a, b, c, m[2], 29, 9);
+        gg!(k, c, d, a, b, m[7], 30, 14);
+        gg!(k, b, c, d, a, m[12], 31, 20);
 
-        hh!(a, b, c, d, m[5], 32, 4);
-        hh!(d, a, b, c, m[8], 33, 11);
-        hh!(c, d, a, b, m[11], 34, 16);
-        hh!(b, c, d, a, m[14], 35, 23);
-        hh!(a, b, c, d, m[1], 36, 4);
-        hh!(d, a, b, c, m[4], 37, 11);
-        hh!(c, d, a, b, m[7], 38, 16);
-        hh!(b, c, d, a, m[10], 39, 23);
-        hh!(a, b, c, d, m[13], 40, 4);
-        hh!(d, a, b, c, m[0], 41, 11);
-        hh!(c, d, a, b, m[3], 42, 16);
-        hh!(b, c, d, a, m[6], 43, 23);
-        hh!(a, b, c, d, m[9], 44, 4);
-        hh!(d, a, b, c, m[12], 45, 11);
-        hh!(c, d, a, b, m[15], 46, 16);
-        hh!(b, c, d, a, m[2], 47, 23);
+        hh!(k, a, b, c, d, m[5], 32, 4);
+        hh!(k, d, a, b, c, m[8], 33, 11);
+        hh!(k, c, d, a, b, m[11], 34, 16);
+        hh!(k, b, c, d, a, m[14], 35, 23);
+        hh!(k, a, b, c, d, m[1], 36, 4);
+        hh!(k, d, a, b, c, m[4], 37, 11);
+        hh!(k, c, d, a, b, m[7], 38, 16);
+        hh!(k, b, c, d, a, m[10], 39, 23);
+        hh!(k, a, b, c, d, m[13], 40, 4);
+        hh!(k, d, a, b, c, m[0], 41, 11);
+        hh!(k, c, d, a, b, m[3], 42, 16);
+        hh!(k, b, c, d, a, m[6], 43, 23);
+        hh!(k, a, b, c, d, m[9], 44, 4);
+        hh!(k, d, a, b, c, m[12], 45, 11);
+        hh!(k, c, d, a, b, m[15], 46, 16);
+        hh!(k, b, c, d, a, m[2], 47, 23);
 
-        ii!(a, b, c, d, m[0], 48, 6);
-        ii!(d, a, b, c, m[7], 49, 10);
-        ii!(c, d, a, b, m[14], 50, 15);
-        ii!(b, c, d, a, m[5], 51, 21);
-        ii!(a, b, c, d, m[12], 52, 6);
-        ii!(d, a, b, c, m[3], 53, 10);
-        ii!(c, d, a, b, m[10], 54, 15);
-        ii!(b, c, d, a, m[1], 55, 21);
-        ii!(a, b, c, d, m[8], 56, 6);
-        ii!(d, a, b, c, m[15], 57, 10);
-        ii!(c, d, a, b, m[6], 58, 15);
-        ii!(b, c, d, a, m[13], 59, 21);
-        ii!(a, b, c, d, m[4], 60, 6);
-        ii!(d, a, b, c, m[11], 61, 10);
-        ii!(c, d, a, b, m[2], 62, 15);
-        ii!(b, c, d, a, m[9], 63, 21);
+        ii!(k, a, b, c, d, m[0], 48, 6);
+        ii!(k, d, a, b, c, m[7], 49, 10);
+        ii!(k, c, d, a, b, m[14], 50, 15);
+        ii!(k, b, c, d, a, m[5], 51, 21);
+        ii!(k, a, b, c, d, m[12], 52, 6);
+        ii!(k, d, a, b, c, m[3], 53, 10);
+        ii!(k, c, d, a, b, m[10], 54, 15);
+        ii!(k, b, c, d, a, m[1], 55, 21);
+        ii!(k, a, b, c, d, m[8], 56, 6);
+        ii!(k, d, a, b, c, m[15], 57, 10);
+        ii!(k, c, d, a, b, m[6], 58, 15);
+        ii!(k, b, c, d, a, m[13], 59, 21);
+        ii!(k, a, b, c, d, m[4], 60, 6);
+        ii!(k, d, a, b, c, m[11], 61, 10);
+        ii!(k, c, d, a, b, m[2], 62, 15);
+        ii!(k, b, c, d, a, m[9], 63, 21);
 
         a = a.wrapping_add(a0);
         b = b.wrapping_add(b0);

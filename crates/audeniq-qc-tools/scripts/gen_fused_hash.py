@@ -27,7 +27,7 @@ def md5_step(blk, t):
     fn = "fgh i"[t // 16]  # placeholder
     func = ["ff", "gg", "hh", "ii"][t // 16]
     s = MD5_SHIFTS[t // 16][t % 4]
-    return f"        {func}!({a}, {b}, {c}, {d}, m{blk}[{md5_index(t)}], {t}, {s});"
+    return f"        {func}!(md5_k, {a}, {b}, {c}, {d}, m{blk}[{md5_index(t)}], {t}, {s});"
 
 
 def sha_group(blk, g):
@@ -77,6 +77,8 @@ def kernel(name, md5_blocks, sha_blocks):
     out.append("    let efgh = _mm_shuffle_epi32(hgfe, 0x1b);")
     out.append("    let mut abef = _mm_alignr_epi8(cdab, efgh, 8);")
     out.append("    let mut cdgh = _mm_blend_epi16(efgh, cdab, 0xf0);")
+    out.append("    // One optimizer barrier per call (see `md5::compress`).")
+    out.append("    let md5_k = core::hint::black_box(&MD5_K);")
     out.append("    let [mut a, mut b, mut c, mut d] = *md5;")
     out.append(f"    for (m, s) in md5_blocks")
     out.append(f"        .as_chunks::<{md5_blocks}>()")
@@ -145,14 +147,14 @@ macro_rules! step {
     };
 }
 macro_rules! ff {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
-        step!($a, $b, $d ^ ($b & ($c ^ $d)), core::hint::black_box(&MD5_K)[$i], $m, $s)
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+        step!($a, $b, $d ^ ($b & ($c ^ $d)), $k[$i], $m, $s)
     };
 }
 macro_rules! gg {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
         $a = $b.wrapping_add(
-            $a.wrapping_add(core::hint::black_box(&MD5_K)[$i])
+            $a.wrapping_add($k[$i])
                 .wrapping_add($m)
                 .wrapping_add($c & !$d)
                 .wrapping_add($b & $d)
@@ -161,13 +163,13 @@ macro_rules! gg {
     };
 }
 macro_rules! hh {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
-        step!($a, $b, $b ^ ($c ^ $d), core::hint::black_box(&MD5_K)[$i], $m, $s)
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+        step!($a, $b, $b ^ ($c ^ $d), $k[$i], $m, $s)
     };
 }
 macro_rules! ii {
-    ($a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
-        step!($a, $b, $c ^ ($b | !$d), core::hint::black_box(&MD5_K)[$i], $m, $s)
+    ($k:ident, $a:ident, $b:ident, $c:ident, $d:ident, $m:expr, $i:expr, $s:expr) => {
+        step!($a, $b, $c ^ ($b | !$d), $k[$i], $m, $s)
     };
 }
 macro_rules! rounds {

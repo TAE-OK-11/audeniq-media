@@ -4,7 +4,7 @@ description = "Dependency-free JSON values, writers and parser with serde_json-i
 version.workspace = true
 edition = "2021"
 rust-version.workspace = true
-license = "LGPL-2.1-or-later"
+license.workspace = true
 
 [dev-dependencies]
 # Independent oracle for the tests only.

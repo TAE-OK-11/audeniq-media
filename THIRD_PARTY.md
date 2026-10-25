@@ -1,7 +1,12 @@
 # Third-party provenance
 
 This file covers the audio engine and the shared crates (`crates/audeniq-qc`,
-`crates/audeniq-qc-tools`, `crates/media-hash`, `crates/media-json`). The
+`crates/audeniq-qc-tools`, `crates/media-hash`, `crates/media-json`). Only
+the FFmpeg-derived modules below are LGPL-2.1-or-later. `media-hash` and
+`media-json` contain no FFmpeg code (see their entries under Rust
+dependencies) and are AUDENIQ's own code under the workspace license
+(`UNLICENSED`); `media-json/src/ryu.rs` keeps the Ryu attribution
+(Apache-2.0 OR BSL-1.0). The
 photo crates record their sources next to the code: `docs/photo/PORTING.md`,
 `crates/photo-deflate/ENGINE.md`, `crates/photo-pdf/UPSTREAM.md`,
 `crates/photo-pdf-cmap/assets/README.md` and the OCR model notes.

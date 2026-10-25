@@ -89,6 +89,7 @@ cargo install --locked --git https://github.com/TAE-OK-11/audeniq-media --rev <r
 
 ## 라이선스
 
-크레이트마다 `Cargo.toml`의 `license`를 따릅니다. 오디오 엔진과 공통 크레이트는 LGPL-2.1-or-later
+크레이트마다 `Cargo.toml`의 `license`를 따릅니다. 오디오 엔진(FFmpeg에서 옮긴 코덱 모듈 포함)은 LGPL-2.1-or-later
 ([LICENSE](LICENSE), [COPYING.GPLv2](COPYING.GPLv2), 출처는 [THIRD_PARTY.md](THIRD_PARTY.md)),
+공통 크레이트 `media-hash`·`media-json`은 FFmpeg 코드가 없는 자체 구현이라 워크스페이스 기본값(`UNLICENSED`),
 photo 크레이트는 워크스페이스 기본값(`UNLICENSED`) 또는 각 업스트림 라이선스(hayro 계열 Apache-2.0 OR MIT 등)입니다.

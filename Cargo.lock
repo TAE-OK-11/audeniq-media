@@ -529,6 +529,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-resample"
+version = "0.1.0"
+
+[[package]]
 name = "media-video"
 version = "0.1.0"
 dependencies = [

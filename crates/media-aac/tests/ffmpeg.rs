@@ -257,3 +257,76 @@ fn damaged_units_are_errors_not_panics() {
         out.clear();
     }
 }
+
+/// Our encoder's streams, decoded by FFmpeg, match our own decode: the
+/// bitstream is read the same way by both.
+#[test]
+fn ffmpeg_reads_our_encoder() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not installed; skipped");
+        return;
+    }
+    let d = dir();
+    let raw = d.join("enc-src.f32");
+    let st = Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(source(48000, 2, 3.0))
+        .args(["-f", "f32le"])
+        .arg(&raw)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let pcm: Vec<f32> = std::fs::read(&raw)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut e = media_aac::encoder::Encoder::new(48000, 2, 256_000).unwrap();
+    let mut units = e.push(&pcm);
+    units.extend(e.finish());
+    let mut stream = Vec::new();
+    for au in &units {
+        let len = au.len() + 7;
+        stream.extend([
+            0xff,
+            0xf1,
+            (1 << 6) | (3 << 2),
+            (2 << 6) | (len >> 11) as u8,
+            (len >> 3) as u8,
+            ((len & 7) << 5) as u8 | 0x1f,
+            0xfc,
+        ]);
+        stream.extend(au);
+    }
+    let aac = d.join("ours.aac");
+    std::fs::write(&aac, &stream).unwrap();
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&aac)
+        .args(["-f", "f32le", "-c:a", "pcm_f32le", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let theirs: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+    let (ours, _) = decode(&e.asc(), &refs);
+    assert_eq!(theirs.len(), ours.len());
+    let worst = theirs
+        .iter()
+        .zip(&ours)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(worst < 1e-4, "largest difference {worst}");
+    // And against the source, after the encoder delay.
+    let (mut s, mut n) = (0f64, 0f64);
+    for (a, b) in pcm.iter().zip(&theirs[media_aac::encoder::DELAY * 2..]) {
+        s += f64::from(*a).powi(2);
+        n += f64::from(a - b).powi(2);
+    }
+    let snr = 10.0 * (s / n).log10();
+    assert!(snr > 20.0, "SNR {snr:.1} dB");
+}

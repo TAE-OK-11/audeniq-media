@@ -32,6 +32,7 @@ photo-pdf-postscript = { path = "crates/photo-pdf-postscript" }
 media-video = { path = "crates/media-video" }
 media-aac = { path = "crates/media-aac" }
 media-adm = { path = "crates/media-adm" }
+media-resample = { path = "crates/media-resample" }
 
 # Third-party crates the PDF renderer (from hayro) still uses; candidates
 # for later merging (see docs/PORTING.md).

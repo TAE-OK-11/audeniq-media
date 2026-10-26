@@ -13,6 +13,7 @@ media-hash = { path = "../crates/media-hash" }
 photo-deflate = { path = "../crates/photo-deflate" }
 audeniq-qc = { path = "../crates/audeniq-qc" }
 audeniq-photo = { path = "../crates/audeniq-photo" }
+media-video = { path = "../crates/media-video" }
 sha2 = "=0.10.9"
 md-5 = "=0.10.6"
 crc32fast = "=1.5.2"
@@ -47,5 +48,10 @@ doc = false
 [[bin]]
 name = "pdf"
 path = "fuzz_targets/pdf.rs"
+test = false
+doc = false
+[[bin]]
+name = "video"
+path = "fuzz_targets/video.rs"
 test = false
 doc = false

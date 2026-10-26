@@ -9,7 +9,8 @@ libFuzzer + AddressSanitizer 대상입니다. 워크스페이스 밖의 별도 �
 | `audio` | 파일 | `audeniq-qc` probe·tags·PCM 해시(전체 디코드), AVX2와 스칼라 |
 | `image` | JPEG/PNG | probe, cover, QR, 정화(JPEG·PNG·서명) |
 | `pdf` | PDF | `pdf::info`, PDF 정화(렌더링 포함) |
-| `video` | MP4/MOV | `media-video` 색인 분석(`audeniq-music video probe`): 상자·샘플 표·조각·코덱 헤더(SPS) |
+| `video` | MP4/MOV | `media-video` 색인 분석과 소리 측정(`audeniq-music video probe --sound`): 상자·샘플 표·조각·코덱 헤더(SPS)·AAC/PCM 디코드 |
+| `aac` | ASC 2바이트 + 접근 단위 | `media-aac` AAC-LC 디코더 |
 
 ```sh
 rustup toolchain install nightly

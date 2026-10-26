@@ -4,8 +4,10 @@
 대체하는 Rust 엔진입니다. 외부 크레이트 없이 `media-json`만 씁니다.
 
 ```text
-audeniq-music video probe FILE      보고서 JSON (stdout, 종료 0)
-audeniq-music video capabilities    엔진·규칙 버전
+audeniq-music video probe FILE           보고서 JSON (stdout, 종료 0) — 색인만 읽음
+audeniq-music video probe --sound FILE   + 소리 트랙을 디코드해 음량·피크·클리핑·무음 측정
+audeniq-music video sound-ranges FILE    소리 데이터가 있는 바이트 범위 {"ranges": [[offset, len], …], "bytes": N}
+audeniq-music video capabilities         엔진·규칙 버전
 ```
 
 오류는 `audeniq-music qc`와 같은 약속입니다: stderr에 `{"detail":…,"error":"IO|INVALID|LIMIT|USAGE"}`, 종료 코드 2.
@@ -31,7 +33,33 @@ VP9·AV1·MPEG-4 영상과 AAC·PCM·ALAC·FLAC·Opus 소리를 FFprobe 결과�
 FFprobe와 다르게 두는 것: AV1 색 정보(시퀀스 헤더 OBU)는 읽지 않고, 길이는 편집 목록이 있으면 그 길이입니다(FFprobe는
 스트림에 따라 미디어 길이를 쓰기도 해 한두 프레임 차이).
 
-## 배급 검사 (`mv-delivery-v1`)
+## 소리 측정 (`--sound`)
+
+소리 트랙(첫 번째로 켜진 트랙)을 디코드해 음원 QC와 같은 측정기(`audeniq-qc`의 EBU R128 통합 음량, True Peak,
+클리핑, 50ms 블록 무음)로 잽니다. 결과는 보고서의 `sound`(못 재면 `sound_note`에 이유)입니다.
+
+- AAC-LC: 자체 디코더 `crates/media-aac` (아래). HE-AAC는 AAC-LC 코어(절반 샘플레이트)만 디코드합니다.
+- PCM: QuickTime/ISO 정수·실수 PCM(`sowt`·`twos`·`in24`·`in32`·`fl32`·`fl64`·`lpcm`·`ipcm`).
+- 모노·스테레오만 측정합니다(5.1 등은 `sound_note`). ALAC·Opus 등도 아직 측정하지 않습니다.
+- 조각 MP4도 측정합니다(`trun`마다 표본 위치를 기록, 트랙당 200만 개까지).
+- 소리 데이터는 256MiB까지 읽습니다(24비트 48kHz 스테레오 PCM 약 15분).
+- `sound-ranges`가 알려 주는 범위만 있으면 측정 결과가 같습니다(테스트로 확인). 백엔드는 이 범위만 S3에서 받아옵니다.
+
+FFmpeg `ebur128`과의 비교(`tests/ffprobe.rs`): AAC MP4·PCM 24비트 MOV·PCM 16비트 빅엔디언 MOV·조각 MP4에서
+통합 음량 ±0.15 LU, True Peak ±0.2 dB 이내. 4분 AAC 스테레오 전체 측정 1.3초(`release-music`).
+
+### AAC 디코더 (`media-aac`)
+
+ISO/IEC 14496-3 AAC-LC: SCE·CPE·LFE, 모든 창 순서·모양(사인/KBD), M/S·인텐시티 스테레오, PNS, TNS, 펄스,
+IMDCT(DCT-IV를 1/4 크기 복소 FFT로). Huffman·밴드 경계 표는 FFmpeg `aactab.c`에서 옮겼으므로(생성 스크립트 결과)
+크레이트 라이선스는 LGPL-2.1-or-later입니다. 코드는 자체 작성입니다.
+
+- FFmpeg 디코더와 표본 단위 비교(`crates/media-aac/tests/ffmpeg.rs`): 48/44.1/32/22.05kHz, 모노·스테레오·5.1,
+  M/S·IS·TNS 각각과 모두 켠 경우, 64k~384k에서 최대 차이 2.4e-7(float 반올림 수준). PNS는 난수라 블록 에너지 1dB 이내.
+- 손상된 접근 단위 3,000개에서 패닉 없음, 퍼징 대상 `fuzz/fuzz_targets/aac.rs`.
+- 4분 256k 스테레오 디코드 0.85초(FFmpeg 단일 스레드 1.25초).
+
+## 배급 검사 (`mv-delivery-v2`)
 
 `issues`의 각 항목은 `code`, `severity`, `detail`(한국어 안내)입니다. `error`가 하나도 없으면 `mv_ready: true`.
 
@@ -39,13 +67,15 @@ FFprobe와 다르게 두는 것: AV1 색 정보(시퀀스 헤더 OBU)는 읽지 
 |---|---|
 | error (그대로는 배급 불가) | `TRUNCATED`, `MEDIA_OUTSIDE_MDAT`, `INDEX_INCONSISTENT`, `EXTERNAL_MEDIA`, `NO_VIDEO`, `NO_VIDEO_FRAMES`, `NO_AUDIO`, `NO_AUDIO_FRAMES` |
 | warning (플랫폼이 거절하거나 담당자가 봐야 함) | `VIDEO_CODEC`(H.264·HEVC·ProRes 외), `RESOLUTION_BELOW_1080P`(짧은 변), `ROTATED`, `NON_SQUARE_PIXELS`, `INTERLACED`, `VARIABLE_FRAME_RATE`, `FRAME_RATE_UNUSUAL`(23.976·24·25·29.97·30·50·59.94·60 외), `H264_HIGH_BIT_DEPTH`, `VIDEO_BIT_RATE_LOW`(H.264 1080p 8/12Mbps, 1440p 16/24, 2160p 35/53 — 30fps 이하/초과, HEVC는 절반, ProRes 제외), `MULTIPLE_VIDEO`, `MULTIPLE_AUDIO`, `AUDIO_CODEC`(AAC-LC·PCM·ALAC 외), `AUDIO_SAMPLE_RATE`(44.1kHz 미만), `AUDIO_CHANNELS`(스테레오 아님), `AUDIO_BIT_RATE_LOW`(AAC 192kbps 미만), `DURATION_MISMATCH`(1초 초과), `AV_OFFSET`(시작 100ms 초과 어긋남), `DURATION_UNKNOWN` |
-| info | `HDR`(PQ·HLG·Dolby Vision), `INDEX_AT_END` |
+| error (소리, `--sound`) | `AUDIO_SILENT`(최대 −80dBFS 미만), `AUDIO_DECODE_ERRORS`(패킷 1% 이상 깨짐; 그 미만은 warning) |
+| warning (소리, `--sound`) | `AUDIO_CLIPPING`(클리핑 표본 0.1% 이상, 또는 클리핑·True Peak 0dBTP 초과), `AUDIO_LONG_SILENCE`(무음 30초 이상 또는 50% 이상), `AUDIO_ONE_CHANNEL_SILENT`, `AUDIO_TOO_QUIET`(−30 LUFS 미만) |
+| info | `HDR`(PQ·HLG·Dolby Vision), `INDEX_AT_END`, `SOUND_NOT_MEASURED` |
 
 규칙을 바꾸면 `RULE_VERSION`을 올립니다. 백엔드는 보고서의 `rule`을 같이 저장합니다.
 
 ## 한계
 
-- 프레임을 디코딩하지 않습니다(깨진 프레임, 실제 화면 내용, 음량은 보지 않음). 담당자 확인이나 별도 디코드 검사가 필요합니다.
+- 영상 프레임은 디코딩하지 않습니다(깨진 프레임, 실제 화면 내용은 보지 않음). 담당자 확인이 필요합니다. 소리는 `--sound`로 디코드합니다.
 - 색인 한도: `moov` 64MiB, `moof` 하나 16MiB, 트랙당 샘플 5천만 개, 최상위 상자 20만 개. 넘으면 `LIMIT`.
 - MPEG-4 Part 2·MJPEG·DNxHD 등은 코덱 이름만 알려 줍니다(프로파일·픽셀 형식 없음).
 

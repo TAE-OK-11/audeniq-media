@@ -12,6 +12,8 @@ pub struct AudioConfig {
     pub bits_per_sample: Option<u32>,
     /// From an `esds` decoder config, when the encoder filled it in.
     pub avg_bit_rate: Option<u64>,
+    /// AAC `AudioSpecificConfig` bytes (empty for other codecs).
+    pub asc: Vec<u8>,
 }
 
 /// MPEG-4 descriptor: tag, then a 1–4 byte length (7 bits per byte).
@@ -123,6 +125,7 @@ fn esds(entry: &mut AudioConfig, b: &[u8]) -> Option<()> {
         let Some((5, asc, _)) = descriptor(body.get(13..)?) else {
             return Some(());
         };
+        entry.asc = asc.to_vec();
         let asc = audio_specific_config(asc)?;
         entry.profile = match asc.object {
             1 => Some("Main"),

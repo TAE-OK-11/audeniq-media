@@ -30,6 +30,7 @@ photo-pdf-jpeg2000 = { path = "crates/photo-pdf-jpeg2000" }
 photo-pdf-cmap = { path = "crates/photo-pdf-cmap" }
 photo-pdf-postscript = { path = "crates/photo-pdf-postscript" }
 media-video = { path = "crates/media-video" }
+media-aac = { path = "crates/media-aac" }
 
 # Third-party crates the PDF renderer (from hayro) still uses; candidates
 # for later merging (see docs/PORTING.md).

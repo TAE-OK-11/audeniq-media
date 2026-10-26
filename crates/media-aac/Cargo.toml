@@ -1,0 +1,11 @@
+[package]
+name = "media-aac"
+description = "AAC-LC decoder (ISO/IEC 14496-3) for AUDENIQ music-video sound checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Codebook and band tables are transcribed from FFmpeg (LGPL).
+license = "LGPL-2.1-or-later"
+
+[lints]
+workspace = true

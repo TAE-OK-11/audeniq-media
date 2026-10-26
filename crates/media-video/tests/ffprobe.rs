@@ -228,7 +228,7 @@ fn h264_aac_fast_start_is_ready() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     let p = ffprobe(&f);
     same_video(&r, &p);
     same_audio(&r, &p);
@@ -276,7 +276,7 @@ fn hevc_main10_hdr_in_mov() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     let p = ffprobe(&f);
     same_video(&r, &p);
     same_audio(&r, &p);
@@ -312,7 +312,7 @@ fn prores_hq_with_pcm() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     let p = ffprobe(&f);
     same_video(&r, &p);
     same_audio(&r, &p);
@@ -346,7 +346,7 @@ fn interlaced_and_anamorphic_h264() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     same_video(&r, &ffprobe(&f));
     assert_eq!(r.video[0].display_aspect_ratio.as_deref(), Some("16:9"));
     let c = codes(&r);
@@ -371,7 +371,7 @@ fn full_range_h264() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     same_video(&r, &ffprobe(&f));
     assert_eq!(r.video[0].color_range, Some("pc"));
 }
@@ -400,7 +400,7 @@ fn fragmented_mp4_counts_samples_from_fragments() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     assert!(r.container.fragments > 1);
     assert_eq!(r.video[0].nb_frames, 50);
     assert_eq!(r.video[0].avg_frame_rate.as_deref(), Some("25/1"));
@@ -438,7 +438,7 @@ fn variable_frame_rate_is_flagged() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     same_video(&r, &ffprobe(&f));
     assert!(r.video[0].variable_frame_rate);
     assert!(codes(&r).contains(&"VARIABLE_FRAME_RATE"));
@@ -479,7 +479,7 @@ fn rotation_and_mono_low_rate_audio() {
     ) else {
         return;
     };
-    let r = media_video::probe_path(&f).unwrap();
+    let r = media_video::probe_path(&f, false).unwrap();
     let p = ffprobe(&f);
     same_audio(&r, &p);
     let side = &stream(&p, "video")["side_data_list"][0]["rotation"];
@@ -509,7 +509,7 @@ fn silent_video_and_audio_only_are_not_ready() {
             "libx264",
         ],
     ) {
-        let r = media_video::probe_path(&f).unwrap();
+        let r = media_video::probe_path(&f, false).unwrap();
         assert!(!r.mv_ready);
         assert!(codes(&r).contains(&"NO_AUDIO"));
     }
@@ -517,7 +517,7 @@ fn silent_video_and_audio_only_are_not_ready() {
         "song.m4a",
         &["-f", "lavfi", "-i", TONE, "-t", "1", "-c:a", "aac"],
     ) {
-        let r = media_video::probe_path(&f).unwrap();
+        let r = media_video::probe_path(&f, false).unwrap();
         assert!(!r.mv_ready);
         assert!(codes(&r).contains(&"NO_VIDEO"));
     }
@@ -548,7 +548,7 @@ fn truncated_upload_is_an_error() {
     let bytes = std::fs::read(&f).unwrap();
     let cut = dir().join("cut.mp4");
     std::fs::write(&cut, &bytes[..bytes.len() * 2 / 3]).unwrap();
-    let r = media_video::probe_path(&cut).unwrap();
+    let r = media_video::probe_path(&cut, false).unwrap();
     assert!(!r.mv_ready);
     assert!(codes(&r).contains(&"TRUNCATED"), "{:?}", r.issues);
 }
@@ -573,7 +573,7 @@ fn other_codecs_are_reported() {
         let Some(f) = clip(name, "testsrc2=size=640x360:rate=24", TONE, &extra) else {
             continue;
         };
-        let r = media_video::probe_path(&f).unwrap();
+        let r = media_video::probe_path(&f, false).unwrap();
         let p = ffprobe(&f);
         same_video(&r, &p);
         same_audio(&r, &p);
@@ -586,11 +586,16 @@ fn not_a_video() {
     let d = dir();
     let png = d.join("x.png");
     std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
-    assert_eq!(media_video::probe_path(&png).unwrap_err().code(), "INVALID");
+    assert_eq!(
+        media_video::probe_path(&png, false).unwrap_err().code(),
+        "INVALID"
+    );
     let empty_moov = d.join("empty.mp4");
     std::fs::write(&empty_moov, b"\0\0\0\x10ftypisom\0\0\0\0\0\0\0\x08moov").unwrap();
     assert_eq!(
-        media_video::probe_path(&empty_moov).unwrap_err().code(),
+        media_video::probe_path(&empty_moov, false)
+            .unwrap_err()
+            .code(),
         "INVALID"
     );
 }
@@ -640,6 +645,184 @@ fn corrupted_indexes_do_not_panic() {
                 _ => 0,
             };
         }
-        let _ = media_video::probe(&mut std::io::Cursor::new(bytes));
+        let _ = media_video::probe_with(&mut std::io::Cursor::new(bytes), true);
     }
+}
+
+/// FFmpeg's EBU R128 meter on the same file: (integrated LUFS, true peak dBTP).
+fn ebur128(path: &Path) -> (f64, f64) {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:a:0",
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    let summary = &text[text.rfind("Summary:").unwrap()..];
+    let after = |key: &str| -> f64 {
+        let at = summary.find(key).unwrap() + key.len();
+        summary[at..]
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    (after("I:"), after("Peak:"))
+}
+
+#[test]
+fn sound_is_measured_like_ffmpeg_ebur128() {
+    if !tools() {
+        return;
+    }
+    let music =
+        "aevalsrc=0.5*sin(2*PI*440*t)*(0.6+0.4*sin(2*PI*0.5*t))|0.4*sin(2*PI*660*t+0.3):s=48000";
+    for (name, extra) in [
+        ("sound-aac.mp4", &["-c:a", "aac", "-b:a", "256k"][..]),
+        ("sound-pcm24.mov", &["-c:a", "pcm_s24le"][..]),
+        ("sound-pcm16be.mov", &["-c:a", "pcm_s16be"][..]),
+        (
+            "sound-frag.mp4",
+            &[
+                "-c:a",
+                "aac",
+                "-movflags",
+                "frag_keyframe+empty_moov+default_base_moof",
+                "-g",
+                "25",
+            ][..],
+        ),
+    ] {
+        let mut args = vec![
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=25",
+            "-f",
+            "lavfi",
+            "-i",
+            music,
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+        ];
+        args.extend_from_slice(extra);
+        let Some(f) = encode(name, &args) else {
+            continue;
+        };
+        let r = media_video::probe_path(&f, true).unwrap();
+        let s = r
+            .sound
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: {:?}", r.sound_note));
+        let (lufs, tp) = ebur128(&f);
+        assert!(
+            (s.integrated_lufs.unwrap() - lufs).abs() <= 0.15,
+            "{name}: {s:?} vs {lufs}"
+        );
+        assert!(
+            (s.true_peak_dbtp.unwrap() - tp).abs() <= 0.2,
+            "{name}: {s:?} vs {tp}"
+        );
+        assert_eq!(s.decode_errors, 0);
+        assert!((s.duration - 6.0).abs() < 0.1, "{name}: {}", s.duration);
+        assert!(r.mv_ready, "{name}: {:?}", r.issues);
+    }
+}
+
+#[test]
+fn sound_problems_are_flagged() {
+    if !tools() {
+        return;
+    }
+    let video = ["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25"];
+    let cases: [(&str, &str, &str); 3] = [
+        ("silent.mp4", "anullsrc=r=48000:cl=stereo", "AUDIO_SILENT"),
+        (
+            "clipped.mp4",
+            "aevalsrc=1.6*sin(2*PI*220*t)|1.6*sin(2*PI*220*t):s=48000",
+            "AUDIO_CLIPPING",
+        ),
+        (
+            "one-side.mp4",
+            "aevalsrc=0.5*sin(2*PI*440*t)|0:s=48000",
+            "AUDIO_ONE_CHANNEL_SILENT",
+        ),
+    ];
+    for (name, src, code) in cases {
+        let mut args = video.to_vec();
+        args.extend_from_slice(&[
+            "-f", "lavfi", "-i", src, "-t", "5", "-c:v", "libx264", "-c:a",
+        ]);
+        args.push(if name == "clipped.mp4" {
+            "pcm_s16le"
+        } else {
+            "aac"
+        });
+        let name = if name == "clipped.mp4" {
+            "clipped.mov"
+        } else {
+            name
+        };
+        let Some(f) = encode(name, &args) else {
+            continue;
+        };
+        let r = media_video::probe_path(&f, true).unwrap();
+        assert!(
+            codes(&r).contains(&code),
+            "{name}: {:?} {:?}",
+            r.issues,
+            r.sound
+        );
+    }
+}
+
+/// `sound-ranges` lists exactly the bytes `probe --sound` reads: a copy with
+/// only the index and those ranges (the rest zero) measures the same.
+#[test]
+fn sound_ranges_are_all_the_sound_needs() {
+    if !tools() {
+        return;
+    }
+    let Some(f) = clip(
+        "ranges.mp4",
+        "testsrc2=size=320x240:rate=25",
+        TONE,
+        &[
+            "-ac",
+            "2",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+        ],
+    ) else {
+        return;
+    };
+    let whole = std::fs::read(&f).unwrap();
+    let ranges = media_video::sound_ranges(&f).unwrap();
+    assert!(!ranges.is_empty());
+    let moov = whole.windows(4).position(|w| w == b"mdat").unwrap() + 4;
+    let mut sparse = vec![0u8; whole.len()];
+    sparse[..moov].copy_from_slice(&whole[..moov]);
+    for (o, l) in &ranges {
+        let (o, l) = (*o as usize, *l as usize);
+        sparse[o..o + l].copy_from_slice(&whole[o..o + l]);
+    }
+    let a = media_video::probe_with(&mut std::io::Cursor::new(whole), true).unwrap();
+    let b = media_video::probe_with(&mut std::io::Cursor::new(sparse), true).unwrap();
+    assert_eq!(a.sound, b.sound);
+    assert!(a.sound.is_some());
 }

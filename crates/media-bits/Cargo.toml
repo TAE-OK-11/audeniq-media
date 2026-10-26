@@ -1,0 +1,13 @@
+[package]
+name = "media-bits"
+description = "Bit readers, bit writer and Huffman decoding shared by the AUDENIQ media codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+
+# Not the workspace lints: `unsafe` is denied crate-wide and allowed only in
+# `writer`, which calls its BMI2 build after runtime detection (as in
+# media-hash).
+[lints.clippy]
+needless_range_loop = "allow"

@@ -1,4 +1,4 @@
-//! Bit reader for codec parameter sets (H.264/HEVC SPS).
+//! Bit reading for codec parameter sets (H.264/HEVC SPS).
 
 /// RBSP of a NAL unit: the payload with emulation-prevention bytes
 /// (`00 00 03`) removed.
@@ -16,56 +16,36 @@ pub(crate) fn unescape(nal: &[u8]) -> Vec<u8> {
     out
 }
 
-/// MSB-first reader; every read is `None` past the end.
-pub(crate) struct Bits<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
+/// The shared MSB reader (media-bits) with every read `None` past the end
+/// or on a malformed code, as the parameter-set parsers here use it.
+pub(crate) struct Bits<'a>(media_bits::Bits<'a>);
 
 impl<'a> Bits<'a> {
     pub(crate) fn new(b: &'a [u8]) -> Self {
-        Self { b, pos: 0 }
+        Self(media_bits::Bits::new(b))
     }
 
     pub(crate) fn flag(&mut self) -> Option<bool> {
-        let byte = *self.b.get(self.pos / 8)?;
-        let bit = byte >> (7 - self.pos % 8) & 1;
-        self.pos += 1;
-        Some(bit == 1)
+        self.0.flag().ok()
     }
 
     /// `n` ≤ 32 bits.
     pub(crate) fn u(&mut self, n: u32) -> Option<u32> {
-        let mut v = 0u64;
-        for _ in 0..n {
-            v = v << 1 | u64::from(self.flag()?);
-        }
-        u32::try_from(v).ok()
+        self.0.get(n).ok()
     }
 
     pub(crate) fn skip(&mut self, n: usize) -> Option<()> {
-        let end = self.pos.checked_add(n)?;
-        (end <= self.b.len() * 8).then(|| self.pos = end)
+        self.0.skip(n).ok()
     }
 
     /// Exp-Golomb `ue(v)`; longer than 32 bits is malformed.
     pub(crate) fn ue(&mut self) -> Option<u32> {
-        let mut zeros = 0;
-        while !self.flag()? {
-            zeros += 1;
-            if zeros > 31 {
-                return None;
-            }
-        }
-        let rest = self.u(zeros)?;
-        ((1u64 << zeros) - 1 + u64::from(rest)).try_into().ok()
+        self.0.ue().ok()
     }
 
     /// Exp-Golomb `se(v)`.
     pub(crate) fn se(&mut self) -> Option<i32> {
-        let k = i64::from(self.ue()?);
-        let v = if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) };
-        i32::try_from(v).ok()
+        self.0.se().ok()
     }
 }
 

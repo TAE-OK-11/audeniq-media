@@ -8,6 +8,7 @@
 //! the code is AUDENIQ's. Not decoded: free-format bit rate, Layers I/II.
 mod tables;
 
+use media_bits::{Bits, Huffman};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 use tables::*;
@@ -17,6 +18,15 @@ pub enum Error {
     Truncated,
     Invalid(&'static str),
     Unsupported(&'static str),
+}
+
+impl From<media_bits::Error> for Error {
+    fn from(e: media_bits::Error) -> Self {
+        match e {
+            media_bits::Error::Eof => Error::Truncated,
+            media_bits::Error::Invalid(what) => Error::Invalid(what),
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -49,87 +59,11 @@ pub fn to_channels(pcm: &[f32], from: usize, to: usize, out: &mut Vec<f32>) {
     }
 }
 
-/// MSB-first bit reader with an absolute position.
-struct Bits<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Bits { data, pos: 0 }
-    }
-
-    fn len(&self) -> usize {
-        self.data.len() * 8
-    }
-
-    fn bit(&mut self) -> Result<u32, Error> {
-        let byte = *self.data.get(self.pos >> 3).ok_or(Error::Truncated)?;
-        let v = u32::from(byte >> (7 - (self.pos & 7)) & 1);
-        self.pos += 1;
-        Ok(v)
-    }
-
-    fn u(&mut self, n: u32) -> Result<u32, Error> {
-        let mut v = 0;
-        for _ in 0..n {
-            v = v << 1 | self.bit()?;
-        }
-        Ok(v)
-    }
-}
-
-/// A prefix code as a binary tree: node children, a leaf is `LEAF | value`.
-struct Tree {
-    nodes: Vec<[u16; 2]>,
-}
-
-const LEAF: u16 = 0x8000;
-
-impl Tree {
-    fn new() -> Tree {
-        Tree {
-            nodes: vec![[0; 2]],
-        }
-    }
-
-    fn insert(&mut self, code: u32, len: u32, value: u8) {
-        let mut node = 0usize;
-        for i in (0..len).rev() {
-            let b = (code >> i & 1) as usize;
-            if i == 0 {
-                self.nodes[node][b] = LEAF | u16::from(value);
-            } else {
-                if self.nodes[node][b] == 0 {
-                    self.nodes.push([0; 2]);
-                    self.nodes[node][b] = (self.nodes.len() - 1) as u16;
-                }
-                node = usize::from(self.nodes[node][b]);
-            }
-        }
-    }
-
-    fn decode(&self, b: &mut Bits) -> Result<u8, Error> {
-        let mut node = 0usize;
-        loop {
-            let next = self.nodes[node][b.bit()? as usize];
-            if next & LEAF != 0 {
-                return Ok((next & 0xff) as u8);
-            }
-            if next == 0 {
-                return Err(Error::Invalid("Huffman code"));
-            }
-            node = usize::from(next);
-        }
-    }
-}
-
 /// Tables built once: Huffman trees, |x|^(4/3), IMDCT and synthesis
 /// matrices and windows.
 struct Static {
-    big: Vec<Tree>,
-    quad: [Tree; 2],
+    big: Vec<Huffman>,
+    quad: [Huffman; 2],
     pow43: Vec<f32>,
     /// cos for the 36- and 12-point IMDCT: [i][k].
     cos36: Vec<[f32; 18]>,
@@ -149,26 +83,24 @@ fn statics() -> &'static Static {
         let mut big = Vec::with_capacity(15);
         let mut at = 0;
         for &n in &HUFF_SIZES {
-            let mut t = Tree::new();
+            let mut codes = Vec::with_capacity(n);
             let mut code = 0u64;
             for i in at..at + n {
                 let len = u32::from(HUFF_LENS[i]);
-                t.insert((code >> (32 - len)) as u32, len, HUFF_SYMS[i]);
+                codes.push(((code >> (32 - len)) as u32, len, u32::from(HUFF_SYMS[i])));
                 code += 1u64 << (32 - len);
             }
-            big.push(t);
+            big.push(Huffman::from_codes(codes));
             at += n;
         }
         let quad = std::array::from_fn(|q| {
-            let mut t = Tree::new();
-            for v in 0..16 {
-                t.insert(
+            Huffman::from_codes((0..16).map(|v| {
+                (
                     u32::from(QUAD_CODES[q][v]),
                     u32::from(QUAD_BITS[q][v]),
-                    v as u8,
-                );
-            }
-            t
+                    v as u32,
+                )
+            }))
         });
         let pow43 = (0..8207)
             .map(|i| (i as f64).powf(4.0 / 3.0) as f32)
@@ -410,8 +342,8 @@ impl Decoder {
         let side_at = if h.crc { 6 } else { 4 };
         let side = f.get(side_at..side_at + side_len).ok_or(Error::Truncated)?;
         let mut b = Bits::new(side);
-        let main_begin = b.u(if h.lsf { 8 } else { 9 })? as usize;
-        b.u(match (h.lsf, nch) {
+        let main_begin = b.get(if h.lsf { 8 } else { 9 })? as usize;
+        b.get(match (h.lsf, nch) {
             (true, n) => n as u32,
             (false, 1) => 5,
             (false, _) => 3,
@@ -419,34 +351,34 @@ impl Decoder {
         let mut gr = [[Granule::default(); 2]; 2];
         if !h.lsf {
             for g in gr[1].iter_mut().take(nch) {
-                g.scfsi = b.u(4)?;
+                g.scfsi = b.get(4)?;
             }
         }
         let ms_only = h.mode == 1 && h.mode_ext == 2;
         for grs in gr.iter_mut().take(ngr) {
             for g in grs.iter_mut().take(nch) {
-                g.part23 = b.u(12)? as usize;
-                g.big_values = b.u(9)? as usize;
+                g.part23 = b.get(12)? as usize;
+                g.big_values = b.get(9)? as usize;
                 if g.big_values > 288 {
                     return Err(Error::Invalid("big_values"));
                 }
-                g.global_gain = b.u(8)? as i32;
+                g.global_gain = b.get(8)? as i32;
                 if ms_only {
                     // The 1/√2 of M/S folded into the gain.
                     g.global_gain -= 2;
                 }
-                g.scalefac_compress = b.u(if h.lsf { 9 } else { 4 })?;
+                g.scalefac_compress = b.get(if h.lsf { 9 } else { 4 })?;
                 if b.bit()? == 1 {
-                    g.block_type = b.u(2)? as u8;
+                    g.block_type = b.get(2)? as u8;
                     if g.block_type == 0 {
                         return Err(Error::Invalid("block type"));
                     }
                     g.mixed = b.bit()? == 1;
                     for t in &mut g.table_select[..2] {
-                        *t = b.u(5)? as u8;
+                        *t = b.get(5)? as u8;
                     }
                     for s in &mut g.subblock_gain {
-                        *s = b.u(3)? as u8;
+                        *s = b.get(3)? as u8;
                     }
                     g.region[0] = match (g.block_type, h.sr_index) {
                         (2, 8) => 36,
@@ -458,10 +390,10 @@ impl Decoder {
                     g.region[1] = 288;
                 } else {
                     for t in &mut g.table_select {
-                        *t = b.u(5)? as u8;
+                        *t = b.get(5)? as u8;
                     }
-                    let r0 = b.u(4)? as usize;
-                    let r1 = b.u(3)? as usize;
+                    let r0 = b.get(4)? as usize;
+                    let r1 = b.get(3)? as usize;
                     g.region[0] = band_pairs(h.sr_index, r0 + 1);
                     g.region[1] = band_pairs(h.sr_index, r0 + r1 + 2);
                 }
@@ -508,8 +440,8 @@ impl Decoder {
                 xr[ch] = [0.0; 576];
                 let g = gr[g_i][ch];
                 let end = pos + g.part23 as i64;
-                if pos >= 0 && end as usize <= bits.len() {
-                    bits.pos = pos as usize;
+                if pos >= 0 && end as usize <= data.len() * 8 {
+                    bits.seek(pos as usize)?;
                     let sf_prev = sf[ch];
                     sf[ch] = if h.lsf {
                         lsf_scalefactors(&mut bits, &mut gr[g_i][ch], h, ch)?
@@ -562,10 +494,10 @@ fn scalefactors(b: &mut Bits, g: &Granule, gr: usize, prev: &[u8; 40]) -> Result
     if g.block_type == 2 {
         let n1 = if g.mixed { 17 } else { 18 };
         for v in &mut sf[..n1] {
-            *v = b.u(s1)? as u8;
+            *v = b.get(s1)? as u8;
         }
         for v in &mut sf[n1..n1 + 18] {
-            *v = b.u(s2)? as u8;
+            *v = b.get(s2)? as u8;
         }
     } else {
         for (k, (from, to)) in [(0, 6), (6, 11), (11, 16), (16, 21)]
@@ -577,7 +509,7 @@ fn scalefactors(b: &mut Bits, g: &Granule, gr: usize, prev: &[u8; 40]) -> Result
             } else {
                 let s = if k < 2 { s1 } else { s2 };
                 for v in &mut sf[from..to] {
-                    *v = b.u(s)? as u8;
+                    *v = b.get(s)? as u8;
                 }
             }
         }
@@ -637,7 +569,7 @@ fn lsf_scalefactors(
     for k in 0..4 {
         for _ in 0..LSF_NSF[table][kind][k] {
             if j < 40 {
-                sf[j] = b.u(slen[k])? as u8;
+                sf[j] = b.get(slen[k])? as u8;
                 j += 1;
             }
         }
@@ -699,14 +631,14 @@ fn huffman(
         }
         let t = &st.big[usize::from(tree) - 1];
         for _ in 0..n {
-            if b.pos >= end || s + 1 >= 576 {
+            if b.pos() >= end || s + 1 >= 576 {
                 break;
             }
             let sym = t.decode(b)?;
-            let mut pair = [u32::from(sym >> 4), u32::from(sym & 15)];
+            let mut pair = [sym >> 4, sym & 15];
             for (j, v) in pair.iter_mut().enumerate() {
                 if *v == 15 && linbits > 0 {
-                    *v += b.u(u32::from(linbits))?;
+                    *v += b.get(u32::from(linbits))?;
                 }
                 if *v != 0 {
                     let neg = b.bit()? == 1;
@@ -718,7 +650,7 @@ fn huffman(
     }
     s = s.min(576);
     let q = &st.quad[g.count1_table];
-    while s + 4 <= 576 && b.pos < end {
+    while s + 4 <= 576 && b.pos() < end {
         let code = q.decode(b)?;
         let mut vals = [0f32; 4];
         for (j, v) in vals.iter_mut().enumerate() {
@@ -729,7 +661,7 @@ fn huffman(
         }
         // An encoder's part2_3_length can end inside the last quadruple;
         // that one is left out.
-        if b.pos > end {
+        if b.pos() > end {
             break;
         }
         xr[s..s + 4].copy_from_slice(&vals);
@@ -962,8 +894,8 @@ mod tests {
                 let c = (code >> (32 - len)) as u32;
                 let bytes = (c << (32 - len)).to_be_bytes();
                 let mut b = Bits::new(&bytes);
-                assert_eq!(st.big[t].decode(&mut b).unwrap(), HUFF_SYMS[i]);
-                assert_eq!(b.pos, len as usize);
+                assert_eq!(st.big[t].decode(&mut b).unwrap(), u32::from(HUFF_SYMS[i]));
+                assert_eq!(b.pos(), len as usize);
                 code += 1u64 << (32 - len);
             }
             assert_eq!(code, 1 << 32, "tree {t} fills the code space");

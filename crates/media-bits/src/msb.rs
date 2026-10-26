@@ -1,8 +1,17 @@
-//! Bounded MSB reader. Cached words and CLZ unary scans, without input padding.
-use crate::{Error, Result};
-pub(crate) struct Bits<'a> {
+//! Bounded MSB-first reader: a cached 64-bit word refilled with unaligned
+//! big-endian loads, CLZ unary scans, and fused Rice decoding; no input
+//! padding is needed. Every read past the end (or the limit set by
+//! [`Bits::take`]) is [`Error::Eof`].
+use crate::Error;
+
+type Result<T> = core::result::Result<T, Error>;
+
+#[derive(Clone)]
+pub struct Bits<'a> {
     data: &'a [u8],
-    pub pos: usize,
+    pos: usize,
+    /// Bit position reading stops at.
+    end: usize,
     cache: u64,
     available: u32,
     loaded: usize,
@@ -13,6 +22,7 @@ impl<'a> Bits<'a> {
         Self {
             data,
             pos: 0,
+            end: data.len() * 8,
             cache: 0,
             available: 0,
             loaded: 0,
@@ -24,8 +34,8 @@ impl<'a> Bits<'a> {
     }
     /// Continue reading at bit `pos` (at most the input length).
     pub fn seek(&mut self, pos: usize) -> Result<()> {
-        if pos > self.data.len() * 8 {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        if pos > self.end {
+            return Err(Error::Eof);
         }
         self.cache = 0;
         self.available = 0;
@@ -34,8 +44,31 @@ impl<'a> Bits<'a> {
         self.get((pos & 7) as u32)?;
         Ok(())
     }
+    /// Bits read so far, from the start of the input.
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+    /// Bits left before the end (or the limit).
+    #[inline]
     pub fn left(&self) -> usize {
-        self.data.len() * 8 - self.pos
+        self.end.saturating_sub(self.pos)
+    }
+    /// A reader of the next `n` bits only (an extension payload); this one
+    /// does not move.
+    pub fn take(&self, n: usize) -> Self {
+        let mut b = self.clone();
+        b.end = self.pos.saturating_add(n).min(self.end);
+        b
+    }
+    /// An error unless the last read stayed within the limit (scans may
+    /// run into the bits after it).
+    #[inline]
+    fn bounded<T>(&self, v: T) -> Result<T> {
+        if self.pos > self.end {
+            return Err(Error::Eof);
+        }
+        Ok(v)
     }
     #[inline]
     fn fill(&mut self) {
@@ -64,7 +97,7 @@ impl<'a> Bits<'a> {
             return Ok(0);
         }
         if self.left() < n as usize {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            return Err(Error::Eof);
         }
         if self.available < n {
             self.fill();
@@ -87,6 +120,11 @@ impl<'a> Bits<'a> {
     /// case. Bounds/range checks and a bounded cross-word fallback remain.
     #[inline]
     pub fn rice_signed(&mut self, k: u32) -> Result<i32> {
+        let v = self.rice_signed_unbounded(k)?;
+        self.bounded(v)
+    }
+    #[inline]
+    fn rice_signed_unbounded(&mut self, k: u32) -> Result<i32> {
         if k > 31 {
             return Err(Error::Invalid("FLAC Rice width"));
         }
@@ -101,7 +139,7 @@ impl<'a> Bits<'a> {
             } else {
                 (self.cache >> (64 - consumed)) & ((1u64 << k) - 1)
             };
-            self.skip(consumed);
+            self.consume(consumed);
             ((q as u64) << k) | tail
         } else {
             let cap = (u32::MAX >> k).saturating_add(1);
@@ -173,9 +211,9 @@ impl<'a> Bits<'a> {
             return Err(Error::Invalid("FLAC residual range"));
         }
         for v in &mut dst[i..] {
-            *v = self.rice_signed(k)?;
+            *v = self.rice_signed_unbounded(k)?;
         }
-        Ok(())
+        self.bounded(())
     }
     /// Top the cache up to 56..=63 bits with one unaligned load when eight
     /// unread bytes remain (see `rice_run`); otherwise leave it to `fill`.
@@ -190,8 +228,16 @@ impl<'a> Bits<'a> {
             self.available += bytes * 8;
         }
     }
+    /// ALAC's adaptive Golomb value: unary prefix (escape at 9 ones to a
+    /// `bits`-wide value), then a `k`-bit suffix whose all-zero form is one
+    /// bit shorter.
     #[inline(always)]
     pub fn alac_scalar(&mut self, k: u32, bits: u32) -> Result<u32> {
+        let v = self.alac_scalar_unbounded(k, bits)?;
+        self.bounded(v)
+    }
+    #[inline(always)]
+    fn alac_scalar_unbounded(&mut self, k: u32, bits: u32) -> Result<u32> {
         if k == 0 || k > 31 || bits > 32 {
             return Err(Error::Invalid("ALAC Rice width"));
         }
@@ -227,7 +273,7 @@ impl<'a> Bits<'a> {
             if value > u32::MAX as u64 {
                 return Err(Error::Invalid("ALAC scalar range"));
             }
-            self.skip(consumed);
+            self.consume(consumed);
             return Ok(value as u32);
         }
         let q = self.unary(true, 9)?;
@@ -245,6 +291,11 @@ impl<'a> Bits<'a> {
     /// Consume up to limit equal bits; consume the terminator only if found.
     #[inline]
     pub fn unary(&mut self, ones: bool, limit: u32) -> Result<u32> {
+        let v = self.unary_unbounded(ones, limit)?;
+        self.bounded(v)
+    }
+    #[inline]
+    fn unary_unbounded(&mut self, ones: bool, limit: u32) -> Result<u32> {
         let mut count = 0;
         loop {
             if count == limit {
@@ -254,23 +305,29 @@ impl<'a> Bits<'a> {
                 self.fill();
             }
             if self.available == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                return Err(Error::Eof);
             }
             let scan = if ones { !self.cache } else { self.cache };
             let n = scan.leading_zeros().min(self.available).min(limit - count);
-            self.skip(n);
+            self.consume(n);
             count += n;
             if count == limit {
                 return Ok(count);
             }
             if self.available != 0 {
-                self.skip(1);
+                self.consume(1);
                 return Ok(count);
             }
         }
     }
+    /// Drop `n` bits that a [`Self::peek`] of at least `n` just showed.
     #[inline]
-    fn skip(&mut self, n: u32) {
+    pub fn advance(&mut self, n: u32) {
+        debug_assert!(n <= self.available && n as usize <= self.left());
+        self.consume(n);
+    }
+    #[inline]
+    fn consume(&mut self, n: u32) {
         self.cache = self.cache.checked_shl(n).unwrap_or(0);
         self.available -= n;
         self.pos += n as usize;
@@ -278,7 +335,7 @@ impl<'a> Bits<'a> {
     #[inline]
     pub fn peek(&mut self, n: u32) -> Result<u32> {
         if n > 32 || self.left() < n as usize {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            return Err(Error::Eof);
         }
         if n == 0 {
             return Ok(0);
@@ -287,6 +344,46 @@ impl<'a> Bits<'a> {
             self.fill();
         }
         Ok((self.cache >> (64 - n)) as u32)
+    }
+    /// One bit.
+    #[inline]
+    pub fn bit(&mut self) -> Result<u32> {
+        self.get(1)
+    }
+    /// One bit as a flag.
+    #[inline]
+    pub fn flag(&mut self) -> Result<bool> {
+        Ok(self.get(1)? == 1)
+    }
+    /// Skip `n` bits.
+    pub fn skip(&mut self, n: usize) -> Result<()> {
+        if n > self.left() {
+            return Err(Error::Eof);
+        }
+        if n <= self.available as usize {
+            self.consume(n as u32);
+            return Ok(());
+        }
+        self.seek(self.pos + n)
+    }
+    /// Skip to the next byte boundary (there must be one before the end).
+    pub fn align(&mut self) -> Result<()> {
+        self.skip((8 - self.pos % 8) % 8)
+    }
+    /// Exp-Golomb `ue(v)` (H.264/HEVC); longer than 32 bits is malformed.
+    pub fn ue(&mut self) -> Result<u32> {
+        let zeros = self.unary(false, 32)?;
+        if zeros == 32 {
+            return Err(Error::Invalid("Exp-Golomb code"));
+        }
+        let v = (1u64 << zeros) - 1 + u64::from(self.get(zeros)?);
+        u32::try_from(v).map_err(|_| Error::Invalid("Exp-Golomb code"))
+    }
+    /// Exp-Golomb `se(v)`.
+    pub fn se(&mut self) -> Result<i32> {
+        let k = i64::from(self.ue()?);
+        let v = if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) };
+        i32::try_from(v).map_err(|_| Error::Invalid("Exp-Golomb code"))
     }
     pub fn align_zero(&mut self) -> Result<()> {
         let n = (8 - self.pos % 8) % 8;
@@ -309,7 +406,7 @@ mod tests {
                     if value > u32::MAX as u64 {
                         continue;
                     }
-                    let mut w = crate::bits::BeWriter::new();
+                    let mut w = crate::BeWriter::new();
                     w.put(offset, 0);
                     w.unary(q);
                     w.put(k, 0);
@@ -320,7 +417,7 @@ mod tests {
                     }
                     let expected = ((value >> 1) as i32) ^ -((value & 1) as i32);
                     assert_eq!(b.rice_signed(k).unwrap(), expected);
-                    assert_eq!(b.pos, offset as usize + q as usize + 1 + k as usize);
+                    assert_eq!(b.pos(), offset as usize + q as usize + 1 + k as usize);
                 }
             }
         }
@@ -331,7 +428,7 @@ mod tests {
                         if k == 1 && tail != 0 {
                             continue;
                         }
-                        let mut w = crate::bits::BeWriter::new();
+                        let mut w = crate::BeWriter::new();
                         w.put(offset, 0);
                         w.put(q, (1u64 << q) - 1);
                         let expected = if q == 9 {
@@ -372,7 +469,7 @@ mod tests {
         for k in [0u32, 1, 4, 11, 14, 20, 30, 31] {
             for offset in [0u32, 3, 7, 13] {
                 for count in [0usize, 1, 2, 9, 64, 300] {
-                    let mut w = crate::bits::BeWriter::new();
+                    let mut w = crate::BeWriter::new();
                     w.put(offset, 5);
                     let mut values = Vec::new();
                     for i in 0..count {
@@ -399,10 +496,10 @@ mod tests {
                         assert_eq!(slow.rice_signed(k).unwrap(), v);
                     }
                     assert_eq!(out, values);
-                    assert_eq!(fast.pos, slow.pos);
+                    assert_eq!(fast.pos(), slow.pos());
                     assert_eq!(fast.get(13).unwrap(), 0x1abc);
                     // Truncation inside the run must fail, never read past it.
-                    let cut = slow.pos.saturating_sub(1) / 8;
+                    let cut = slow.pos().saturating_sub(1) / 8;
                     if !values.is_empty() && cut * 8 >= offset as usize {
                         let mut b = Bits::new(&w.bytes[..cut]);
                         b.get(offset).unwrap();
@@ -412,7 +509,7 @@ mod tests {
             }
         }
         // Values above u32 are corrupt even when the code fits one word.
-        let mut w = crate::bits::BeWriter::new();
+        let mut w = crate::BeWriter::new();
         w.unary(3);
         w.put(31, 0);
         w.put(64, 0);
@@ -430,7 +527,7 @@ mod tests {
                 }
                 for _ in 0..16 {
                     let mut expected = 0u32;
-                    for i in b.pos..b.pos + width as usize {
+                    for i in b.pos()..b.pos() + width as usize {
                         expected = (expected << 1) | ((data[i / 8] >> (7 - i % 8)) & 1) as u32;
                     }
                     assert_eq!(b.peek(width).unwrap(), expected);
@@ -460,11 +557,11 @@ mod tests {
                 }
                 let mut b = Bits::new(&data);
                 assert_eq!(b.unary(ones, 200).unwrap(), len as u32);
-                assert_eq!(b.pos, len + 1);
+                assert_eq!(b.pos(), len + 1);
                 let mut b = Bits::new(&data);
                 let cap = (len / 2) as u32;
                 assert_eq!(b.unary(ones, cap).unwrap(), cap);
-                assert_eq!(b.pos, cap as usize);
+                assert_eq!(b.pos(), cap as usize);
             }
         }
     }

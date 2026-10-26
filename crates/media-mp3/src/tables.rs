@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Layer III tables (ISO/IEC 11172-3, 13818-3), transcribed from FFmpeg's
 //! `mpegaudiodec_common.c` and `mpegaudiodsp_data.c` (LGPL-2.1-or-later).
+#![allow(clippy::unreadable_literal, clippy::excessive_precision)]
 
 /// Code lengths of the 15 big-value Huffman trees, codes in canonical
 /// order (each code follows the previous one), trees back to back.

@@ -195,6 +195,19 @@ fn esds(entry: &mut AudioConfig, b: &[u8]) -> Option<()> {
         if let Some(rate) = asc.rate {
             entry.sample_rate = rate;
         }
+        // SBR signalled after the core config (backward compatible): the
+        // decoder runs at the extension rate.
+        if asc.object == 2
+            && let Ok((c, _)) = media_aac::parse_config(&entry.asc)
+            && c.sbr == 1
+        {
+            entry.profile = Some("HE-AAC".into());
+            entry.sample_rate = if c.ext_rate != 0 {
+                c.ext_rate
+            } else {
+                2 * c.sample_rate
+            };
+        }
         // HE-AACv2 is coded mono; the decoder outputs stereo.
         if asc.object == 29 {
             entry.channels = 2;

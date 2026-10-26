@@ -227,6 +227,11 @@ impl Decoder {
         self.config.channels as usize
     }
 
+    /// Sample rate of the decoded output.
+    pub fn output_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
     /// Output channel names in decode (AAC element) order for the
     /// configuration: C, L, R, Ls, Rs, LFE for 5.1.
     pub fn layout(&self) -> &'static [&'static str] {

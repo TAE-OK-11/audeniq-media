@@ -2,6 +2,7 @@
 //! format, read back by FFprobe/FFmpeg. Skipped (passes) when ffmpeg is not
 //! installed; CI installs it.
 use media_json::Value;
+use media_video::Pick;
 use media_video::convert::{Codec, Container, Options, convert, preset};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -207,6 +208,7 @@ fn prores_pcm_51_to_pcm24_mov_keeps_timecode() {
         container: Container::Mp4,
         codec: Codec::Aac(320_000),
         sample_rate: 48000,
+        pick: None,
     };
     assert!(
         convert(&src, &mp4, &mp4_opts).is_err(),
@@ -263,4 +265,195 @@ fn no_sound_is_an_error() {
         )
         .is_err()
     );
+}
+
+/// Largest difference between two interleaved buffers (lengths must match).
+fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+/// Channel `c` of interleaved `ch`-channel PCM.
+fn plane(pcm: &[f32], ch: usize, c: usize) -> Vec<f32> {
+    pcm.chunks_exact(ch).map(|f| f[c]).collect()
+}
+
+#[test]
+fn dual_mono_tracks_become_left_and_right() {
+    if !tools() {
+        return;
+    }
+    let Some(src) = encode(
+        "dual-mono.mov",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x120:r=24:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:r=48000:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=660:r=48000:d=2",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map",
+            "2:a",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "pcm_s24le",
+        ],
+    ) else {
+        return;
+    };
+    let out = dir().join("dual-mono-out.mov");
+    let c = convert(&src, &out, &preset("pcm24").unwrap()).unwrap();
+    assert_eq!(c.mapping, "dual-mono");
+    assert_eq!(c.source_channels, [[2, 1], [3, 1]]);
+    assert!(c.dropped_tracks.is_empty());
+    // Left is the first track and right the second, sample for sample.
+    let pcm = decoded(&out);
+    let left = decoded_track(&src, 0);
+    let right = decoded_track(&src, 1);
+    assert!(max_diff(&plane(&pcm, 2, 0), &left) < 1e-6);
+    assert!(max_diff(&plane(&pcm, 2, 1), &right) < 1e-6);
+    // Picked the other way round.
+    let mut swap = preset("pcm24").unwrap();
+    swap.pick = Some(Pick::Stereo(2, 1));
+    let out = dir().join("dual-mono-swap.mov");
+    let c = convert(&src, &out, &swap).unwrap();
+    assert_eq!(c.mapping, "channels");
+    let pcm = decoded(&out);
+    assert!(max_diff(&plane(&pcm, 2, 0), &right) < 1e-6);
+    // The measurement hears both tracks.
+    let r = media_video::probe_path(&src, true).unwrap();
+    let s = r.sound.unwrap();
+    assert_eq!((s.mapping.as_str(), s.channels), ("dual-mono", 2));
+    // sound-ranges covers both tracks' data.
+    let bytes: u64 = media_video::sound_ranges(&src)
+        .unwrap()
+        .iter()
+        .map(|r| r.1)
+        .sum();
+    assert_eq!(bytes, 2 * 2 * 48000 * 3);
+}
+
+/// FFmpeg's decode of sound stream `n` alone.
+fn decoded_track(path: &Path, n: usize) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            &format!("0:a:{n}"),
+            "-f",
+            "f32le",
+            "-c:a",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
+fn discrete_channels_give_the_first_two_or_the_picked() {
+    if !tools() {
+        return;
+    }
+    let Some(src) = encode(
+        "discrete.mov",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x120:r=24:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*660*t)|0.2*sin(2*PI*1000*t)|0.1*sin(2*PI*1500*t):s=48000:d=2:c=4c",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "pcm_s24le",
+        ],
+    ) else {
+        return;
+    };
+    // Make the channels discrete (stems, no speakers), as editors write
+    // them: CoreAudio kAudioChannelLayoutTag_DiscreteInOrder.
+    let mut bytes = std::fs::read(&src).unwrap();
+    let at = bytes.windows(4).position(|w| w == b"chan").unwrap() + 8;
+    bytes[at..at + 4].copy_from_slice(&(147u32 << 16 | 4).to_be_bytes());
+    std::fs::write(&src, &bytes).unwrap();
+    let src_pcm = decoded(&src);
+
+    let out = dir().join("discrete-out.mov");
+    let c = convert(&src, &out, &preset("pcm24").unwrap()).unwrap();
+    assert_eq!(c.mapping, "channels");
+    assert_eq!(c.source_channels, [[2, 1], [2, 2]]);
+    let pcm = decoded(&out);
+    assert!(max_diff(&plane(&pcm, 2, 0), &plane(&src_pcm, 4, 0)) < 1e-6);
+    assert!(max_diff(&plane(&pcm, 2, 1), &plane(&src_pcm, 4, 1)) < 1e-6);
+
+    let mut mono = preset("pcm24").unwrap();
+    mono.pick = Some(Pick::Mono(3));
+    let out = dir().join("discrete-mono.mov");
+    let c = convert(&src, &out, &mono).unwrap();
+    assert_eq!(c.source_channels, [[2, 3]]);
+    let pcm = decoded(&out);
+    assert!(max_diff(&plane(&pcm, 2, 0), &plane(&src_pcm, 4, 2)) < 1e-6);
+    assert!(max_diff(&plane(&pcm, 2, 1), &plane(&src_pcm, 4, 2)) < 1e-6);
+
+    mono.pick = Some(Pick::Mono(5));
+    assert!(convert(&src, &dir().join("discrete-bad.mov"), &mono).is_err());
+}
+
+#[test]
+fn alac_is_decoded_exactly() {
+    if !tools() {
+        return;
+    }
+    let Some(src) = encode(
+        "alac.mov",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x120:r=24:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("{TONES}:s=48000:d=2"),
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "alac",
+            "-sample_fmt",
+            "s32p",
+        ],
+    ) else {
+        return;
+    };
+    let out = dir().join("alac-out.mov");
+    let c = convert(&src, &out, &preset("pcm24").unwrap()).unwrap();
+    assert_eq!(c.source_sound.codec_name, "alac");
+    // 24-bit ALAC in, 24-bit PCM out at the same rate: the same samples.
+    assert!(max_diff(&decoded(&out), &decoded(&src)) < 1e-6);
+    let r = media_video::probe_path(&src, true).unwrap();
+    assert!(r.sound.is_some(), "{:?}", r.sound_note);
 }

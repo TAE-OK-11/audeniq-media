@@ -25,10 +25,12 @@ pub mod convert;
 mod file;
 mod report;
 pub mod sound;
+mod source;
 mod track;
 
 pub use check::{Issue, Severity};
 pub use report::{AudioStream, Container, OtherStream, Report, VideoStream};
+pub use source::Pick;
 
 use std::io::{Read, Seek, SeekFrom};
 

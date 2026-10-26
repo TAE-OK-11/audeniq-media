@@ -1,0 +1,11 @@
+[package]
+name = "media-mp3"
+description = "MPEG-1/2/2.5 Layer III (MP3) decoder for AUDENIQ music-video sound checks and conversions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Huffman and scale-factor band tables are transcribed from FFmpeg (LGPL).
+license = "LGPL-2.1-or-later"
+
+[lints]
+workspace = true

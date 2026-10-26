@@ -1,6 +1,6 @@
 //! Local, lossless-only audio QC. No FFmpeg or native media-codec FFI at runtime.
-#[cfg(not(feature = "reference-codecs"))]
-mod alac;
+/// Native ALAC packet decoder, shared with the music-video engine.
+pub mod alac;
 pub mod audio;
 mod bits;
 pub mod cli;
@@ -19,7 +19,8 @@ pub mod kernels;
 mod m4a;
 pub mod meter;
 mod mp4;
-#[cfg(not(feature = "reference-codecs"))]
+// The comparison build uses only the parts ALAC needs.
+#[cfg_attr(feature = "reference-codecs", allow(dead_code))]
 mod msb;
 pub mod pcm;
 mod pcm_hash;

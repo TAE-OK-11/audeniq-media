@@ -180,6 +180,40 @@ impl Layout {
     }
 }
 
+/// What a frame's rate search has already measured, per (group, band):
+/// quantization noise and codebook bit costs by scalefactor. Neither depends
+/// on the SNR being tried, so the bisection reuses them.
+#[derive(Default)]
+struct Memo {
+    noise: Vec<Vec<(i32, f32)>>,
+    cost: Vec<Vec<(i32, [u32; 12])>>,
+}
+
+impl Memo {
+    fn reset(&mut self, n: usize) {
+        self.noise.resize_with(n, Vec::new);
+        self.cost.resize_with(n, Vec::new);
+        self.noise.iter_mut().for_each(Vec::clear);
+        self.cost.iter_mut().for_each(Vec::clear);
+    }
+
+    fn noise(
+        &mut self,
+        i: usize,
+        x: &[f32],
+        pow34: &[f32],
+        ranges: &[std::ops::Range<usize>],
+        sf: i32,
+    ) -> f32 {
+        if let Some(&(_, e)) = self.noise[i].iter().find(|(s, _)| *s == sf) {
+            return e;
+        }
+        let e = noise(x, pow34, ranges, sf);
+        self.noise[i].push((sf, e));
+        e
+    }
+}
+
 /// One channel's coded frame: per (group, band) scalefactor and codebook,
 /// quantized values window-major.
 #[derive(Clone, Default)]
@@ -214,6 +248,8 @@ pub struct Encoder {
     ath_short: Vec<f32>,
     snr: f32,
     reservoir: i64,
+    /// Rate-search memos per channel, kept to reuse their allocations.
+    memos: Vec<Memo>,
 }
 
 fn ath_table(sample_rate: u32, offsets: &[u16], bands: usize, n: usize) -> Vec<f32> {
@@ -279,6 +315,7 @@ impl Encoder {
             ),
             snr: 20.0,
             reservoir: 0,
+            memos: Vec::new(),
         })
     }
 
@@ -534,19 +571,21 @@ impl Encoder {
         let fits = |coded: &[Coded]| {
             header + coded.iter().map(|c| i64::from(c.bits)).sum::<i64>() <= budget
         };
+        let mut memos = std::mem::take(&mut self.memos);
+        memos.resize_with(ch, Memo::default);
+        for m in &mut memos {
+            m.reset(n);
+        }
+        let mut code = |snr: f32| -> Vec<Coded> {
+            (0..ch)
+                .map(|c| self.code_channel(layout, &spec[c], &pow34[c], snr, &mut memos[c]))
+                .collect()
+        };
         // Widen the bracket until it holds the answer, then bisect.
-        let coded_lo: Vec<Coded> = spec
-            .iter()
-            .zip(&pow34)
-            .map(|(s, p)| self.code_channel(layout, s, p, lo))
-            .collect();
+        let coded_lo = code(lo);
         if fits(&coded_lo) {
             best = Some((lo, coded_lo));
-            let coded_hi: Vec<Coded> = spec
-                .iter()
-                .zip(&pow34)
-                .map(|(s, p)| self.code_channel(layout, s, p, hi))
-                .collect();
+            let coded_hi = code(hi);
             if fits(&coded_hi) {
                 best = Some((hi, coded_hi));
                 lo = hi;
@@ -561,11 +600,7 @@ impl Encoder {
                 break;
             }
             let mid = (lo + hi) / 2.0;
-            let coded: Vec<Coded> = spec
-                .iter()
-                .zip(&pow34)
-                .map(|(s, p)| self.code_channel(layout, s, p, mid))
-                .collect();
+            let coded = code(mid);
             if fits(&coded) {
                 best = Some((mid, coded));
                 lo = mid;
@@ -573,15 +608,8 @@ impl Encoder {
                 hi = mid;
             }
         }
-        let (snr, coded) = best.unwrap_or_else(|| {
-            (
-                -20.0,
-                spec.iter()
-                    .zip(&pow34)
-                    .map(|(s, p)| self.code_channel(layout, s, p, -20.0))
-                    .collect(),
-            )
-        });
+        let (snr, coded) = best.unwrap_or_else(|| (-20.0, code(-20.0)));
+        self.memos = memos;
         self.snr = snr;
         let mut w = BitWriter::new();
         if ch == 1 {
@@ -612,7 +640,14 @@ impl Encoder {
 
     /// Scalefactors, codebooks and quantized values of one channel at a
     /// given SNR, with its bit count.
-    fn code_channel(&self, layout: &Layout, x: &[f32], pow34: &[f32], snr: f32) -> Coded {
+    fn code_channel(
+        &self,
+        layout: &Layout,
+        x: &[f32],
+        pow34: &[f32],
+        snr: f32,
+        memo: &mut Memo,
+    ) -> Coded {
         let bands = layout.bands;
         let n = layout.groups.len() * bands;
         let ath = if layout.short() {
@@ -669,14 +704,15 @@ impl Encoder {
                 let min_sf = (100.0 + (0.75 * peak.max(1e-9).log2() - 8191f32.log2()) / 0.1875)
                     .ceil()
                     .max(0.0) as i32;
+                let i = g * bands + b;
                 let (mut a, mut z) = (min_sf.min(255), 255);
-                if noise(x, pow34, &ranges, a) > allowed {
-                    sf[g * bands + b] = a;
+                if memo.noise(i, x, pow34, &ranges, a) > allowed {
+                    sf[i] = a;
                     continue;
                 }
                 while z - a > 1 {
                     let mid = (a + z) / 2;
-                    if noise(x, pow34, &ranges, mid) <= allowed {
+                    if memo.noise(i, x, pow34, &ranges, mid) <= allowed {
                         a = mid;
                     } else {
                         z = mid;
@@ -763,15 +799,26 @@ impl Encoder {
                     cost[b][0] = 0;
                     continue;
                 }
+                if let Some(&(_, c)) = memo.cost[i].iter().find(|(s, _)| *s == sf[i]) {
+                    cost[b] = c;
+                    continue;
+                }
                 buf.clear();
                 for r in layout.ranges(g, b) {
                     buf.extend_from_slice(&q[r]);
                 }
+                // Codebooks whose largest value is below the band's cannot
+                // code it.
+                let max = buf.iter().fold(0, |m, v| m.max(v.abs()));
                 for c in 1..12 {
+                    if shape(c).4 < max {
+                        continue;
+                    }
                     if let Some(v) = band_bits(&buf, c) {
                         cost[b][c] = v;
                     }
                 }
+                memo.cost[i].push((sf[i], cost[b]));
             }
             let (cbs, spectral, section) = sections(&cost, if layout.short() { 3 } else { 5 });
             cb[g * bands..g * bands + bands].copy_from_slice(&cbs);

@@ -51,6 +51,8 @@ FFprobe와 다르게 두는 것: AV1 색 정보(시퀀스 헤더 OBU)는 읽지 
 
 ## 측정
 
+전체 결과·재현 방법: [BENCHMARK.md](BENCHMARK.md) (6가지 파일, FFprobe 대비 9~17배 빠르고 메모리 약 1/4).
+
 4분 640×360 H.264+AAC MP4(62MB, 7,200프레임)를 `release-music` 빌드로 30번 실행한 중앙값:
 
 | 도구 | 시간 | 최대 RSS |

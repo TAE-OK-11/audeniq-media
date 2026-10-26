@@ -107,3 +107,18 @@ fn video_group_routes_to_the_video_probe() {
             .contains("\"error\":\"USAGE\"")
     );
 }
+
+#[test]
+fn atmos_group_routes_to_the_adm_reader() {
+    let out = music(&["atmos", "capabilities"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(&format!("\"engine\":\"{}\"", media_adm::ENGINE_VERSION)));
+    let out = music(&["atmos", "probe", "/nonexistent/audeniq-music-test.wav"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("\"error\":\"IO\"")
+    );
+}

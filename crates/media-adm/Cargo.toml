@@ -1,0 +1,13 @@
+[package]
+name = "media-adm"
+description = "ADM BWF (Dolby Atmos master) reader and delivery checks for AUDENIQ"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+media-json.workspace = true
+
+[lints]
+workspace = true

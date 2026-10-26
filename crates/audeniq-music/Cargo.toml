@@ -14,6 +14,7 @@ path = "src/main.rs"
 audeniq-qc = { path = "../audeniq-qc" }
 photo-cli = { path = "../photo-cli" }
 media-video.workspace = true
+media-adm.workspace = true
 mimalloc.workspace = true
 
 [lints]

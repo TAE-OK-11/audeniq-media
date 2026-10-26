@@ -43,3 +43,9 @@ jobs:
       - run: cargo test --locked -p photo-png --test qc_crc
       - run: cargo test --locked -p media-hash --no-default-features
       - run: cargo check --locked -p media-hash --no-default-features
+      - name: FFmpeg for the codec parity tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg
+      # The sound codecs and their shared kernels on NEON.
+      - run: cargo test --locked -p media-bits -p media-dsp -p media-aac -p media-mp3 -p media-resample -p media-video

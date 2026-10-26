@@ -305,6 +305,7 @@ dependencies = [
  "libfuzzer-sys",
  "md-5",
  "media-hash",
+ "media-video",
  "photo-deflate",
  "sha2",
 ]
@@ -316,6 +317,13 @@ version = "0.1.0"
 [[package]]
 name = "media-json"
 version = "0.1.0"
+
+[[package]]
+name = "media-video"
+version = "0.1.0"
+dependencies = [
+ "media-json",
+]
 
 [[package]]
 name = "moxcms"

@@ -457,3 +457,43 @@ fn alac_is_decoded_exactly() {
     let r = media_video::probe_path(&src, true).unwrap();
     assert!(r.sound.is_some(), "{:?}", r.sound_note);
 }
+
+#[test]
+fn mp3_is_decoded_like_ffmpeg() {
+    if !tools() {
+        return;
+    }
+    let Some(src) = encode(
+        "mp3.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x120:r=24:d=3",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("{TONES}:s=48000:d=3"),
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "256k",
+        ],
+    ) else {
+        return;
+    };
+    let out = dir().join("mp3-out.mov");
+    let c = convert(&src, &out, &preset("pcm24").unwrap()).unwrap();
+    assert_eq!(c.source_sound.codec_name, "mp3");
+    // Same rate, PCM out: FFmpeg's decode with the edit list (encoder
+    // delay) applied, to 24-bit precision.
+    let theirs = decoded(&src);
+    let ours = decoded(&out);
+    assert!(ours.len() <= theirs.len() && ours.len() >= theirs.len() - 2 * 1152);
+    assert!(max_diff(&ours, &theirs[..ours.len()]) < 1e-5);
+    let r = media_video::probe_path(&src, true).unwrap();
+    let s = r.sound.unwrap();
+    assert_eq!((s.codec_name.as_str(), s.decode_errors), ("mp3", 0));
+}

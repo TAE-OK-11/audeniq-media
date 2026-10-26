@@ -300,6 +300,13 @@ name = "media-aac"
 version = "0.1.0"
 
 [[package]]
+name = "media-adm"
+version = "0.1.0"
+dependencies = [
+ "media-json",
+]
+
+[[package]]
 name = "media-engine-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -309,6 +316,7 @@ dependencies = [
  "libfuzzer-sys",
  "md-5",
  "media-aac",
+ "media-adm",
  "media-hash",
  "media-video",
  "photo-deflate",

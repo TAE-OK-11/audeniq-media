@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - .github/workflows/audio-benchmark.yml
+      - crates/media-bits/**
       - crates/media-hash/**
       - crates/media-json/**
       - crates/audeniq-qc/src/flac.rs

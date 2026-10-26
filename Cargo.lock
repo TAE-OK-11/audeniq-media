@@ -529,6 +529,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-mp3"
+version = "0.1.0"
+
+[[package]]
 name = "media-resample"
 version = "0.1.0"
 
@@ -539,6 +543,7 @@ dependencies = [
  "audeniq-qc",
  "media-aac",
  "media-json",
+ "media-mp3",
  "media-resample",
 ]
 

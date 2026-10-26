@@ -204,8 +204,8 @@ pub fn downmix_stereo(input: &[f32], layout: &[&str]) -> Vec<f32> {
     let gains: Vec<(f32, f32)> = layout
         .iter()
         .map(|n| match *n {
-            "L" | "FL" => (1.0, 0.0),
-            "R" | "FR" => (0.0, 1.0),
+            "L" | "FL" | "FLC" => (1.0, 0.0),
+            "R" | "FR" | "FRC" => (0.0, 1.0),
             "C" | "FC" | "M" if ch == 1 => (1.0, 1.0),
             "C" | "FC" => (k, k),
             "Ls" | "SL" | "BL" | "Lss" | "Lrs" => (k, 0.0),

@@ -9,3 +9,6 @@ license = "LGPL-2.1-or-later"
 
 [lints]
 workspace = true
+
+[dependencies]
+media-bits.workspace = true

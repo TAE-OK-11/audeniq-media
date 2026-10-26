@@ -10,10 +10,9 @@
 //! be compared with it sample by sample; the QMF banks are the standard's
 //! complex-exponential matrices. Tables come from FFmpeg (`sbr_tables.rs`).
 use crate::Error;
-use crate::bits::Bits;
-use crate::huffman::Tree;
 use crate::ps::Ps;
 use crate::sbr_tables as tab;
+use media_bits::{Bits, Huffman as Tree};
 use media_dsp::{Dct4, Fft};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
@@ -396,17 +395,17 @@ impl Sbr {
         let old = self.spectrum;
         self.start = true;
         self.ready = false;
-        self.amp_res_header = b.u(1)? as u8;
-        self.spectrum[0] = b.u(4)? as i32;
-        self.spectrum[1] = b.u(4)? as i32;
-        self.spectrum[2] = b.u(3)? as i32;
-        b.u(2)?;
-        let extra1 = b.u(1)? == 1;
-        let extra2 = b.u(1)? == 1;
+        self.amp_res_header = b.get(1)? as u8;
+        self.spectrum[0] = b.get(4)? as i32;
+        self.spectrum[1] = b.get(4)? as i32;
+        self.spectrum[2] = b.get(3)? as i32;
+        b.get(2)?;
+        let extra1 = b.get(1)? == 1;
+        let extra2 = b.get(1)? == 1;
         if extra1 {
-            self.spectrum[3] = b.u(2)? as i32;
-            self.spectrum[4] = b.u(1)? as i32;
-            self.spectrum[5] = b.u(2)? as i32;
+            self.spectrum[3] = b.get(2)? as i32;
+            self.spectrum[4] = b.get(1)? as i32;
+            self.spectrum[5] = b.get(2)? as i32;
         } else {
             self.spectrum[3] = 2;
             self.spectrum[4] = 1;
@@ -416,10 +415,10 @@ impl Sbr {
             self.reset = true;
         }
         if extra2 {
-            self.limiter_bands = b.u(2)? as usize;
-            self.limiter_gains = b.u(2)? as usize;
-            self.interpol_freq = b.u(1)? == 1;
-            self.smoothing_mode = b.u(1)? == 1;
+            self.limiter_bands = b.get(2)? as usize;
+            self.limiter_gains = b.get(2)? as usize;
+            self.interpol_freq = b.get(1)? == 1;
+            self.smoothing_mode = b.get(1)? == 1;
         } else {
             self.limiter_bands = 2;
             self.limiter_gains = 2;
@@ -683,10 +682,10 @@ impl Sbr {
         ch.amp_res = self.amp_res_header;
         ch.t_env_num_env_old = ch.t_env[num_env_old];
         const CEIL_LOG2: [u32; 6] = [0, 1, 2, 2, 3, 3];
-        let class = b.u(2)?;
+        let class = b.get(2)?;
         match class {
             0 => {
-                let n = 1usize << b.u(2)?;
+                let n = 1usize << b.get(2)?;
                 if n > 4 {
                     return Ok(false);
                 }
@@ -700,46 +699,46 @@ impl Sbr {
                 for i in 0..n - 1 {
                     ch.t_env[i + 1] = ch.t_env[i] + abs_bord_trail;
                 }
-                ch.freq_res[1] = b.u(1)? as u8;
+                ch.freq_res[1] = b.get(1)? as u8;
                 for i in 1..n {
                     ch.freq_res[i + 1] = ch.freq_res[1];
                 }
             }
             1 => {
-                abs_bord_trail += b.u(2)? as usize;
-                let rel = b.u(2)? as usize;
+                abs_bord_trail += b.get(2)? as usize;
+                let rel = b.get(2)? as usize;
                 let n = rel + 1;
                 ch.num_env = n;
                 ch.t_env[0] = 0;
                 ch.t_env[n] = abs_bord_trail;
                 for i in 0..rel {
-                    let d = 2 * b.u(2)? as usize + 2;
+                    let d = 2 * b.get(2)? as usize + 2;
                     ch.t_env[n - 1 - i] = ch.t_env[n - i].saturating_sub(d);
                 }
-                pointer = b.u(CEIL_LOG2[n])? as usize;
+                pointer = b.get(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
-                    ch.freq_res[n - i] = b.u(1)? as u8;
+                    ch.freq_res[n - i] = b.get(1)? as u8;
                 }
             }
             2 => {
-                ch.t_env[0] = b.u(2)? as usize;
-                let rel = b.u(2)? as usize;
+                ch.t_env[0] = b.get(2)? as usize;
+                let rel = b.get(2)? as usize;
                 let n = rel + 1;
                 ch.num_env = n;
                 ch.t_env[n] = abs_bord_trail;
                 for i in 0..rel {
-                    ch.t_env[i + 1] = ch.t_env[i] + 2 * b.u(2)? as usize + 2;
+                    ch.t_env[i + 1] = ch.t_env[i] + 2 * b.get(2)? as usize + 2;
                 }
-                pointer = b.u(CEIL_LOG2[n])? as usize;
+                pointer = b.get(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
-                    ch.freq_res[i + 1] = b.u(1)? as u8;
+                    ch.freq_res[i + 1] = b.get(1)? as u8;
                 }
             }
             _ => {
-                ch.t_env[0] = b.u(2)? as usize;
-                abs_bord_trail += b.u(2)? as usize;
-                let lead = b.u(2)? as usize;
-                let trail = b.u(2)? as usize;
+                ch.t_env[0] = b.get(2)? as usize;
+                abs_bord_trail += b.get(2)? as usize;
+                let lead = b.get(2)? as usize;
+                let trail = b.get(2)? as usize;
                 let n = lead + trail + 1;
                 if n > 5 {
                     return Ok(false);
@@ -747,15 +746,15 @@ impl Sbr {
                 ch.num_env = n;
                 ch.t_env[n] = abs_bord_trail;
                 for i in 0..lead {
-                    ch.t_env[i + 1] = ch.t_env[i] + 2 * b.u(2)? as usize + 2;
+                    ch.t_env[i + 1] = ch.t_env[i] + 2 * b.get(2)? as usize + 2;
                 }
                 for i in 0..trail {
-                    let d = 2 * b.u(2)? as usize + 2;
+                    let d = 2 * b.get(2)? as usize + 2;
                     ch.t_env[n - 1 - i] = ch.t_env[n - i].saturating_sub(d);
                 }
-                pointer = b.u(CEIL_LOG2[n])? as usize;
+                pointer = b.get(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
-                    ch.freq_res[i + 1] = b.u(1)? as u8;
+                    ch.freq_res[i + 1] = b.get(1)? as u8;
                 }
             }
         }
@@ -815,10 +814,10 @@ impl Sbr {
     fn read_dtdf(&mut self, b: &mut Bits, c: usize) -> Result<(), Error> {
         let ch = &mut self.ch[c];
         for i in 0..ch.num_env {
-            ch.df_env[i] = b.u(1)? as u8;
+            ch.df_env[i] = b.get(1)? as u8;
         }
         for i in 0..ch.num_noise {
-            ch.df_noise[i] = b.u(1)? as u8;
+            ch.df_noise[i] = b.get(1)? as u8;
         }
         Ok(())
     }
@@ -828,7 +827,7 @@ impl Sbr {
         let ch = &mut self.ch[c];
         ch.invf_mode[1] = ch.invf_mode[0];
         for i in 0..n_q {
-            ch.invf_mode[0][i] = b.u(2)? as u8;
+            ch.invf_mode[0][i] = b.get(2)? as u8;
         }
         Ok(())
     }
@@ -865,7 +864,7 @@ impl Sbr {
                     ch.env_facs_q[i + 1][j] = v;
                 }
             } else {
-                ch.env_facs_q[i + 1][0] = delta * b.u(bits)? as i32;
+                ch.env_facs_q[i + 1][0] = delta * b.get(bits)? as i32;
                 for j in 1..n[res] {
                     let v = ch.env_facs_q[i + 1][j - 1] + delta * huff(b, f)?;
                     if !(0..=127).contains(&v) {
@@ -899,7 +898,7 @@ impl Sbr {
                     ch.noise_facs_q[i + 1][j] = v;
                 }
             } else {
-                ch.noise_facs_q[i + 1][0] = delta * b.u(5)? as i32;
+                ch.noise_facs_q[i + 1][0] = delta * b.get(5)? as i32;
                 for j in 1..n_q {
                     let v = ch.noise_facs_q[i + 1][j - 1] + delta * huff(b, f)?;
                     if !(0..=30).contains(&v) {
@@ -916,10 +915,10 @@ impl Sbr {
     fn read_harmonics(&mut self, b: &mut Bits, c: usize) -> Result<(), Error> {
         let n1 = self.n[1];
         let ch = &mut self.ch[c];
-        ch.add_harmonic_flag = b.u(1)? == 1;
+        ch.add_harmonic_flag = b.get(1)? == 1;
         if ch.add_harmonic_flag {
             for i in 0..n1 {
-                ch.add_harmonic[i] = b.u(1)? as u8;
+                ch.add_harmonic[i] = b.get(1)? as u8;
             }
         }
         Ok(())
@@ -929,8 +928,8 @@ impl Sbr {
     /// for invalid data.
     fn read_element(&mut self, b: &mut Bits, id: u32) -> Result<bool, Error> {
         if id == 0 {
-            if b.u(1)? == 1 {
-                b.u(4)?;
+            if b.get(1)? == 1 {
+                b.get(4)?;
             }
             if !self.read_grid(b, 0)? {
                 return Ok(false);
@@ -942,10 +941,10 @@ impl Sbr {
             }
             self.read_harmonics(b, 0)?;
         } else {
-            if b.u(1)? == 1 {
-                b.u(8)?;
+            if b.get(1)? == 1 {
+                b.get(8)?;
             }
-            self.coupling = b.u(1)? == 1;
+            self.coupling = b.get(1)? == 1;
             if self.coupling {
                 if !self.read_grid(b, 0)? {
                     return Ok(false);
@@ -992,15 +991,15 @@ impl Sbr {
             self.turn_off();
             return Ok(());
         }
-        if b.u(1)? == 1 {
-            let mut size = b.u(4)? as usize;
+        if b.get(1)? == 1 {
+            let mut size = b.get(4)? as usize;
             if size == 15 {
-                size += b.u(8)? as usize;
+                size += b.get(8)? as usize;
             }
             let mut left = size as i64 * 8;
             while left > 7 {
                 left -= 2;
-                let ext = b.u(2)?;
+                let ext = b.get(2)?;
                 if ext == 2 && ps_allowed {
                     let used = self.ps.read(b, left as usize);
                     b.skip(used)?;
@@ -1026,9 +1025,9 @@ impl Sbr {
         self.kx_and_m_pushed = true;
         let r = (|| -> Result<(), Error> {
             if crc {
-                b.u(10)?;
+                b.get(10)?;
             }
-            if b.u(1)? == 1 {
+            if b.get(1)? == 1 {
                 self.read_header(b)?;
             }
             if self.reset {
@@ -1740,7 +1739,7 @@ mod tests {
             for (i, (&c, &l)) in codes.iter().zip(lens.iter()).enumerate() {
                 let v = (u64::from(c) << (64 - u32::from(l))).to_be_bytes();
                 let mut b = Bits::new(&v);
-                assert_eq!(st.trees[t].decode(&mut b).unwrap(), i, "table {t}");
+                assert_eq!(st.trees[t].decode(&mut b).unwrap() as usize, i, "table {t}");
             }
         }
     }

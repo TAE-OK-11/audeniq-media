@@ -7,9 +7,8 @@
 //! Follows FFmpeg's float decoder, step and buffer for step, so the output
 //! can be compared with it; tables from FFmpeg (`ps_tables.rs`).
 use crate::Error;
-use crate::bits::Bits;
-use crate::huffman::Tree;
 use crate::ps_tables as tab;
+use media_bits::{Bits, Huffman as Tree};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
@@ -425,11 +424,11 @@ impl Ps {
         const NUM_ENV: [[usize; 4]; 2] = [[0, 1, 2, 4], [1, 2, 3, 4]];
         const NR_IIDICC: [usize; 6] = [10, 20, 34, 10, 20, 34];
         const NR_IPDOPD: [usize; 6] = [5, 11, 17, 5, 11, 17];
-        let header = b.u(1)? == 1;
+        let header = b.get(1)? == 1;
         if header {
-            self.enable_iid = b.u(1)? == 1;
+            self.enable_iid = b.get(1)? == 1;
             if self.enable_iid {
-                let mode = b.u(3)? as usize;
+                let mode = b.get(3)? as usize;
                 if mode > 5 {
                     return Ok(false);
                 }
@@ -437,23 +436,23 @@ impl Ps {
                 self.iid_quant = mode > 2;
                 self.nr_ipdopd_par = NR_IPDOPD[mode];
             }
-            self.enable_icc = b.u(1)? == 1;
+            self.enable_icc = b.get(1)? == 1;
             if self.enable_icc {
-                self.icc_mode = b.u(3)? as usize;
+                self.icc_mode = b.get(3)? as usize;
                 if self.icc_mode > 5 {
                     return Ok(false);
                 }
                 self.nr_icc_par = NR_IIDICC[self.icc_mode];
             }
-            self.enable_ext = b.u(1)? == 1;
+            self.enable_ext = b.get(1)? == 1;
         }
-        let frame_class = b.u(1)? == 1;
+        let frame_class = b.get(1)? == 1;
         self.num_env_old = self.num_env;
-        self.num_env = NUM_ENV[usize::from(frame_class)][b.u(2)? as usize];
+        self.num_env = NUM_ENV[usize::from(frame_class)][b.get(2)? as usize];
         self.border[0] = -1;
         if frame_class {
             for e in 1..=self.num_env {
-                self.border[e] = b.u(5)? as i32;
+                self.border[e] = b.get(5)? as i32;
                 if self.border[e] < self.border[e - 1] {
                     return Ok(false);
                 }
@@ -468,7 +467,7 @@ impl Ps {
         let iid_max = 7 + 8 * i32::from(self.iid_quant);
         if self.enable_iid {
             for e in 0..self.num_env {
-                let dt = b.u(1)? == 1;
+                let dt = b.get(1)? == 1;
                 let table = match (dt, self.iid_quant) {
                     (false, false) => IID_DF0,
                     (false, true) => IID_DF1,
@@ -496,7 +495,7 @@ impl Ps {
         }
         if self.enable_icc {
             for e in 0..self.num_env {
-                let dt = b.u(1)? == 1;
+                let dt = b.get(1)? == 1;
                 let ep = e_prev(e, self.num_env_old);
                 let n = self.nr_icc_par;
                 let table = if dt { ICC_DT } else { ICC_DF };
@@ -518,29 +517,29 @@ impl Ps {
             self.icc = [[0; MAX_PAR]; MAX_ENV];
         }
         if self.enable_ext {
-            let mut cnt = b.u(4)? as i64;
+            let mut cnt = b.get(4)? as i64;
             if cnt == 15 {
-                cnt += i64::from(b.u(8)?);
+                cnt += i64::from(b.get(8)?);
             }
             cnt *= 8;
             while cnt > 7 {
-                let id = b.u(2)?;
+                let id = b.get(2)?;
                 let before = b.pos();
                 if id == 0 {
-                    self.enable_ipdopd = b.u(1)? == 1;
+                    self.enable_ipdopd = b.get(1)? == 1;
                     if self.enable_ipdopd {
                         for e in 0..self.num_env {
                             let ep = e_prev(e, self.num_env_old);
                             let n = self.nr_ipdopd_par;
-                            let dt = b.u(1)? == 1;
+                            let dt = b.get(1)? == 1;
                             let t = if dt { IPD_DT } else { IPD_DF };
                             Self::read_par(b, &mut self.ipd, n, t, e, dt, ep, |_| true, true)?;
-                            let dt = b.u(1)? == 1;
+                            let dt = b.get(1)? == 1;
                             let t = if dt { OPD_DT } else { OPD_DF };
                             Self::read_par(b, &mut self.opd, n, t, e, dt, ep, |_| true, true)?;
                         }
                     }
-                    b.u(1)?;
+                    b.get(1)?;
                 }
                 cnt -= 2 + (b.pos() - before) as i64;
             }

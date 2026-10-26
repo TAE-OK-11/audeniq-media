@@ -7,7 +7,7 @@
 //! reconstruction, extra bits and interleaving share one output pass over
 //! reusable buffers. Bounded bit reads and checked packet structure remain.
 use crate::{msb::Bits, Error, Result};
-pub(crate) struct Decoder {
+pub struct Decoder {
     config: [u8; 24],
     pcm: [Vec<i32>; 2],
     extra: [Vec<u32>; 2],
@@ -160,7 +160,26 @@ impl Decoder {
             extra: std::array::from_fn(|_| Vec::new()),
         }
     }
+    /// Channels the magic cookie declares.
+    pub fn channels(&self) -> usize {
+        usize::from(self.config[9])
+    }
+    /// Decode a packet of exactly `frames` frames (the `stts` delta) into
+    /// left-aligned interleaved samples.
     pub fn decode(&mut self, packet: &[u8], frames: u32, out: &mut Vec<i32>) -> Result<()> {
+        self.decode_frames(packet, Some(frames), out)
+    }
+    /// [`Decoder::decode`] when the packet's length is not known up front
+    /// (it is the cookie's frame length unless the packet says otherwise).
+    pub fn decode_any(&mut self, packet: &[u8], out: &mut Vec<i32>) -> Result<()> {
+        self.decode_frames(packet, None, out)
+    }
+    fn decode_frames(
+        &mut self,
+        packet: &[u8],
+        frames: Option<u32>,
+        out: &mut Vec<i32>,
+    ) -> Result<()> {
         let mut b = Bits::new(packet);
         let channels = self.config[9] as usize;
         let width = self.config[5] as u32;
@@ -191,7 +210,7 @@ impl Decoder {
             let samples = if sized { b.get(32)? } else { maximum };
             if samples == 0
                 || samples > maximum
-                || samples != frames
+                || frames.is_some_and(|f| samples != f)
                 || (count != 0 && count != samples)
             {
                 return Err(Error::Invalid("ALAC sample count"));

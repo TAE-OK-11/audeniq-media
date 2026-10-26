@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 media-json.workspace = true
 media-aac.workspace = true
+media-mp3.workspace = true
 media-resample.workspace = true
 audeniq-qc = { path = "../audeniq-qc" }
 

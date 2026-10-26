@@ -115,6 +115,23 @@ impl Imdct {
         }
     }
 
+    /// Forward MDCT of `n` windowed samples into `n/2` coefficients,
+    /// `X[k] = Σ z[i] cos(2π/n (i + n0)(k + ½))` (no scale), through the
+    /// same DCT-IV: fold the four quarter-blocks into `n/2` values.
+    pub(crate) fn forward(&mut self, z: &[f32], out: &mut [f32]) {
+        let m = self.n / 2;
+        let h = m / 2;
+        let mut u = vec![0f32; m];
+        for i in 0..h {
+            u[i] = -z[3 * h - 1 - i] - z[3 * h + i];
+            u[h + i] = z[i] - z[m - 1 - i];
+        }
+        self.dct4(&u);
+        for (o, v) in out.iter_mut().zip(&self.dct) {
+            *o = *v as f32;
+        }
+    }
+
     pub(crate) fn run(&mut self, x: &[f32], out: &mut [f32]) {
         let (n, m) = (self.n, self.n / 2);
         self.dct4(x);
@@ -203,6 +220,33 @@ mod tests {
             Imdct::new(n).run(&x, &mut out);
             for (a, b) in out.iter().zip(direct(&x)) {
                 assert!((f64::from(*a) - b).abs() < 1e-4, "{a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn forward_mdct_matches_the_definition() {
+        for n in [256usize, 2048] {
+            let z: Vec<f32> = (0..n)
+                .map(|i| ((i * 53 % 97) as f32 - 48.0) / 5.0)
+                .collect();
+            let mut fast = vec![0.0; n / 2];
+            Imdct::new(n).forward(&z, &mut fast);
+            let n0 = (n as f64 / 2.0 + 1.0) / 2.0;
+            for k in 0..n / 2 {
+                let d: f64 = z
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        f64::from(v)
+                            * (2.0 * PI / n as f64 * (i as f64 + n0) * (k as f64 + 0.5)).cos()
+                    })
+                    .sum();
+                assert!(
+                    (f64::from(fast[k]) - d).abs() < 1e-2,
+                    "{n} {k}: {} {d}",
+                    fast[k]
+                );
             }
         }
     }

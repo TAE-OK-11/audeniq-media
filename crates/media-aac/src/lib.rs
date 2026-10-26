@@ -10,6 +10,7 @@
 //! refused or reported by the caller. Tables come from FFmpeg (LGPL), the
 //! code is AUDENIQ's.
 mod bits;
+pub mod encoder;
 mod huffman;
 mod mdct;
 mod tables;
@@ -35,7 +36,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-const RATES: [u32; 13] = [
+pub(crate) const RATES: [u32; 13] = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
 ];
 
@@ -66,7 +67,7 @@ fn trees() -> &'static Trees {
 }
 
 /// `|q|^(4/3)` for every quantized magnitude (escape values reach 8191).
-fn pow43() -> &'static [f32] {
+pub(crate) fn pow43() -> &'static [f32] {
     static T: OnceLock<Vec<f32>> = OnceLock::new();
     T.get_or_init(|| {
         (0..8192)

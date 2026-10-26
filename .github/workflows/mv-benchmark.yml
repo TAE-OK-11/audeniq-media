@@ -1,0 +1,43 @@
+name: MV sound tools versus FFmpeg
+on:
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/media-aac/**
+      - crates/media-bits/**
+      - crates/media-dsp/**
+      - crates/media-mp3/**
+      - crates/media-resample/**
+      - crates/media-video/**
+      - crates/audeniq-music/**
+      - .github/workflows/mv-benchmark.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: FFmpeg (the comparison and the corpus maker)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -version | head -1
+      - run: rustc --version && cargo --version
+      - run: cargo test --locked --release -p media-bits -p media-dsp -p media-aac -p media-mp3 -p media-resample -p media-video
+      - run: cargo build --locked --profile release-music -p audeniq-music
+      - run: cargo build --locked --profile release-music -p media-video --example decode_sound
+      - name: Four-minute music videos, three runs each
+        run: |
+          python3 crates/media-video/bench/compare_ffmpeg.py --seconds 240 --runs 3 \
+            --json mv-benchmark.json | tee mv-benchmark.txt
+          { echo '### ${{ matrix.runner }}'; echo '```'; cat mv-benchmark.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

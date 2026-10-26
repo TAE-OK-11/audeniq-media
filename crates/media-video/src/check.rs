@@ -1,4 +1,4 @@
-//! Music-video delivery checks (`mv-delivery-v1`).
+//! Music-video delivery checks (`mv-delivery-v2`: v1 plus the sound checks).
 //!
 //! `error`: the file cannot be delivered as is (no picture or sound, media
 //! outside the file, a broken index). `warning`: a DSP is likely to reject it
@@ -352,6 +352,101 @@ pub(crate) fn evaluate(r: &Report, l: &Layout, tracks: &[Track]) -> Vec<Issue> {
                 ),
             );
         }
+    }
+
+    // The decoded sound (`probe --sound`): what the audio QC checks on masters.
+    if let Some(s) = &r.sound {
+        if s.decode_errors > 0 {
+            let broken = s.decode_errors * 100 >= s.packets.max(1);
+            add(
+                "AUDIO_DECODE_ERRORS",
+                if broken { Error } else { Warning },
+                format!(
+                    "소리 데이터 {}곳이 깨져 재생되지 않습니다(전체 {}곳 중).",
+                    s.decode_errors, s.packets
+                ),
+            );
+        }
+        match s.peak_dbfs {
+            None => add(
+                "AUDIO_SILENT",
+                Error,
+                "소리 트랙이 완전히 무음입니다.".into(),
+            ),
+            Some(p) if p < -80.0 => add(
+                "AUDIO_SILENT",
+                Error,
+                format!("소리 트랙이 사실상 무음입니다(최대 {p:.1}dBFS)."),
+            ),
+            _ => {}
+        }
+        let samples = (s.duration * f64::from(s.sample_rate) * f64::from(s.channels)).max(1.0);
+        if s.clipped_samples as f64 / samples >= 0.001 {
+            add(
+                "AUDIO_CLIPPING",
+                Warning,
+                format!(
+                    "소리가 찌그러져 있습니다(클리핑 {}회). 마스터를 확인해 주세요.",
+                    s.clip_events
+                ),
+            );
+        } else if s.clip_events > 0 || s.true_peak_dbtp.is_some_and(|t| t > 0.0) {
+            add(
+                "AUDIO_CLIPPING",
+                Warning,
+                format!(
+                    "소리 최고점이 0dBFS를 넘습니다(True Peak {:+.1}dBTP, 클리핑 {}회). 재생 기기에서 찌그러질 수 있습니다.",
+                    s.true_peak_dbtp.unwrap_or(0.0),
+                    s.clip_events
+                ),
+            );
+        }
+        if s.silent_ratio >= 0.5 || s.longest_silence >= 30.0 {
+            add(
+                "AUDIO_LONG_SILENCE",
+                Warning,
+                format!(
+                    "소리가 없는 구간이 깁니다(가장 긴 무음 {:.0}초, 전체의 {:.0}%).",
+                    s.longest_silence,
+                    s.silent_ratio * 100.0
+                ),
+            );
+        }
+        if let [Some(a), Some(b)] | [Some(a), Some(b), ..] = s.channel_peaks_dbfs.as_slice()
+            && ((*a < -60.0) != (*b < -60.0))
+        {
+            add(
+                "AUDIO_ONE_CHANNEL_SILENT",
+                Warning,
+                "스테레오의 한쪽 채널에 소리가 없습니다.".into(),
+            );
+        } else if s.channels == 2
+            && s.channel_peaks_dbfs.iter().filter(|p| p.is_none()).count() == 1
+        {
+            add(
+                "AUDIO_ONE_CHANNEL_SILENT",
+                Warning,
+                "스테레오의 한쪽 채널에 소리가 없습니다.".into(),
+            );
+        }
+        if let Some(l) = s.integrated_lufs
+            && l < -30.0
+        {
+            add(
+                "AUDIO_TOO_QUIET",
+                Warning,
+                format!(
+                    "소리가 매우 작습니다({l:.1} LUFS). 음원과 같은 마스터를 썼는지 확인해 주세요."
+                ),
+            );
+        }
+    }
+    if let Some(note) = &r.sound_note {
+        add(
+            "SOUND_NOT_MEASURED",
+            Info,
+            format!("소리는 측정하지 않았습니다: {note}."),
+        );
     }
 
     // Picture and sound together.

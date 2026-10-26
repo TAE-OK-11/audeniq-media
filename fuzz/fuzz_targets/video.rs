@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = media_video::probe(&mut std::io::Cursor::new(data));
+    let _ = media_video::probe_with(&mut std::io::Cursor::new(data), true);
 });

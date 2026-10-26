@@ -12,6 +12,8 @@ pub const MAX_MOOV: u64 = 64 << 20;
 const MAX_MOOF: u64 = 16 << 20;
 /// Top-level boxes walked before the rest is treated as unreadable.
 const MAX_BOXES: usize = 200_000;
+/// Fragment sample positions kept per track.
+pub const MAX_FRAGMENT_SAMPLES: usize = 2_000_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct Layout {
@@ -24,6 +26,9 @@ pub(crate) struct Layout {
     pub fragments: u64,
     /// Sample timing per track id gathered from `moof/traf/trun`.
     pub fragment_timing: BTreeMap<u32, Timing>,
+    /// Per track id: each `trun`'s data offset and sample sizes (up to
+    /// [`MAX_FRAGMENT_SAMPLES`] samples a track), for reading the sound.
+    pub fragment_runs: BTreeMap<u32, Vec<(u64, Vec<u32>)>>,
     /// Data of a fragment points outside the file.
     pub fragment_outside: bool,
     /// The last top-level box runs past the end of the file.
@@ -196,6 +201,7 @@ fn fragment(l: &mut Layout, moof: &[u8], moof_at: u64, trex: &BTreeMap<u32, (u32
                 return;
             }
             let mut bytes = 0u64;
+            let mut sizes = Vec::new();
             for i in 0..count {
                 let mut field = |bit: u32, default: u32| -> u32 {
                     if tf & bit == 0 {
@@ -224,8 +230,14 @@ fn fragment(l: &mut Layout, moof: &[u8], moof_at: u64, trex: &BTreeMap<u32, (u32
                     timing.sync.get_or_insert_with(Vec::new);
                 }
                 bytes = bytes.saturating_add(u64::from(s));
+                sizes.push(s);
             }
             timing.bytes = timing.bytes.saturating_add(bytes);
+            let runs = l.fragment_runs.entry(id).or_default();
+            let kept: usize = runs.iter().map(|r| r.1.len()).sum();
+            if kept + sizes.len() <= MAX_FRAGMENT_SAMPLES {
+                runs.push((data, sizes));
+            }
             if data.saturating_add(bytes) > l.size {
                 l.fragment_outside = true;
             }

@@ -167,14 +167,14 @@ fn colr(p: &[u8]) -> Option<Color> {
 }
 
 /// Number of entries a full-box table may hold given its payload size.
-fn entries(b: &[u8], at: usize, width: usize) -> Option<usize> {
+pub(crate) fn entries(b: &[u8], at: usize, width: usize) -> Option<usize> {
     let n = u32_at(b, at)? as usize;
     let room = b.len().saturating_sub(at + 4) / width;
     (n <= room).then_some(n)
 }
 
 /// Sizes from `stsz` or `stz2`: (uniform size, per-sample sizes).
-fn sample_sizes(stbl: &[u8]) -> Option<(u32, u64, Vec<u32>)> {
+pub(crate) fn sample_sizes(stbl: &[u8]) -> Option<(u32, u64, Vec<u32>)> {
     if let Some(b) = child(stbl, b"stsz") {
         let uniform = u32_at(b, 4)?;
         let count = u64::from(u32_at(b, 8)?);
@@ -210,7 +210,7 @@ fn sample_sizes(stbl: &[u8]) -> Option<(u32, u64, Vec<u32>)> {
     Some((0, n as u64, sizes))
 }
 
-fn chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
+pub(crate) fn chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
     if let Some(b) = child(stbl, b"stco") {
         let n = entries(b, 4, 4)?;
         return (0..n)

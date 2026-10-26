@@ -14,6 +14,9 @@ pub struct Report {
     pub video: Vec<VideoStream>,
     pub audio: Vec<AudioStream>,
     pub other: Vec<OtherStream>,
+    /// The measured sound track (`probe --sound`), or why it was not.
+    pub sound: Option<crate::sound::Sound>,
+    pub sound_note: Option<String>,
     pub issues: Vec<Issue>,
     /// No issue of severity `error`.
     pub mv_ready: bool,
@@ -25,6 +28,8 @@ media_json::json_struct!(Report {
     video,
     audio,
     other,
+    sound,
+    sound_note,
     issues,
     mv_ready
 });
@@ -335,22 +340,25 @@ fn frame_rates(t: &Timing, timescale: u32) -> (Rate, Rate, bool) {
     if runs.len() > 1 && runs[runs.len() - 1].0 == 1 {
         runs = &runs[..runs.len() - 1];
     }
-    let min = runs.iter().map(|r| r.1).min();
-    let max = runs.iter().map(|r| r.1).max();
-    let (Some(min), Some(max)) = (min, max) else {
+    let Some(common) = runs.iter().max_by_key(|r| r.0).map(|r| r.1) else {
         return (None, avg, false);
     };
-    if min == max {
-        return (ratio(ts, u64::from(min)), avg, false);
-    }
     // Deltas one tick apart are rounding of a constant rate (29.97 fps in a
-    // 1000 Hz timescale is 33/34/33…).
-    let variable = max - min > 1;
-    let common = runs.iter().max_by_key(|r| r.0).map(|r| r.1).unwrap_or(min);
-    let nominal = if variable {
-        ratio(ts, u64::from(common))
-    } else {
+    // 1000 Hz timescale is 33/34/33…); a few odd frames (fragment or edit
+    // boundaries) are not a variable rate either: over 1% of frames are.
+    let odd: u64 = runs
+        .iter()
+        .filter(|r| r.1.abs_diff(common) > 1)
+        .map(|r| r.0)
+        .sum();
+    let variable = odd.saturating_mul(100) > t.samples;
+    // Only rounding jitter: the average is the rate; else the common delta.
+    let jitter =
+        runs.iter().any(|r| r.1 != common) && runs.iter().all(|r| r.1.abs_diff(common) <= 1);
+    let nominal = if jitter {
         avg
+    } else {
+        ratio(ts, u64::from(common))
     };
     (nominal, avg, variable)
 }
@@ -515,6 +523,8 @@ pub(crate) fn build(l: &Layout) -> Result<(Report, Vec<Track>), Error> {
         video: Vec::new(),
         audio: Vec::new(),
         other: Vec::new(),
+        sound: None,
+        sound_note: None,
         issues: Vec::new(),
         mv_ready: false,
     };
@@ -596,6 +606,17 @@ mod tests {
         let (r, _, v) = frame_rates(&vfr, 90000);
         assert!(v);
         assert_eq!(r, Some((30, 1)));
+
+        // Seven odd frames among 7200 (fragment boundaries): constant.
+        let mut frag = Timing::default();
+        for _ in 0..7 {
+            frag.push(1027, 1001);
+            frag.push(1, 2002);
+        }
+        frag.push(7, 1001);
+        let (r, _, v) = frame_rates(&frag, 30000);
+        assert!(!v);
+        assert_eq!(r, Some((30000, 1001)));
     }
 
     #[test]

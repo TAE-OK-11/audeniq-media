@@ -6,7 +6,7 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
 
 - 오디오: 무손실 디코딩/FLAC 정규화, LUFS·True Peak QC, 지문 입력 — [docs/audio/README.md](docs/audio/README.md)
 - 이미지·PDF: 메타데이터, 색상·출처 보고, QR, OCR, 업로드 정화, PDF — [docs/photo/README.md](docs/photo/README.md)
-- 뮤직비디오: MP4/MOV 분석(FFprobe 필드)과 배급 규격 검사 — [docs/video/README.md](docs/video/README.md)
+- 뮤직비디오: MP4/MOV 분석(FFprobe 필드), 소리 디코드·음량 측정(자체 AAC 디코더), 배급 규격 검사 — [docs/video/README.md](docs/video/README.md)
 
 ## 구성
 
@@ -18,7 +18,8 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
 | `crates/audeniq-qc-tools` | 오디오 검증·벤치마크 도구 (`audeniq-qc-tools`) |
 | `crates/audeniq-photo` | 이미지·PDF 통합 API |
 | `crates/photo-cli` | photo 명령행 라이브러리와 `audeniq-photo` 바이너리 |
-| `crates/media-video` | 뮤직비디오 MP4/MOV 분석·배급 검사 (`audeniq-music video …`) |
+| `crates/media-video` | 뮤직비디오 MP4/MOV 분석·소리 측정·배급 검사 (`audeniq-music video …`) |
+| `crates/media-aac` | AAC-LC 디코더 (뮤직비디오 소리 측정) |
 | `crates/audeniq-music` | 백엔드가 설치하는 단일 바이너리 `audeniq-music` (`qc …`, `photo …`, `video …`) |
 | `crates/photo-bench` | 외부 도구 대비 벤치마크 (`audeniq-photo-bench`) |
 | `crates/photo-*` | 코덱·파서: core, deflate, png, jpeg, icc, meta, qr, ocr, pdf(+syntax/interpret/ccitt/jbig2/jpeg2000/cmap/postscript) |

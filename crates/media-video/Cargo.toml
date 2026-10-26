@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 media-json.workspace = true
+media-aac.workspace = true
+audeniq-qc = { path = "../audeniq-qc" }
 
 [lints]
 workspace = true

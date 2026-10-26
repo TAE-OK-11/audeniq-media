@@ -504,6 +504,10 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
         return Err(Error::Limit("24-bit PCM goes in .mov, not .mp4".into()));
     }
     let mut f = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(input)?);
+    // Sound reads go through their own small buffer (see `READ_BUFFER`); the
+    // large one serves the video copy, read in long runs.
+    let mut sound_in =
+        std::io::BufReader::with_capacity(crate::READ_BUFFER, std::fs::File::open(input)?);
     let size = f.seek(SeekFrom::End(0))?;
     let layout = crate::file::walk(&mut f, size)?;
     let moov = layout
@@ -602,7 +606,7 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
                 .map_err(|e| Error::Limit(e.to_string()))?;
             let mut units = Vec::new();
             decode_sound(
-                &mut f,
+                &mut sound_in,
                 &layout,
                 &plan,
                 movie_ts,
@@ -619,7 +623,7 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
         Codec::Pcm24 => {
             let mut pcm = Vec::new();
             decode_sound(
-                &mut f,
+                &mut sound_in,
                 &layout,
                 &plan,
                 movie_ts,

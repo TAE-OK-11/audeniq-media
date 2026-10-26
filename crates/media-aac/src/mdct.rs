@@ -1,117 +1,29 @@
-//! Inverse MDCT through a DCT-IV of half the size, itself a complex FFT of
-//! a quarter the size, and the sine / Kaiser-Bessel-derived windows.
+//! Inverse MDCT through a DCT-IV of half the size (`media-dsp`: a complex
+//! FFT of a quarter the size), and the sine / Kaiser-Bessel-derived windows.
+use media_dsp::Dct4;
 use std::f64::consts::PI;
-
-#[derive(Clone, Copy)]
-struct C {
-    re: f64,
-    im: f64,
-}
-
-impl C {
-    fn mul(self, o: C) -> C {
-        C {
-            re: self.re * o.re - self.im * o.im,
-            im: self.re * o.im + self.im * o.re,
-        }
-    }
-}
 
 /// IMDCT of `n/2` coefficients into `n` samples:
 /// `y[i] = 2/n Σ X[k] cos(2π/n (i + n0)(k + ½))`, `n0 = (n/2 + 1)/2`.
 pub(crate) struct Imdct {
     n: usize,
-    /// Pre/post rotation `exp(-iπ(8j+1)/(8M))`, `M = n/2`.
-    twiddle: Vec<C>,
-    /// FFT roots of size `M/2` and its bit-reversal permutation.
-    roots: Vec<C>,
-    rev: Vec<usize>,
-    buf: Vec<C>,
-    dct: Vec<f64>,
+    dct4: Dct4,
+    dct: Vec<f32>,
+    fold: Vec<f32>,
+    re: Vec<f32>,
+    im: Vec<f32>,
 }
 
 impl Imdct {
     pub(crate) fn new(n: usize) -> Imdct {
         let m = n / 2;
-        let q = m / 2;
-        let twiddle = (0..q)
-            .map(|j| {
-                let a = -PI * (8 * j + 1) as f64 / (8 * m) as f64;
-                C {
-                    re: a.cos(),
-                    im: a.sin(),
-                }
-            })
-            .collect();
-        let roots = (0..q / 2)
-            .map(|k| {
-                let a = -2.0 * PI * k as f64 / q as f64;
-                C {
-                    re: a.cos(),
-                    im: a.sin(),
-                }
-            })
-            .collect();
-        let bits = q.trailing_zeros();
-        let rev = (0..q)
-            .map(|i| i.reverse_bits() >> (usize::BITS - bits))
-            .collect();
         Imdct {
             n,
-            twiddle,
-            roots,
-            rev,
-            buf: vec![C { re: 0.0, im: 0.0 }; q],
+            dct4: Dct4::new(m),
             dct: vec![0.0; m],
-        }
-    }
-
-    fn fft(&mut self) {
-        let q = self.buf.len();
-        for i in 0..q {
-            let j = self.rev[i];
-            if i < j {
-                self.buf.swap(i, j);
-            }
-        }
-        let mut len = 2;
-        while len <= q {
-            let step = q / len;
-            for start in (0..q).step_by(len) {
-                for k in 0..len / 2 {
-                    let w = self.roots[k * step];
-                    let a = self.buf[start + k];
-                    let b = self.buf[start + k + len / 2].mul(w);
-                    self.buf[start + k] = C {
-                        re: a.re + b.re,
-                        im: a.im + b.im,
-                    };
-                    self.buf[start + k + len / 2] = C {
-                        re: a.re - b.re,
-                        im: a.im - b.im,
-                    };
-                }
-            }
-            len *= 2;
-        }
-    }
-
-    /// `u[i] = Σ x[k] cos(π/M (i + ½)(k + ½))`.
-    fn dct4(&mut self, x: &[f32]) {
-        let m = self.n / 2;
-        let q = m / 2;
-        for j in 0..q {
-            let v = C {
-                re: f64::from(x[2 * j]),
-                im: f64::from(x[m - 1 - 2 * j]),
-            };
-            self.buf[j] = v.mul(self.twiddle[j]);
-        }
-        self.fft();
-        for k in 0..q {
-            let c = self.buf[k].mul(self.twiddle[k]);
-            self.dct[2 * k] = c.re;
-            self.dct[m - 1 - 2 * k] = -c.im;
+            fold: vec![0.0; m],
+            re: vec![0.0; m / 2],
+            im: vec![0.0; m / 2],
         }
     }
 
@@ -121,31 +33,31 @@ impl Imdct {
     pub(crate) fn forward(&mut self, z: &[f32], out: &mut [f32]) {
         let m = self.n / 2;
         let h = m / 2;
-        let mut u = vec![0f32; m];
+        let u = &mut self.fold;
         for i in 0..h {
             u[i] = -z[3 * h - 1 - i] - z[3 * h + i];
             u[h + i] = z[i] - z[m - 1 - i];
         }
-        self.dct4(&u);
-        for (o, v) in out.iter_mut().zip(&self.dct) {
-            *o = *v as f32;
-        }
+        self.dct4.run(&self.fold, out, &mut self.re, &mut self.im);
     }
 
     pub(crate) fn run(&mut self, x: &[f32], out: &mut [f32]) {
         let (n, m) = (self.n, self.n / 2);
-        self.dct4(x);
-        let scale = 2.0 / n as f64;
-        for (i, o) in out.iter_mut().enumerate().take(n) {
-            let j = i + m / 2;
-            let v = if j < m {
-                self.dct[j]
-            } else if j < 2 * m {
-                -self.dct[2 * m - 1 - j]
-            } else {
-                -self.dct[j - 2 * m]
-            };
-            *o = (v * scale) as f32;
+        self.dct4.run(x, &mut self.dct, &mut self.re, &mut self.im);
+        let scale = 2.0 / n as f32;
+        // y[i] = d[i + m/2] for the first half of d, then the mirrored and
+        // negated halves.
+        let q = m / 2;
+        let d = &self.dct;
+        let out = &mut out[..n];
+        for i in 0..q {
+            out[i] = d[q + i] * scale;
+        }
+        for i in q..q + m {
+            out[i] = -d[2 * m - 1 - (i + q)] * scale;
+        }
+        for i in q + m..n {
+            out[i] = -d[i + q - 2 * m] * scale;
         }
     }
 }

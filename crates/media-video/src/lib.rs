@@ -34,6 +34,12 @@ pub use source::Pick;
 
 use std::io::{Read, Seek, SeekFrom};
 
+/// Read buffer for index and sound reads. Sound chunks sit between video
+/// chunks, so each is a seek and a read: a buffer much larger than a chunk
+/// would read video bytes only to throw them away. Reads at least this large
+/// go straight to the file.
+pub(crate) const READ_BUFFER: usize = 16 << 10;
+
 /// Engine identity reported in every probe.
 pub const ENGINE_VERSION: &str = "audeniq-video/0.1.0";
 /// Delivery rules the `issues` were evaluated against (v2: sound checks).
@@ -116,13 +122,13 @@ pub fn probe_with<R: Read + Seek>(r: &mut R, sound: bool) -> Result<Report, Erro
 
 /// [`probe_with`] of a file on disk.
 pub fn probe_path(path: &std::path::Path, sound: bool) -> Result<Report, Error> {
-    let mut f = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    let mut f = std::io::BufReader::with_capacity(READ_BUFFER, std::fs::File::open(path)?);
     probe_with(&mut f, sound)
 }
 
 /// Byte ranges of the sound track's data ([`sound::ranges`]).
 pub fn sound_ranges(path: &std::path::Path) -> Result<Vec<(u64, u64)>, Error> {
-    let mut f = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    let mut f = std::io::BufReader::with_capacity(READ_BUFFER, std::fs::File::open(path)?);
     let size = f.seek(SeekFrom::End(0))?;
     let layout = file::walk(&mut f, size)?;
     if layout.moov.is_none() {
@@ -132,9 +138,13 @@ pub fn sound_ranges(path: &std::path::Path) -> Result<Vec<(u64, u64)>, Error> {
 }
 
 /// The delivery sound of an MP4/MOV decoded as it is: edit lists applied,
-/// no resampling or folding. (sample rate, channel names, interleaved f32).
-pub fn decode_sound(path: &std::path::Path) -> Result<(u32, Vec<&'static str>, Vec<f32>), Error> {
-    let mut f = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+/// no resampling or folding, handed to `sink` block by block (interleaved
+/// f32). Returns the sample rate and channel names.
+pub fn decode_sound_blocks(
+    path: &std::path::Path,
+    sink: &mut dyn FnMut(&[f32]),
+) -> Result<(u32, Vec<&'static str>), Error> {
+    let mut f = std::io::BufReader::with_capacity(READ_BUFFER, std::fs::File::open(path)?);
     let size = f.seek(SeekFrom::End(0))?;
     let layout = file::walk(&mut f, size)?;
     let moov = layout
@@ -145,6 +155,17 @@ pub fn decode_sound(path: &std::path::Path) -> Result<(u32, Vec<&'static str>, V
     let ts = source::movie_timescale(&moov).unwrap_or(1);
     let mut mix = source::Mix::open(&mut f, &layout, &plan, ts, source::Use::Convert)?;
     let mut pcm = Vec::new();
-    while mix.pull(&mut f, &mut pcm)? {}
-    Ok((mix.rate(), mix.names(), pcm))
+    while mix.pull(&mut f, &mut pcm)? {
+        sink(&pcm);
+        pcm.clear();
+    }
+    Ok((mix.rate(), mix.names()))
+}
+
+/// [`decode_sound_blocks`] gathered: (sample rate, channel names,
+/// interleaved f32).
+pub fn decode_sound(path: &std::path::Path) -> Result<(u32, Vec<&'static str>, Vec<f32>), Error> {
+    let mut all = Vec::new();
+    let (rate, names) = decode_sound_blocks(path, &mut |b| all.extend_from_slice(b))?;
+    Ok((rate, names, all))
 }

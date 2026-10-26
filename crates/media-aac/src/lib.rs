@@ -58,6 +58,8 @@ const INTENSITY_HCB: u8 = 15;
 struct Trees {
     sf: Tree,
     spectral: Vec<Tree>,
+    /// Each spectral codebook's symbols as their (up to four) values.
+    values: Vec<Vec<[i8; 4]>>,
 }
 
 fn trees() -> &'static Trees {
@@ -68,7 +70,35 @@ fn trees() -> &'static Trees {
             .iter()
             .map(|(c, l)| Tree::new(c, l))
             .collect(),
+        values: (1..=11u8)
+            .map(|cb| {
+                let (dims, modulo, off) = unpacking(cb);
+                let n = (modulo as usize).pow(dims as u32);
+                (0..n as i32)
+                    .map(|mut idx| {
+                        let mut v = [0i8; 4];
+                        for d in (0..dims).rev() {
+                            v[d] = (idx % modulo - off) as i8;
+                            idx /= modulo;
+                        }
+                        v
+                    })
+                    .collect()
+            })
+            .collect(),
     })
+}
+
+/// Values per symbol, their modulus and offset for codebook `cb`.
+fn unpacking(cb: u8) -> (usize, i32, i32) {
+    match cb {
+        1 | 2 => (4, 3, 1),
+        3 | 4 => (4, 3, 0),
+        5 | 6 => (2, 9, 4),
+        7 | 8 => (2, 8, 0),
+        9 | 10 => (2, 13, 0),
+        _ => (2, 17, 0),
+    }
 }
 
 /// `|q|^(4/3)` for every quantized magnitude (escape values reach 8191).
@@ -753,22 +783,18 @@ impl Decoder {
                     continue;
                 }
                 let tree = &t.spectral[usize::from(cb) - 1];
-                let (dims, signed, modulo, off) = match cb {
-                    1 | 2 => (4, true, 3, 1),
-                    3 | 4 => (4, false, 3, 0),
-                    5 | 6 => (2, true, 9, 4),
-                    7 | 8 => (2, false, 8, 0),
-                    9 | 10 => (2, false, 13, 0),
-                    _ => (2, false, 17, 0),
-                };
+                let table = &t.values[usize::from(cb) - 1];
+                let dims = unpacking(cb).0;
+                let signed = matches!(cb, 1 | 2 | 5 | 6);
                 for w in 0..glen {
                     let base = (win + w) * 128;
                     let mut k = lo;
                     while k < hi {
-                        let mut idx = tree.decode(b)? as i32;
-                        for d in (0..dims).rev() {
-                            vals[d] = idx % modulo - off;
-                            idx /= modulo;
+                        let sym = table
+                            .get(tree.decode(b)?)
+                            .ok_or(Error::Invalid("Huffman codeword"))?;
+                        for (v, &s) in vals.iter_mut().zip(sym) {
+                            *v = i32::from(s);
                         }
                         if !signed {
                             for v in vals.iter_mut().take(dims) {

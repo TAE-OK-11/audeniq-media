@@ -7,5 +7,8 @@ rust-version.workspace = true
 # Codebook, band, SBR and PS tables are transcribed from FFmpeg (LGPL).
 license = "LGPL-2.1-or-later"
 
+[dependencies]
+media-dsp.workspace = true
+
 [lints]
 workspace = true

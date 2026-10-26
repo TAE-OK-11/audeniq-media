@@ -1,11 +1,13 @@
 # AUDENIQ 미디어 엔진
 
 AUDENIQ 백엔드가 쓰던 외부 미디어 도구(FFmpeg·FFprobe, ExifTool, ZBar, Poppler, Tesseract,
-Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 오디오 엔진(`audeniq-qc`)과 이미지·PDF 도구(`audeniq-photo`)를
+Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 배급으로 늘어난 영상 분석(FFprobe)도 `media-video`가 맡습니다. 오디오 엔진(`audeniq-qc`)과 이미지·PDF 도구(`audeniq-photo`)를
 하나의 Cargo 워크스페이스로 합치고, 두 쪽이 따로 갖고 있던 공통 부분을 공유 크레이트로 모았습니다.
 
 - 오디오: 무손실 디코딩/FLAC 정규화, LUFS·True Peak QC, 지문 입력 — [docs/audio/README.md](docs/audio/README.md)
 - 이미지·PDF: 메타데이터, 색상·출처 보고, QR, OCR, 업로드 정화, PDF — [docs/photo/README.md](docs/photo/README.md)
+- 뮤직비디오: MP4/MOV 분석(FFprobe 필드), 소리 디코드·음량 측정(자체 AAC 디코더), 배급 규격 검사 — [docs/video/README.md](docs/video/README.md)
+- Dolby Atmos: ADM BWF 마스터(BW64/RF64) 읽기와 공간 음향 납품 검사 — [docs/atmos/README.md](docs/atmos/README.md)
 
 ## 구성
 
@@ -17,7 +19,10 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 오디오 엔진(
 | `crates/audeniq-qc-tools` | 오디오 검증·벤치마크 도구 (`audeniq-qc-tools`) |
 | `crates/audeniq-photo` | 이미지·PDF 통합 API |
 | `crates/photo-cli` | photo 명령행 라이브러리와 `audeniq-photo` 바이너리 |
-| `crates/audeniq-music` | 백엔드가 설치하는 단일 바이너리 `audeniq-music` (`qc …`, `photo …`) |
+| `crates/media-video` | 뮤직비디오 MP4/MOV 분석·소리 측정·배급 검사 (`audeniq-music video …`) |
+| `crates/media-aac` | AAC-LC 디코더 (뮤직비디오 소리 측정) |
+| `crates/media-adm` | Dolby Atmos ADM BWF 분석·납품 검사 (`audeniq-music atmos …`) |
+| `crates/audeniq-music` | 백엔드가 설치하는 단일 바이너리 `audeniq-music` (`qc …`, `photo …`, `video …`, `atmos …`) |
 | `crates/photo-bench` | 외부 도구 대비 벤치마크 (`audeniq-photo-bench`) |
 | `crates/photo-*` | 코덱·파서: core, deflate, png, jpeg, icc, meta, qr, ocr, pdf(+syntax/interpret/ccitt/jbig2/jpeg2000/cmap/postscript) |
 
@@ -39,6 +44,8 @@ cargo build --profile release-music --locked -p audeniq-music  # target/release-
 ```text
 audeniq-music qc <명령> ...      audeniq-qc와 같은 명령·JSON (예: audeniq-music qc analyze FILE --fingerprint)
 audeniq-music photo <명령> ...   audeniq-photo와 같은 명령·출력 (예: audeniq-music photo sanitize SRC DST MIME)
+audeniq-music video <명령> ...   뮤직비디오 분석 (예: audeniq-music video probe --sound FILE)
+audeniq-music atmos <명령> ...   Dolby Atmos 마스터 분석 (예: audeniq-music atmos probe --peaks FILE)
 audeniq-music --version          audeniq-music 0.1.0 (audeniq-qc/0.1.0)
 ```
 
@@ -71,7 +78,7 @@ cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
-photo의 대조 테스트는 exiftool, zbarimg, qrencode, ffmpeg, poppler, python3/Pillow가 있을 때만 비교하고
+photo와 video의 대조 테스트는 exiftool, zbarimg, qrencode, ffmpeg, poppler, python3/Pillow가 있을 때만 비교하고
 없으면 건너뜁니다(`.github/workflows/ci.yml`이 설치). 오디오 측정 워크플로(`native.yml`, `media-codecs.yml` 등)는
 오디오와 공통 크레이트만 빌드합니다.
 
@@ -85,7 +92,7 @@ cargo install --locked --git https://github.com/TAE-OK-11/audeniq-media --rev <r
   --profile release-music audeniq-music
 ```
 
-명령 이름 앞에 `qc`/`photo`가 붙는 것 말고 명령행·JSON 출력은 `audeniq-qc`, `audeniq-photo`와 같습니다.
+`video`·`atmos`는 이 바이너리에만 있습니다. 명령 이름 앞에 `qc`/`photo`가 붙는 것 말고 명령행·JSON 출력은 `audeniq-qc`, `audeniq-photo`와 같습니다.
 
 ## 라이선스
 

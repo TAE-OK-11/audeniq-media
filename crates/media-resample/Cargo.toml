@@ -1,0 +1,10 @@
+[package]
+name = "media-resample"
+description = "Polyphase windowed-sinc sample-rate conversion and channel downmix for AUDENIQ deliveries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

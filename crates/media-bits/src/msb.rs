@@ -88,8 +88,22 @@ impl<'a> Bits<'a> {
         self.loaded += count as usize;
         self.available += count * 8;
     }
-    #[inline]
+    #[inline(always)]
     pub fn get(&mut self, n: u32) -> Result<u32> {
+        // Bits already cached and within the limit: no refill, no branch
+        // to the error paths.
+        if n.wrapping_sub(1) < self.available.min(32) && self.pos + n as usize <= self.end {
+            let x = (self.cache >> (64 - n)) as u32;
+            self.cache <<= n;
+            self.available -= n;
+            self.pos += n as usize;
+            return Ok(x);
+        }
+        self.get_slow(n)
+    }
+    #[cold]
+    #[inline(never)]
+    fn get_slow(&mut self, n: u32) -> Result<u32> {
         if n > 32 {
             return Err(Error::Invalid("bit width"));
         }
@@ -332,8 +346,16 @@ impl<'a> Bits<'a> {
         self.available -= n;
         self.pos += n as usize;
     }
-    #[inline]
+    #[inline(always)]
     pub fn peek(&mut self, n: u32) -> Result<u32> {
+        if n.wrapping_sub(1) < self.available.min(32) && self.pos + n as usize <= self.end {
+            return Ok((self.cache >> (64 - n)) as u32);
+        }
+        self.peek_slow(n)
+    }
+    #[cold]
+    #[inline(never)]
+    fn peek_slow(&mut self, n: u32) -> Result<u32> {
         if n > 32 || self.left() < n as usize {
             return Err(Error::Eof);
         }

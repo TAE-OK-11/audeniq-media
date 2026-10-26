@@ -68,7 +68,7 @@ impl Huffman {
     }
 
     /// The next symbol.
-    #[inline]
+    #[inline(always)]
     pub fn decode(&self, b: &mut Bits) -> Result<u32, Error> {
         if b.left() < FAST as usize {
             return self.walk(b, 0);
@@ -85,6 +85,8 @@ impl Huffman {
         Ok(e & 0xff_ffff)
     }
 
+    #[cold]
+    #[inline(never)]
     fn walk(&self, b: &mut Bits, mut at: usize) -> Result<u32, Error> {
         loop {
             let next = self.nodes[at][b.bit()? as usize];

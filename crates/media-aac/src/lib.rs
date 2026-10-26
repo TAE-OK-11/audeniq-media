@@ -803,9 +803,17 @@ impl Decoder {
                             *v = i32::from(s);
                         }
                         if !signed {
-                            for v in vals.iter_mut().take(dims) {
-                                if *v != 0 && b.get(1)? == 1 {
-                                    *v = -*v;
+                            // One sign bit per nonzero value, read at once.
+                            let nz = vals[..dims].iter().filter(|v| **v != 0).count() as u32;
+                            if nz != 0 {
+                                let mut signs = b.get(nz)? << (32 - nz);
+                                for v in vals.iter_mut().take(dims) {
+                                    if *v != 0 {
+                                        if signs & 1 << 31 != 0 {
+                                            *v = -*v;
+                                        }
+                                        signs <<= 1;
+                                    }
                                 }
                             }
                         }

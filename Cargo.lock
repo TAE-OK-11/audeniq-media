@@ -546,6 +546,7 @@ name = "media-mp3"
 version = "0.1.0"
 dependencies = [
  "media-bits",
+ "media-dsp",
 ]
 
 [[package]]

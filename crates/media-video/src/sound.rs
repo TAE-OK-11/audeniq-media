@@ -25,6 +25,9 @@ pub struct Sound {
     /// `mono`, `stereo`, `dual-mono` (two mono tracks as left and right) or
     /// `channels` (the first two of discrete channels).
     pub mapping: String,
+    /// AAC profile as decoded (`LC`, `HE-AAC`, `HE-AACv2`); SBR signalled
+    /// only in the stream itself shows here, not in the index.
+    pub profile: Option<String>,
     pub duration: f64,
     /// Packets decoded and packets the decoder refused.
     pub packets: u64,
@@ -46,6 +49,7 @@ media_json::json_struct!(Sound {
     sample_rate,
     channels,
     mapping,
+    profile,
     duration,
     packets,
     decode_errors,
@@ -304,6 +308,7 @@ pub(crate) fn measure<R: Read + Seek>(
         sample_rate: rate,
         channels,
         mapping: plan.kind.to_string(),
+        profile: mix.aac_profile().map(str::to_string),
         duration: (a.duration_secs * 1000.0).round() / 1000.0,
         packets: mix.packets(),
         decode_errors: mix.errors(),

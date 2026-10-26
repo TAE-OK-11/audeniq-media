@@ -209,15 +209,6 @@ fn decode_sound<R: Read + Seek>(
     out_rate: u32,
     sink: &mut dyn FnMut(&[f32]),
 ) -> Result<(), Error> {
-    for c in &plan.tracks {
-        if c.cfg.codec == "aac"
-            && media_aac::parse_config(&c.cfg.asc).is_ok_and(|(cfg, _)| cfg.extension)
-        {
-            return Err(invalid(
-                "HE-AAC(SBR/PS) 소리는 아직 변환하지 않습니다(고음역이 빠진 채로 나옵니다)",
-            ));
-        }
-    }
     let mut mix = Mix::open(r, layout, plan, movie_timescale, Use::Convert)?;
     let names = mix.names();
     let mut resampler = media_resample::Resampler::new(mix.rate(), out_rate, 2);

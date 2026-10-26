@@ -6,7 +6,7 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
 
 - 오디오: 무손실 디코딩/FLAC 정규화, LUFS·True Peak QC, 지문 입력 — [docs/audio/README.md](docs/audio/README.md)
 - 이미지·PDF: 메타데이터, 색상·출처 보고, QR, OCR, 업로드 정화, PDF — [docs/photo/README.md](docs/photo/README.md)
-- 뮤직비디오: MP4/MOV 분석(FFprobe 필드), 소리 디코드·음량 측정(자체 AAC 디코더), 배급 규격 검사 — [docs/video/README.md](docs/video/README.md)
+- 뮤직비디오: MP4/MOV 분석(FFprobe 필드), 소리 디코드·음량 측정(자체 AAC·HE-AAC·MP3 디코더), 배급 규격 검사, 배급 사양 소리 변환 — [docs/video/README.md](docs/video/README.md)
 - Dolby Atmos: ADM BWF 마스터(BW64/RF64) 읽기와 공간 음향 납품 검사 — [docs/atmos/README.md](docs/atmos/README.md)
 
 ## 구성
@@ -20,7 +20,8 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
 | `crates/audeniq-photo` | 이미지·PDF 통합 API |
 | `crates/photo-cli` | photo 명령행 라이브러리와 `audeniq-photo` 바이너리 |
 | `crates/media-video` | 뮤직비디오 MP4/MOV 분석·소리 측정·배급 검사 (`audeniq-music video …`) |
-| `crates/media-aac` | AAC-LC 디코더 (뮤직비디오 소리 측정) |
+| `crates/media-aac` | AAC-LC 디코더·인코더, HE-AAC(SBR)·HE-AACv2(PS) 디코드 (뮤직비디오 소리) |
+| `crates/media-mp3` | MP3(MPEG-1/2/2.5 Layer III) 디코더 (뮤직비디오 소리) |
 | `crates/media-adm` | Dolby Atmos ADM BWF 분석·납품 검사 (`audeniq-music atmos …`) |
 | `crates/audeniq-music` | 백엔드가 설치하는 단일 바이너리 `audeniq-music` (`qc …`, `photo …`, `video …`, `atmos …`) |
 | `crates/photo-bench` | 외부 도구 대비 벤치마크 (`audeniq-photo-bench`) |

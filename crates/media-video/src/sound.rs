@@ -54,13 +54,14 @@ media_json::json_struct!(Sound {
 });
 
 /// The sound track the delivery uses: the first enabled one (or the only).
-struct Chosen<'a> {
-    id: u32,
-    cfg: AudioConfig,
-    stbl: &'a [u8],
+pub(crate) struct Chosen<'a> {
+    pub id: u32,
+    pub cfg: AudioConfig,
+    pub trak: &'a [u8],
+    pub stbl: &'a [u8],
 }
 
-fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
+pub(crate) fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
     let ts = child(moov, b"mvhd")
         .and_then(|m| u32_at(m, if m.first() == Some(&1) { 20 } else { 12 }))?;
     let mut found = Vec::new();
@@ -78,6 +79,7 @@ fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
                 Chosen {
                     id: tr.id,
                     cfg,
+                    trak,
                     stbl,
                 },
             ));
@@ -88,7 +90,7 @@ fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
 }
 
 /// Bytes of one PCM frame, `None` for compressed codecs.
-fn pcm_frame(c: &AudioConfig) -> Option<usize> {
+pub(crate) fn pcm_frame(c: &AudioConfig) -> Option<usize> {
     let bits: usize = c.codec.strip_prefix("pcm_")?[1..]
         .trim_end_matches(['l', 'b', 'e'])
         .parse()
@@ -97,7 +99,7 @@ fn pcm_frame(c: &AudioConfig) -> Option<usize> {
 }
 
 /// (chunk offset, first sample, samples) of every chunk.
-fn chunks(stbl: &[u8]) -> Option<Vec<(u64, usize, usize)>> {
+pub(crate) fn chunks(stbl: &[u8]) -> Option<Vec<(u64, usize, usize)>> {
     let offsets = track::chunk_offsets(stbl)?;
     let stsc = child(stbl, b"stsc")?;
     let runs = track::entries(stsc, 4, 12)?;
@@ -125,7 +127,7 @@ fn chunks(stbl: &[u8]) -> Option<Vec<(u64, usize, usize)>> {
 
 /// Where the chosen track's data is: (offset, sizes of the packets stored
 /// back to back there). PCM chunks are one "packet" of whole frames.
-fn reads(layout: &Layout, c: &Chosen) -> Result<Vec<(u64, Vec<u32>)>, Error> {
+pub(crate) fn reads(layout: &Layout, c: &Chosen) -> Result<Vec<(u64, Vec<u32>)>, Error> {
     let bad = || Error::Invalid("sound track sample tables".into());
     if layout.fragments > 0 {
         return Ok(layout.fragment_runs.get(&c.id).cloned().unwrap_or_default());
@@ -191,7 +193,7 @@ pub(crate) fn ranges(layout: &Layout) -> Result<Vec<(u64, u64)>, Error> {
 }
 
 /// Interleaved PCM bytes → left-aligned i32.
-fn pcm_to_i32(codec: &str, bytes: &[u8], out: &mut Vec<i32>) {
+pub(crate) fn pcm_to_i32(codec: &str, bytes: &[u8], out: &mut Vec<i32>) {
     let little = codec.ends_with("le");
     let rd = |b: &[u8]| -> [u8; 8] {
         let mut a = [0u8; 8];

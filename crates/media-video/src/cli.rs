@@ -4,6 +4,11 @@
 //! video probe [--sound] FILE   report JSON on stdout, exit 0; `--sound`
 //!                              also decodes and measures the sound track
 //! video sound-ranges FILE      byte ranges of the sound track's data
+//! video convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N]
+//!       [--rate 44100|48000] IN OUT
+//!                              copy the picture, convert the sound to a
+//!                              distributor's spec (default preset from
+//!                              OUT's extension: .mov → pcm24, else aac-320)
 //! video capabilities           engine and rule versions
 //! ```
 //!
@@ -28,9 +33,66 @@ fn emit(v: &impl media_json::ToJson) -> ExitCode {
     }
 }
 
+/// `convert-audio` options and paths.
+fn convert_args(
+    args: &[std::ffi::OsString],
+) -> Result<
+    (
+        crate::convert::Options,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ),
+    String,
+> {
+    use crate::convert::{Codec, Container, preset};
+    let mut paths = Vec::new();
+    let (mut name, mut codec, mut bitrate, mut rate) = (None, None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || {
+            it.next()
+                .and_then(|v| v.to_str())
+                .ok_or_else(|| format!("{} needs a value", a.to_string_lossy()))
+        };
+        match a.to_str() {
+            Some("--preset") => name = Some(value()?.to_string()),
+            Some("--codec") => codec = Some(value()?.to_string()),
+            Some("--bitrate") => {
+                bitrate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?)
+            }
+            Some("--rate") => rate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?),
+            Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            _ => paths.push(std::path::PathBuf::from(a)),
+        }
+    }
+    let [input, output] =
+        <[_; 2]>::try_from(paths).map_err(|_| "IN and OUT are required".to_string())?;
+    let mov = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mov"));
+    let name = name.unwrap_or_else(|| if mov { "pcm24" } else { "aac-320" }.into());
+    let mut o = preset(&name).ok_or_else(|| format!("unknown preset {name}"))?;
+    o.container = if mov { Container::Mov } else { Container::Mp4 };
+    match codec.as_deref() {
+        Some("aac") => o.codec = Codec::Aac(bitrate.unwrap_or(320_000)),
+        Some("pcm24") => o.codec = Codec::Pcm24,
+        Some(c) => return Err(format!("unknown codec {c}")),
+        None => {
+            if let (Some(b), Codec::Aac(_)) = (bitrate, o.codec) {
+                o.codec = Codec::Aac(b);
+            }
+        }
+    }
+    if let Some(r) = rate {
+        o.sample_rate = r;
+    }
+    Ok((o, input, output))
+}
+
 pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
     let usage = format!(
-        "usage: {prog} probe [--sound] FILE | {prog} sound-ranges FILE | {prog} capabilities"
+        "usage: {prog} probe [--sound] FILE | {prog} sound-ranges FILE | {prog} convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N] [--rate HZ] IN OUT | {prog} capabilities"
     );
     let words: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
     match words.as_slice() {
@@ -50,6 +112,13 @@ pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
             }
             Err(e) => fail(e.code(), &e.to_string()),
         },
+        [Some("convert-audio"), ..] => match convert_args(&args[1..]) {
+            Ok((opts, input, output)) => match crate::convert::convert(&input, &output, &opts) {
+                Ok(c) => emit(&c),
+                Err(e) => fail(e.code(), &e.to_string()),
+            },
+            Err(e) => fail("USAGE", &format!("{e}; {usage}")),
+        },
         [Some("capabilities")] => emit(&media_json::json!({
             "engine": crate::ENGINE_VERSION,
             "rule": crate::RULE_VERSION,
@@ -57,6 +126,7 @@ pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
             "max_moov_bytes": crate::file::MAX_MOOV,
             "sound_codecs": ["aac", "pcm"],
             "max_sound_bytes": crate::sound::MAX_SOUND_BYTES,
+            "convert_presets": crate::convert::PRESETS.iter().map(|p| p.0).collect::<Vec<_>>(),
         })),
         _ => fail("USAGE", &usage),
     }

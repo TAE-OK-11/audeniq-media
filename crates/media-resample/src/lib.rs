@@ -35,14 +35,33 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// Dot product in eight independent lanes, which the compiler vectorizes.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0f32; 8];
+    for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        for i in 0..8 {
+            lanes[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = a
+        .chunks_exact(8)
+        .remainder()
+        .iter()
+        .zip(b.chunks_exact(8).remainder())
+        .map(|(x, y)| x * y)
+        .sum();
+    lanes.iter().sum::<f32>() + tail
+}
+
 pub struct Resampler {
     channels: usize,
     up: usize,
     down: usize,
     /// `up` phases × `2 * HALF_TAPS` taps.
     taps: Vec<f32>,
-    /// Interleaved input not yet consumed, with `HALF_TAPS` frames of history.
-    buf: Vec<f32>,
+    /// Input not yet consumed, one buffer per channel, with `HALF_TAPS`
+    /// frames of history.
+    buf: Vec<Vec<f32>>,
     /// Absolute index (in `up` steps) of the next output sample.
     pos: u64,
     /// Absolute input frame index of `buf[0]`.
@@ -94,7 +113,7 @@ impl Resampler {
             up,
             down,
             taps,
-            buf: vec![0.0; (HALF_TAPS - 1) * channels],
+            buf: vec![vec![0.0; HALF_TAPS - 1]; channels],
             pos: 0,
             base: 0,
             in_frames: 0,
@@ -113,7 +132,11 @@ impl Resampler {
             out.extend_from_slice(input);
             return;
         }
-        self.buf.extend_from_slice(input);
+        for f in input.chunks_exact(self.channels) {
+            for (b, v) in self.buf.iter_mut().zip(f) {
+                b.push(*v);
+            }
+        }
         self.in_frames += (input.len() / self.channels) as u64;
         self.drain(out, false);
     }
@@ -123,16 +146,16 @@ impl Resampler {
         if self.up == self.down {
             return;
         }
-        self.buf
-            .extend(std::iter::repeat_n(0.0, (HALF_TAPS + 1) * self.channels));
+        for b in &mut self.buf {
+            b.extend(std::iter::repeat_n(0.0, HALF_TAPS + 1));
+        }
         self.drain(out, true);
     }
 
     fn drain(&mut self, out: &mut Vec<f32>, last: bool) {
-        let ch = self.channels;
         let width = 2 * HALF_TAPS;
         // Buffered frames start at input frame `base - (HALF_TAPS - 1)`.
-        let frames = (self.buf.len() / ch) as u64;
+        let frames = self.buf[0].len() as u64;
         let target = self.output_len(self.in_frames);
         loop {
             if last && self.out_frames >= target {
@@ -148,12 +171,8 @@ impl Resampler {
                 break;
             }
             let h = &self.taps[phase * width..phase * width + width];
-            for c in 0..ch {
-                let mut acc = 0f32;
-                for (j, &k) in h.iter().enumerate() {
-                    acc += k * self.buf[(first + j) * ch + c];
-                }
-                out.push(acc);
+            for b in &self.buf {
+                out.push(dot(h, &b[first..first + width]));
             }
             self.pos += 1;
             self.out_frames += 1;
@@ -162,9 +181,11 @@ impl Resampler {
         let t = self.pos * self.down as u64;
         let centre = t / self.up as u64;
         let keep_from = centre.saturating_sub(self.base) as usize;
-        let keep_from = keep_from.min(self.buf.len() / ch);
+        let keep_from = keep_from.min(self.buf[0].len());
         if keep_from > 0 {
-            self.buf.drain(..keep_from * ch);
+            for b in &mut self.buf {
+                b.drain(..keep_from);
+            }
             self.base += keep_from as u64;
         }
     }

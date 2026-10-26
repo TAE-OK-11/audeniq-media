@@ -1,7 +1,8 @@
 //! AUDENIQ video probe: what FFprobe told about an uploaded music video,
 //! read from the MP4/QuickTime index alone, plus the checks a music-video
 //! delivery needs (`mv-delivery-v2`), and with `--sound` the sound track
-//! decoded and measured ([`sound`]).
+//! decoded and measured ([`sound`]). [`convert`] rewrites a video with its
+//! picture copied and its sound converted to a distributor's spec.
 //!
 //! Only box headers, `ftyp`, `moov` and `moof` are read; `mdat` is never
 //! touched (with `--sound`, only the sound track's part of it), so an 8 GB
@@ -20,6 +21,7 @@ mod boxes;
 pub mod check;
 pub mod cli;
 pub mod codec;
+pub mod convert;
 mod file;
 mod report;
 pub mod sound;

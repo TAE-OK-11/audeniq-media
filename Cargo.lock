@@ -539,6 +539,7 @@ dependencies = [
  "audeniq-qc",
  "media-aac",
  "media-json",
+ "media-resample",
 ]
 
 [[package]]

@@ -15,8 +15,9 @@ pub use fft::{Dct4, Fft};
 use simd::multiversion;
 
 multiversion! {
-    /// Σ a[i]·b[i] over the shorter length, in eight independent lanes (the
-    /// same order on every machine).
+    /// Σ a[i]·b[i] over the shorter length, in eight independent lanes
+    /// summed in order, then the tail (the same order on every machine, and
+    /// as audeniq-qc's dot kernels).
     pub fn dot(a: &[f32], b: &[f32]) -> f32 = dot_body;
 }
 
@@ -32,7 +33,5 @@ fn dot_body(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     let tail: f32 = at.iter().zip(bt).map(|(x, y)| x * y).sum();
-    ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5]))
-        + ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]))
-        + tail
+    lanes.iter().sum::<f32>() + tail
 }

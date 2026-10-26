@@ -68,7 +68,7 @@ fn table_update(mut crc: u16, data: &[u8]) -> u16 {
 }
 
 /// x^n mod P.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const fn x_pow_mod(n: u32) -> u64 {
     let mut r = 1u32;
     let mut i = 0;
@@ -84,26 +84,26 @@ const fn x_pow_mod(n: u32) -> u64 {
 
 /// (x^D mod P, x^(D+64) mod P): multipliers for the low and high halves of a
 /// lane moved forward by D bits.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const fn keys(d: u32) -> (u64, u64) {
     (x_pow_mod(d), x_pow_mod(d + 64))
 }
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const D128: (u64, u64) = keys(128);
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const D256: (u64, u64) = keys(256);
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const D384: (u64, u64) = keys(384);
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const D512: (u64, u64) = keys(512);
 
 /// Inputs shorter than this go through the table.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const MIN_FOLD: usize = 64;
 
 /// CRC-16 of `data`.
 pub fn crc16(data: &[u8]) -> u16 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if data.len() >= MIN_FOLD
         && std::is_x86_feature_detected!("pclmulqdq")
         && std::is_x86_feature_detected!("ssse3")
@@ -111,7 +111,7 @@ pub fn crc16(data: &[u8]) -> u16 {
         // SAFETY: both instruction sets were detected at runtime.
         return unsafe { x86::crc16(data) };
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "std"))]
     if data.len() >= MIN_FOLD && std::arch::is_aarch64_feature_detected!("pmull") {
         // SAFETY: PMULL (and NEON) were detected at runtime.
         return unsafe { arm::crc16(data) };
@@ -119,10 +119,10 @@ pub fn crc16(data: &[u8]) -> u16 {
     table_update(0, data)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod x86 {
     use super::{table_update, D128, D256, D384, D512};
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     #[inline(always)]
     unsafe fn keys(k: (u64, u64)) -> __m128i {
@@ -181,10 +181,10 @@ mod x86 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
 mod arm {
     use super::{table_update, D128, D256, D384, D512};
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     /// The 16 bytes at the start of `data` as a polynomial (first bit is the
     /// coefficient of x^127).

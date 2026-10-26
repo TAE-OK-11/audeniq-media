@@ -35,24 +35,6 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// Dot product in eight independent lanes, which the compiler vectorizes.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut lanes = [0f32; 8];
-    for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-        for i in 0..8 {
-            lanes[i] += x[i] * y[i];
-        }
-    }
-    let tail: f32 = a
-        .chunks_exact(8)
-        .remainder()
-        .iter()
-        .zip(b.chunks_exact(8).remainder())
-        .map(|(x, y)| x * y)
-        .sum();
-    lanes.iter().sum::<f32>() + tail
-}
-
 pub struct Resampler {
     channels: usize,
     up: usize,
@@ -172,7 +154,7 @@ impl Resampler {
             }
             let h = &self.taps[phase * width..phase * width + width];
             for b in &self.buf {
-                out.push(dot(h, &b[first..first + width]));
+                out.push(media_dsp::dot(h, &b[first..first + width]));
             }
             self.pos += 1;
             self.out_frames += 1;

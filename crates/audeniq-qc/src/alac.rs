@@ -6,7 +6,8 @@
 //! per common order with sign-specific coefficient steps, and stereo
 //! reconstruction, extra bits and interleaving share one output pass over
 //! reusable buffers. Bounded bit reads and checked packet structure remain.
-use crate::{msb::Bits, Error, Result};
+use crate::{Error, Result};
+use media_bits::Bits;
 pub struct Decoder {
     config: [u8; 24],
     pcm: [Vec<i32>; 2],
@@ -22,7 +23,7 @@ fn scalar(b: &mut Bits<'_>, k: u32, bits: u32) -> Result<u32> {
     // A complete ALAC code is at most 9 + 32 bits, so after a 56-bit refill
     // the cached fast path in `alac_scalar` always applies.
     b.refill();
-    b.alac_scalar(k, bits)
+    Ok(b.alac_scalar(k, bits)?)
 }
 fn rice(
     b: &mut Bits<'_>,

@@ -10,9 +10,7 @@
 //! Not decoded: main prediction, LTP, SSR, coupling channels and
 //! downsampled SBR; such streams are refused or reported by the caller.
 //! Tables come from FFmpeg (LGPL), the code is AUDENIQ's.
-mod bits;
 pub mod encoder;
-mod huffman;
 mod mdct;
 mod ps;
 mod ps_tables;
@@ -20,8 +18,7 @@ mod sbr;
 mod sbr_tables;
 mod tables;
 
-use bits::Bits;
-use huffman::Tree;
+use media_bits::{Bits, Huffman as Tree};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +26,15 @@ pub enum Error {
     Truncated,
     Invalid(&'static str),
     Unsupported(&'static str),
+}
+
+impl From<media_bits::Error> for Error {
+    fn from(e: media_bits::Error) -> Self {
+        match e {
+            media_bits::Error::Eof => Error::Truncated,
+            media_bits::Error::Invalid(what) => Error::Invalid(what),
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -136,13 +142,13 @@ pub struct Config {
 pub fn parse_config(asc: &[u8]) -> Result<(Config, usize), Error> {
     let mut b = Bits::new(asc);
     let object = |b: &mut Bits| -> Result<u32, Error> {
-        let o = b.u(5)?;
-        Ok(if o == 31 { 32 + b.u(6)? } else { o })
+        let o = b.get(5)?;
+        Ok(if o == 31 { 32 + b.get(6)? } else { o })
     };
     let rate = |b: &mut Bits| -> Result<(usize, u32), Error> {
-        let i = b.u(4)? as usize;
+        let i = b.get(4)? as usize;
         if i == 15 {
-            let r = b.u(24)?;
+            let r = b.get(24)?;
             let idx = RATES
                 .iter()
                 .position(|&x| x <= r * 92 / 100 + r * 8 / 100 && x <= r)
@@ -159,7 +165,7 @@ pub fn parse_config(asc: &[u8]) -> Result<(Config, usize), Error> {
     };
     let mut ot = object(&mut b)?;
     let (mut idx, mut sample_rate) = rate(&mut b)?;
-    let chan_config = b.u(4)?;
+    let chan_config = b.get(4)?;
     let (mut sbr, mut ps, mut ext_rate) = (-1i8, -1i8, 0u32);
     let explicit = ot == 5 || ot == 29;
     if explicit {
@@ -182,10 +188,10 @@ pub fn parse_config(asc: &[u8]) -> Result<(Config, usize), Error> {
         // Sync extension: searched bit by bit from here.
         let mut s = b.clone();
         while s.left() > 15 {
-            if s.clone().u(11)? == 0x2b7 {
-                s.u(11)?;
+            if s.clone().get(11)? == 0x2b7 {
+                s.get(11)?;
                 if object(&mut s)? == 5 {
-                    sbr = s.u(1)? as i8;
+                    sbr = s.get(1)? as i8;
                     if sbr == 1 {
                         ext_rate = rate(&mut s)?.1;
                         if ext_rate == sample_rate {
@@ -193,24 +199,24 @@ pub fn parse_config(asc: &[u8]) -> Result<(Config, usize), Error> {
                         }
                     }
                 }
-                if s.left() > 11 && s.u(11)? == 0x548 {
-                    ps = s.u(1)? as i8;
+                if s.left() > 11 && s.get(11)? == 0x548 {
+                    ps = s.get(1)? as i8;
                 }
                 break;
             }
-            s.u(1)?;
+            s.get(1)?;
         }
     }
     // GASpecificConfig: frameLengthFlag must select 1024.
-    if b.u(1)? != 0 {
+    if b.get(1)? != 0 {
         return Err(Error::Unsupported("960-sample frames"));
     }
     let channels = match chan_config {
         0 => {
-            if b.u(1)? == 1 {
-                b.u(14)?; // dependsOnCoreCoder: coreCoderDelay
+            if b.get(1)? == 1 {
+                b.get(14)?; // dependsOnCoreCoder: coreCoderDelay
             }
-            b.u(1)?; // extensionFlag
+            b.get(1)?; // extensionFlag
             match pce(&mut b)? {
                 n @ 1..=8 => n,
                 _ => return Err(Error::Unsupported("channel configuration")),
@@ -398,26 +404,26 @@ impl Decoder {
         // data belongs to the one before it.
         let mut elements: Vec<(u32, usize)> = Vec::new();
         loop {
-            let id = b.u(3)?;
+            let id = b.get(3)?;
             match id {
                 0 | 3 => {
-                    b.u(4)?;
+                    b.get(4)?;
                     elements.push((id, spectra.len()));
                     spectra.push(self.ics(&mut b, None, id == 3)?);
                 }
                 1 => {
                     elements.push((1, spectra.len()));
-                    b.u(4)?;
-                    let common = b.u(1)? == 1;
+                    b.get(4)?;
+                    let common = b.get(1)? == 1;
                     let mut info = None;
                     let mut ms = (0u32, Vec::new());
                     if common {
                         let i = self.ics_info(&mut b)?;
-                        let mode = b.u(2)?;
+                        let mode = b.get(2)?;
                         let mut mask = Vec::new();
                         if mode == 1 {
                             for _ in 0..i.groups * i.max_sfb {
-                                mask.push(b.u(1)? == 1);
+                                mask.push(b.get(1)? == 1);
                             }
                         }
                         if mode == 3 {
@@ -442,22 +448,22 @@ impl Decoder {
                 }
                 2 => return Err(Error::Unsupported("coupling channel element")),
                 4 => {
-                    b.u(4)?;
-                    let align = b.u(1)? == 1;
-                    let mut n = b.u(8)? as usize;
+                    b.get(4)?;
+                    let align = b.get(1)? == 1;
+                    let mut n = b.get(8)? as usize;
                     if n == 255 {
-                        n += b.u(8)? as usize;
+                        n += b.get(8)? as usize;
                     }
                     if align {
-                        b.align();
+                        b.align()?;
                     }
                     b.skip(n * 8)?;
                 }
                 5 => skip_pce(&mut b)?,
                 6 => {
-                    let mut n = b.u(4)? as usize;
+                    let mut n = b.get(4)? as usize;
                     if n == 15 {
-                        n += b.u(8)? as usize - 1;
+                        n += b.get(8)? as usize - 1;
                     }
                     if n > 0 {
                         self.fill(&b, n, &elements)?;
@@ -552,7 +558,7 @@ impl Decoder {
     /// it (`extension_payload` 13/14), anything else skipped.
     fn fill(&mut self, b: &Bits, n: usize, elements: &[(u32, usize)]) -> Result<(), Error> {
         let mut p = b.take(n * 8);
-        let kind = p.u(4)?;
+        let kind = p.get(4)?;
         if !matches!(kind, 13 | 14) {
             return Ok(());
         }
@@ -584,17 +590,17 @@ impl Decoder {
     }
 
     fn ics_info(&self, b: &mut Bits) -> Result<Info, Error> {
-        b.u(1)?; // ics_reserved_bit
-        let seq = b.u(2)? as u8;
-        let shape = b.u(1)? as u8;
+        b.get(1)?; // ics_reserved_bit
+        let seq = b.get(2)? as u8;
+        let shape = b.get(1)? as u8;
         let mut info = Info {
             seq,
             shape,
             ..Info::default()
         };
         if seq == EIGHT_SHORT {
-            info.max_sfb = b.u(4)? as usize;
-            let grouping = b.u(7)?;
+            info.max_sfb = b.get(4)? as usize;
+            let grouping = b.get(7)?;
             info.groups = 1;
             info.group_len[0] = 1;
             for i in 0..7 {
@@ -609,10 +615,10 @@ impl Decoder {
                 return Err(Error::Invalid("max_sfb"));
             }
         } else {
-            info.max_sfb = b.u(6)? as usize;
+            info.max_sfb = b.get(6)? as usize;
             info.groups = 1;
             info.group_len[0] = 1;
-            if b.u(1)? == 1 {
+            if b.get(1)? == 1 {
                 return Err(Error::Unsupported("prediction (main / LTP profile)"));
             }
             if info.max_sfb > usize::from(tables::NUM_SWB_LONG[self.sr]) {
@@ -633,7 +639,7 @@ impl Decoder {
     /// `individual_channel_stream`: side info, scalefactors, tools and the
     /// dequantized spectrum.
     fn ics(&mut self, b: &mut Bits, common: Option<Info>, lfe: bool) -> Result<Spectrum, Error> {
-        let global = b.u(8)? as i32;
+        let global = b.get(8)? as i32;
         let info = match common {
             Some(i) => i,
             None => self.ics_info(b)?,
@@ -653,13 +659,13 @@ impl Decoder {
         for g in 0..info.groups {
             let mut k = 0;
             while k < bands {
-                let cb = b.u(4)? as u8;
+                let cb = b.get(4)? as u8;
                 if cb == 12 {
                     return Err(Error::Invalid("reserved codebook 12"));
                 }
                 let mut len = 0usize;
                 loop {
-                    let inc = b.u(sect_bits)? as usize;
+                    let inc = b.get(sect_bits)? as usize;
                     len += inc;
                     if inc != esc {
                         break;
@@ -686,7 +692,7 @@ impl Decoder {
                 }
                 NOISE_HCB => {
                     if first_noise {
-                        noise += b.u(9)? as i32 - 256;
+                        noise += b.get(9)? as i32 - 256;
                         first_noise = false;
                     } else {
                         noise += t.sf.decode(b)? as i32 - 60;
@@ -704,16 +710,16 @@ impl Decoder {
         }
         // Pulse data (long windows only).
         let mut pulses = Vec::new();
-        if b.u(1)? == 1 {
+        if b.get(1)? == 1 {
             if info.seq == EIGHT_SHORT {
                 return Err(Error::Invalid("pulse data in short window"));
             }
-            let n = b.u(2)? as usize + 1;
-            let start = b.u(6)? as usize;
+            let n = b.get(2)? as usize + 1;
+            let start = b.get(6)? as usize;
             let mut k = usize::from(*offsets.get(start).ok_or(Error::Invalid("pulse band"))?);
             for _ in 0..n {
-                k += b.u(5)? as usize;
-                let amp = b.u(4)? as i32;
+                k += b.get(5)? as usize;
+                let amp = b.get(4)? as i32;
                 if k >= 1024 {
                     return Err(Error::Invalid("pulse offset"));
                 }
@@ -721,18 +727,18 @@ impl Decoder {
             }
         }
         // TNS.
-        let tns = if b.u(1)? == 1 {
+        let tns = if b.get(1)? == 1 {
             let short = info.seq == EIGHT_SHORT;
             let (nf_bits, len_bits, order_bits) = if short { (1, 4, 3) } else { (2, 6, 5) };
             let mut tns = Tns::default();
             for _ in 0..info.windows() {
-                let n = b.u(nf_bits)?;
+                let n = b.get(nf_bits)?;
                 let mut filters = Vec::new();
                 if n > 0 {
-                    let res = b.u(1)? + 3;
+                    let res = b.get(1)? + 3;
                     for _ in 0..n {
-                        let len = b.u(len_bits)? as usize;
-                        let order = b.u(order_bits)? as usize;
+                        let len = b.get(len_bits)? as usize;
+                        let order = b.get(order_bits)? as usize;
                         if order == 0 {
                             filters.push((len, false, Vec::new()));
                             continue;
@@ -740,8 +746,8 @@ impl Decoder {
                         if order > if short { 7 } else { 12 } {
                             return Err(Error::Invalid("TNS order"));
                         }
-                        let dir = b.u(1)? == 1;
-                        let compress = b.u(1)?;
+                        let dir = b.get(1)? == 1;
+                        let compress = b.get(1)?;
                         let bits = res - compress;
                         let iqfac =
                             (f64::from(1u32 << (res - 1)) - 0.5) / std::f64::consts::FRAC_PI_2;
@@ -749,7 +755,7 @@ impl Decoder {
                             (f64::from(1u32 << (res - 1)) + 0.5) / std::f64::consts::FRAC_PI_2;
                         let mut parcor = Vec::with_capacity(order);
                         for _ in 0..order {
-                            let raw = b.u(bits)? as i32;
+                            let raw = b.get(bits)? as i32;
                             let q = if raw >= 1 << (bits - 1) {
                                 raw - (1 << bits)
                             } else {
@@ -767,7 +773,7 @@ impl Decoder {
         } else {
             None
         };
-        if b.u(1)? == 1 {
+        if b.get(1)? == 1 {
             return Err(Error::Unsupported("gain control (SSR)"));
         }
         // Spectral data: integers, window-major.
@@ -791,14 +797,14 @@ impl Decoder {
                     let mut k = lo;
                     while k < hi {
                         let sym = table
-                            .get(tree.decode(b)?)
+                            .get(tree.decode(b)? as usize)
                             .ok_or(Error::Invalid("Huffman codeword"))?;
                         for (v, &s) in vals.iter_mut().zip(sym) {
                             *v = i32::from(s);
                         }
                         if !signed {
                             for v in vals.iter_mut().take(dims) {
-                                if *v != 0 && b.u(1)? == 1 {
+                                if *v != 0 && b.get(1)? == 1 {
                                     *v = -*v;
                                 }
                             }
@@ -807,13 +813,13 @@ impl Decoder {
                             for v in vals.iter_mut().take(2) {
                                 if v.abs() == 16 {
                                     let mut n = 0;
-                                    while b.u(1)? == 1 {
+                                    while b.get(1)? == 1 {
                                         n += 1;
                                         if n > 8 {
                                             return Err(Error::Invalid("escape"));
                                         }
                                     }
-                                    let m = (1 << (n + 4)) + b.u(n + 4)? as i32;
+                                    let m = (1 << (n + 4)) + b.get(n + 4)? as i32;
                                     *v = v.signum() * m;
                                 }
                             }
@@ -1069,29 +1075,29 @@ fn stereo(l: &mut Spectrum, r: &mut Spectrum, ms: &(u32, Vec<bool>), short: &[u1
 /// elements themselves).
 /// `program_config_element`: the channels it declares (pairs count two).
 fn pce(b: &mut Bits) -> Result<u32, Error> {
-    b.u(4)?; // element_instance_tag
-    b.u(2)?; // object_type
-    b.u(4)?; // sampling_frequency_index
-    let front = b.u(4)?;
-    let side = b.u(4)?;
-    let back = b.u(4)?;
-    let lfe = b.u(2)?;
-    let assoc = b.u(3)?;
-    let cc = b.u(4)?;
+    b.get(4)?; // element_instance_tag
+    b.get(2)?; // object_type
+    b.get(4)?; // sampling_frequency_index
+    let front = b.get(4)?;
+    let side = b.get(4)?;
+    let back = b.get(4)?;
+    let lfe = b.get(2)?;
+    let assoc = b.get(3)?;
+    let cc = b.get(4)?;
     // Mono and stereo mixdown element numbers, matrix mixdown index.
     for bits in [4, 4, 3] {
-        if b.u(1)? == 1 {
-            b.u(bits)?;
+        if b.get(1)? == 1 {
+            b.get(bits)?;
         }
     }
     let mut channels = lfe;
     for _ in 0..front + side + back {
-        channels += 1 + b.u(1)?; // is_cpe
-        b.u(4)?;
+        channels += 1 + b.get(1)?; // is_cpe
+        b.get(4)?;
     }
     b.skip((lfe * 4 + assoc * 4 + cc * 5) as usize)?;
-    b.align();
-    let comment = b.u(8)? as usize;
+    b.align()?;
+    let comment = b.get(8)? as usize;
     b.skip(comment * 8)?;
     Ok(channels)
 }

@@ -6,7 +6,6 @@ mod bits;
 pub mod cli;
 #[cfg(not(feature = "reference-codecs"))]
 mod compressed;
-mod crc16;
 pub mod flac;
 #[cfg(not(feature = "reference-codecs"))]
 mod flac_decode;
@@ -21,7 +20,6 @@ pub mod meter;
 mod mp4;
 // The comparison build uses only the parts ALAC needs.
 #[cfg_attr(feature = "reference-codecs", allow(dead_code))]
-mod msb;
 pub mod pcm;
 mod pcm_hash;
 mod png;
@@ -64,6 +62,14 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<media_bits::Error> for Error {
+    fn from(e: media_bits::Error) -> Self {
+        match e {
+            media_bits::Error::Eof => io::Error::from(io::ErrorKind::UnexpectedEof).into(),
+            media_bits::Error::Invalid(what) => Self::Invalid(what),
+        }
+    }
+}
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Self::Io(e)

@@ -1,6 +1,7 @@
 //! Signal-processing kernels shared by the AUDENIQ media codecs: a split
 //! complex FFT and the DCT-IV on it (AAC's MDCT, SBR's QMF banks, MP3's
-//! synthesis), and a dot product (resampling filters).
+//! synthesis), a dot product (resampling filters) and the sliding history
+//! of synthesis filter banks.
 //!
 //! Every kernel is plain safe Rust. On x86-64 each also has a build with
 //! AVX2 enabled, chosen at runtime ([`simd`]); AArch64 always has NEON, so
@@ -8,10 +9,12 @@
 #![deny(unsafe_code)]
 
 pub mod fft;
+mod history;
 #[allow(unsafe_code)]
 pub mod simd;
 
 pub use fft::{Dct4, Fft};
+pub use history::History;
 use simd::multiversion;
 
 multiversion! {

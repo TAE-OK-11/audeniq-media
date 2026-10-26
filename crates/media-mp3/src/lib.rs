@@ -9,6 +9,7 @@
 mod tables;
 
 use media_bits::{Bits, Huffman};
+use media_dsp::History;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 use tables::*;
@@ -65,15 +66,17 @@ struct Static {
     big: Vec<Huffman>,
     quad: [Huffman; 2],
     pow43: Vec<f32>,
-    /// cos for the 36- and 12-point IMDCT: [i][k].
-    cos36: Vec<[f32; 18]>,
+    /// DCT-IV of size 18, cos(π/18 (m+½)(k+½)): [m][k] (the 36-point
+    /// IMDCT folded), and cos for the 12-point IMDCT: [i][k].
+    dct18: Vec<[f32; 18]>,
     cos12: Vec<[f32; 6]>,
     /// Long windows by block type (0 normal, 1 start, 3 stop) and short.
     win: [[f32; 36]; 4],
     /// Antialias butterflies (cs, ca).
     alias: [(f32, f32); 8],
-    /// Synthesis matrixing N[i][k] and window D.
-    matrix: Vec<[f32; 32]>,
+    /// Synthesis matrixing as the DCT-II of size 32, cos(mπ(2k+1)/64):
+    /// [m][k] (see [`synth`]), and the window D.
+    dct32: Vec<[f32; 32]>,
     window: Vec<f32>,
 }
 
@@ -105,10 +108,10 @@ fn statics() -> &'static Static {
         let pow43 = (0..8207)
             .map(|i| (i as f64).powf(4.0 / 3.0) as f32)
             .collect();
-        let cos36 = (0..36)
-            .map(|i| {
+        let dct18 = (0..18)
+            .map(|m| {
                 std::array::from_fn(|k| {
-                    (PI / 72.0 * (2 * i + 1 + 18) as f64 * (2 * k + 1) as f64).cos() as f32
+                    (PI / 18.0 * (m as f64 + 0.5) * (k as f64 + 0.5)).cos() as f32
                 })
             })
             .collect();
@@ -147,11 +150,9 @@ fn statics() -> &'static Static {
             let n = (1.0 + c * c).sqrt();
             ((1.0 / n) as f32, (c / n) as f32)
         });
-        let matrix = (0..64)
-            .map(|i| {
-                std::array::from_fn(|k| {
-                    ((16 + i) as f64 * (2 * k + 1) as f64 * PI / 64.0).cos() as f32
-                })
+        let dct32 = (0..32)
+            .map(|m| {
+                std::array::from_fn(|k| (m as f64 * (2 * k + 1) as f64 * PI / 64.0).cos() as f32)
             })
             .collect();
         // D[512 - i] = -D[i] except at multiples of 64.
@@ -167,11 +168,11 @@ fn statics() -> &'static Static {
             big,
             quad,
             pow43,
-            cos36,
+            dct18,
             cos12,
             win,
             alias,
-            matrix,
+            dct32,
             window,
         }
     })
@@ -282,7 +283,7 @@ pub struct Decoder {
     /// IMDCT second halves per channel, subband-major (32 × 18).
     overlap: [[f32; 576]; 2],
     /// Synthesis V vectors (newest first) per channel.
-    v: [Vec<f32>; 2],
+    v: [History; 2],
 }
 
 impl Default for Decoder {
@@ -296,7 +297,7 @@ impl Decoder {
         Decoder {
             reservoir: Vec::new(),
             overlap: [[0.0; 576]; 2],
-            v: [vec![0.0; 1024], vec![0.0; 1024]],
+            v: [History::new(1024), History::new(1024)],
         }
     }
 
@@ -470,10 +471,10 @@ impl Decoder {
                 antialias(&g, &mut xr[ch]);
                 let mut sb = [[0f32; 32]; 18];
                 imdct(&g, &xr[ch], &mut self.overlap[ch], &mut sb);
-                for (t, s) in sb.iter().enumerate() {
-                    let mut o = [0f32; 32];
-                    synth(&mut self.v[ch], s, &mut o);
-                    for (i, v) in o.iter().enumerate() {
+                let mut o = [[0f32; 32]; 18];
+                synth(&mut self.v[ch], &sb, &mut o);
+                for (t, slot) in o.iter().enumerate() {
+                    for (i, v) in slot.iter().enumerate() {
                         pcm[(g_i * 576 + t * 32 + i) * nch + ch] = *v;
                     }
                 }
@@ -806,27 +807,53 @@ fn antialias(g: &Granule, xr: &mut [f32; 576]) {
 /// the odd ones: `out[time][subband]`.
 fn imdct(g: &Granule, xr: &[f32; 576], overlap: &mut [f32; 576], out: &mut [[f32; 32]; 18]) {
     let st = statics();
+    let long = |sb: usize| g.block_type != 2 || (g.mixed && sb < 2);
+    // The 36-point IMDCT is the DCT-IV of size 18, d, unfolded:
+    // y = (d[9..18], −d[17..=0], −d[0..9]). All subbands at once, the
+    // subband in the inner (vector) loop.
+    let mut d = [[0f32; 32]; 18];
+    if long(0) {
+        let mut x = [[0f32; 32]; 18];
+        for sb in 0..32 {
+            for k in 0..18 {
+                x[k][sb] = xr[sb * 18 + k];
+            }
+        }
+        for (dm, c) in d.iter_mut().zip(&st.dct18) {
+            for (xk, &c) in x.iter().zip(c) {
+                for (v, &x) in dm.iter_mut().zip(xk) {
+                    *v += c * x;
+                }
+            }
+        }
+    }
     for sb in 0..32 {
-        let x = &xr[sb * 18..sb * 18 + 18];
-        let bt = if g.mixed && sb < 2 {
-            0
-        } else {
-            usize::from(g.block_type)
-        };
         let mut y = [0f32; 36];
-        if bt == 2 {
+        if long(sb) {
+            let bt = if g.mixed && sb < 2 {
+                0
+            } else {
+                usize::from(g.block_type)
+            };
+            let w = &st.win[bt];
+            for n in 0..9 {
+                y[n] = d[9 + n][sb] * w[n];
+                y[27 + n] = -d[n][sb] * w[27 + n];
+            }
+            for n in 9..27 {
+                y[n] = -d[26 - n][sb] * w[n];
+            }
+        } else {
+            let x = &xr[sb * 18..sb * 18 + 18];
             for win in 0..3 {
                 for i in 0..12 {
                     let c = &st.cos12[i];
-                    let v: f32 = (0..6).map(|k| x[3 * k + win] * c[k]).sum();
+                    let mut v = 0f32;
+                    for k in 0..6 {
+                        v += x[3 * k + win] * c[k];
+                    }
                     y[6 + 6 * win + i] += v * st.win[2][i];
                 }
-            }
-        } else {
-            for (i, yi) in y.iter_mut().enumerate() {
-                let c = &st.cos36[i];
-                let v: f32 = x.iter().zip(c).map(|(a, b)| a * b).sum();
-                *yi = v * st.win[bt][i];
             }
         }
         let o = &mut overlap[sb * 18..sb * 18 + 18];
@@ -841,20 +868,51 @@ fn imdct(g: &Granule, xr: &[f32; 576], overlap: &mut [f32; 576], out: &mut [[f32
     }
 }
 
-/// Polyphase synthesis of one time slot (ISO/IEC 11172-3 Annex A.2).
-fn synth(v: &mut [f32], s: &[f32; 32], out: &mut [f32; 32]) {
+/// Polyphase synthesis of a granule's 18 time slots (ISO/IEC 11172-3
+/// Annex A.2). The matrixing v[i] = Σ s[k]·cos((16+i)(2k+1)π/64), i < 64,
+/// takes 32 values: with c the DCT-II of size 32, c(m) = Σ s[k]·cos(mπ(2k+1)
+/// /64), v[i] is c(16+i) for i < 16, 0 at 16, −c(48−i) up to 48 and
+/// −c(i−48) above. The DCT-IIs of all slots run at once.
+fn synth(v: &mut History, s: &[[f32; 32]; 18], out: &mut [[f32; 32]; 18]) {
     let st = statics();
-    v.copy_within(0..960, 64);
-    for (i, row) in st.matrix.iter().enumerate() {
-        v[i] = row.iter().zip(s).map(|(a, b)| a * b).sum();
-    }
-    for (j, o) in out.iter_mut().enumerate() {
-        let mut sum = 0f32;
-        for i in 0..8 {
-            sum += v[i * 128 + j] * st.window[i * 64 + j];
-            sum += v[i * 128 + 96 + j] * st.window[i * 64 + 32 + j];
+    let mut st_ = [[0f32; 18]; 32];
+    for (t, slot) in s.iter().enumerate() {
+        for k in 0..32 {
+            st_[k][t] = slot[k];
         }
-        *o = sum;
+    }
+    let mut c = [[0f32; 18]; 32];
+    for (cm, w) in c.iter_mut().zip(&st.dct32) {
+        for (sk, &w) in st_.iter().zip(w) {
+            for (v, &x) in cm.iter_mut().zip(sk) {
+                *v += w * x;
+            }
+        }
+    }
+    for (t, o) in out.iter_mut().enumerate() {
+        let v = v.push(1024, 64);
+        for i in 0..16 {
+            v[i] = c[16 + i][t];
+        }
+        v[16] = 0.0;
+        for i in 17..=48 {
+            v[i] = -c[48 - i][t];
+        }
+        for i in 49..64 {
+            v[i] = -c[i - 48][t];
+        }
+        *o = [0.0; 32];
+        for i in 0..8 {
+            let (a, b) = (&v[i * 128..i * 128 + 32], &v[i * 128 + 96..i * 128 + 128]);
+            let (wa, wb) = (
+                &st.window[i * 64..i * 64 + 32],
+                &st.window[i * 64 + 32..i * 64 + 64],
+            );
+            for j in 0..32 {
+                o[j] += a[j] * wa[j];
+                o[j] += b[j] * wb[j];
+            }
+        }
     }
 }
 

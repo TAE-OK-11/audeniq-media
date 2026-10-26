@@ -17,6 +17,9 @@ pub struct Fft {
     /// Twiddles exp(−2πik/2h) of the stage of half-size h at [h + k].
     wr: Vec<f32>,
     wi: Vec<f32>,
+    /// Bit reversal over n/4: the first radix-4 group of input quarter
+    /// offset j lands at 4·rev4[j].
+    rev4: Vec<u32>,
 }
 
 impl Fft {
@@ -40,7 +43,20 @@ impl Fft {
             }
             h *= 2;
         }
-        Fft { n, swaps, wr, wi }
+        let rev4 = (0..n / 4)
+            .map(|j| {
+                j.reverse_bits()
+                    .checked_shr(usize::BITS + 2 - bits)
+                    .unwrap_or(0) as u32
+            })
+            .collect();
+        Fft {
+            n,
+            swaps,
+            wr,
+            wi,
+            rev4,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -172,8 +188,14 @@ fn fft_body(f: &Fft, re: &mut [f32], im: &mut [f32]) {
         re[s + 3] = a1r - b1i;
         im[s + 3] = a1i + b1r;
     }
-    // Radix 4 after that: stages of half-size h and 2h at once, then one
-    // radix-2 stage if the count is odd.
+    stages_body(f, re, im);
+}
+
+/// The stages after the first radix-4 pass: half-sizes h and 2h at once,
+/// then one radix-2 stage if their count is odd.
+#[inline(always)]
+fn stages_body(f: &Fft, re: &mut [f32], im: &mut [f32]) {
+    let n = f.n;
     let mut h = 4;
     while 4 * h <= n {
         let (w1r, w1i) = (&f.wr[h..2 * h], &f.wi[h..2 * h]);
@@ -185,32 +207,10 @@ fn fft_body(f: &Fft, re: &mut [f32], im: &mut [f32]) {
             let (r2, r3) = r23.split_at_mut(h);
             let (i0, i1) = i01.split_at_mut(h);
             let (i2, i3) = i23.split_at_mut(h);
-            for k in 0..h {
-                // Stage h: (0, 1) and (2, 3) with w1.
-                let (ar, ai) = (
-                    r1[k] * w1r[k] - i1[k] * w1i[k],
-                    r1[k] * w1i[k] + i1[k] * w1r[k],
-                );
-                let (br, bi) = (
-                    r3[k] * w1r[k] - i3[k] * w1i[k],
-                    r3[k] * w1i[k] + i3[k] * w1r[k],
-                );
-                let (b0r, b0i) = (r0[k] + ar, i0[k] + ai);
-                let (b1r, b1i) = (r0[k] - ar, i0[k] - ai);
-                let (b2r, b2i) = (r2[k] + br, i2[k] + bi);
-                let (b3r, b3i) = (r2[k] - br, i2[k] - bi);
-                // Stage 2h: (0, 2) with w2, (1, 3) with w2·(−i).
-                let (cr, ci) = (b2r * w2r[k] - b2i * w2i[k], b2r * w2i[k] + b2i * w2r[k]);
-                let (dr, di) = (b3r * w2r[k] - b3i * w2i[k], b3r * w2i[k] + b3i * w2r[k]);
-                r0[k] = b0r + cr;
-                i0[k] = b0i + ci;
-                r2[k] = b0r - cr;
-                i2[k] = b0i - ci;
-                // d·(−i) = (di, −dr)
-                r1[k] = b1r + di;
-                i1[k] = b1i - dr;
-                r3[k] = b1r - di;
-                i3[k] = b1i + dr;
+            if h >= 8 {
+                fused::<8>([r0, r1, r2, r3], [i0, i1, i2, i3], [w1r, w1i, w2r, w2i]);
+            } else {
+                fused::<4>([r0, r1, r2, r3], [i0, i1, i2, i3], [w1r, w1i, w2r, w2i]);
             }
         }
         h *= 4;
@@ -219,7 +219,26 @@ fn fft_body(f: &Fft, re: &mut [f32], im: &mut [f32]) {
         let (wr, wi) = (&f.wr[h..2 * h], &f.wi[h..2 * h]);
         let (ar, br) = re.split_at_mut(h);
         let (ai, bi) = im.split_at_mut(h);
-        for k in 0..h {
+        // Whole blocks of eight, then the rest (h is 4 or a multiple of 8).
+        let blocks = h / 8 * 8;
+        let [ar8, br8, ai8, bi8] =
+            [&mut *ar, &mut *br, &mut *ai, &mut *bi].map(|x| x[..blocks].as_chunks_mut::<8>().0);
+        let [wr8, wi8] = [wr, wi].map(|x| x[..blocks].as_chunks::<8>().0);
+        for c in 0..ar8.len() {
+            let (xar, xbr, xai, xbi) = (ar8[c], br8[c], ai8[c], bi8[c]);
+            let (wr, wi) = (wr8[c], wi8[c]);
+            let mut o = [[0f32; 8]; 4];
+            for e in 0..8 {
+                let tr = xbr[e] * wr[e] - xbi[e] * wi[e];
+                let ti = xbr[e] * wi[e] + xbi[e] * wr[e];
+                o[0][e] = xar[e] + tr;
+                o[1][e] = xai[e] + ti;
+                o[2][e] = xar[e] - tr;
+                o[3][e] = xai[e] - ti;
+            }
+            (ar8[c], ai8[c], br8[c], bi8[c]) = (o[0], o[1], o[2], o[3]);
+        }
+        for k in blocks..h {
             let tr = br[k] * wr[k] - bi[k] * wi[k];
             let ti = br[k] * wi[k] + bi[k] * wr[k];
             br[k] = ar[k] - tr;
@@ -227,6 +246,47 @@ fn fft_body(f: &Fft, re: &mut [f32], im: &mut [f32]) {
             ar[k] += tr;
             ai[k] += ti;
         }
+    }
+}
+
+/// The fused radix-4 butterflies of `fft_body` over blocks of `L` values
+/// of `k` (a multiple of `L` of them), so they vectorize.
+#[inline(always)]
+fn fused<const L: usize>(r: [&mut [f32]; 4], i: [&mut [f32]; 4], w: [&[f32]; 4]) {
+    let [r0, r1, r2, r3] = r.map(|x| x.as_chunks_mut::<L>().0);
+    let [i0, i1, i2, i3] = i.map(|x| x.as_chunks_mut::<L>().0);
+    let [w1r, w1i, w2r, w2i] = w.map(|x| x.as_chunks::<L>().0);
+    for c in 0..r0.len() {
+        // Local copies: the blocks then provably do not alias and the
+        // lane loop vectorizes.
+        let (x0r, x1r, x2r, x3r) = (r0[c], r1[c], r2[c], r3[c]);
+        let (x0i, x1i, x2i, x3i) = (i0[c], i1[c], i2[c], i3[c]);
+        let (w1r, w1i, w2r, w2i) = (w1r[c], w1i[c], w2r[c], w2i[c]);
+        let mut o = [[0f32; L]; 8];
+        for e in 0..L {
+            let ar = x1r[e] * w1r[e] - x1i[e] * w1i[e];
+            let ai = x1r[e] * w1i[e] + x1i[e] * w1r[e];
+            let br = x3r[e] * w1r[e] - x3i[e] * w1i[e];
+            let bi = x3r[e] * w1i[e] + x3i[e] * w1r[e];
+            let (b0r, b0i) = (x0r[e] + ar, x0i[e] + ai);
+            let (b1r, b1i) = (x0r[e] - ar, x0i[e] - ai);
+            let (b2r, b2i) = (x2r[e] + br, x2i[e] + bi);
+            let (b3r, b3i) = (x2r[e] - br, x2i[e] - bi);
+            let cr = b2r * w2r[e] - b2i * w2i[e];
+            let ci = b2r * w2i[e] + b2i * w2r[e];
+            let dr = b3r * w2r[e] - b3i * w2i[e];
+            let di = b3r * w2i[e] + b3i * w2r[e];
+            o[0][e] = b0r + cr;
+            o[1][e] = b0i + ci;
+            o[2][e] = b0r - cr;
+            o[3][e] = b0i - ci;
+            o[4][e] = b1r + di;
+            o[5][e] = b1i - dr;
+            o[6][e] = b1r - di;
+            o[7][e] = b1i + dr;
+        }
+        (r0[c], i0[c], r2[c], i2[c]) = (o[0], o[1], o[2], o[3]);
+        (r1[c], i1[c], r3[c], i3[c]) = (o[4], o[5], o[6], o[7]);
     }
 }
 
@@ -270,8 +330,12 @@ impl Dct4 {
     pub fn run(&self, x: &[f32], out: &mut [f32], re: &mut [f32], im: &mut [f32]) {
         let (m, q) = (self.m, self.m / 2);
         assert!(x.len() == m && out.len() == m && re.len() == q && im.len() == q);
-        pre(x, &self.tr, &self.ti, re, im);
-        self.fft.forward(re, im);
+        if q >= 32 {
+            pre_first(&self.fft, x, &self.tr, &self.ti, re, im);
+        } else {
+            pre(x, &self.tr, &self.ti, re, im);
+            self.fft.forward(re, im);
+        }
         post(re, im, &self.tr, &self.ti, out);
     }
 }
@@ -348,23 +412,87 @@ fn post_lanes_body(re: &[V], im: &[V], tr: &[f32], ti: &[f32], out: &mut [V], g:
     }
 }
 
+/// z(s + e), e < 8: (x[2(s+e)], x[m−1−2(s+e)]) rotated by (tr, ti)[s + e].
+/// A function, not a closure, so it inlines into the AVX2 build.
+#[inline(always)]
+fn rotated8(x: &[f32], tr: &[f32], ti: &[f32], m: usize, s: usize) -> ([f32; 8], [f32; 8]) {
+    let lo: [f32; 16] = x[2 * s..2 * s + 16].try_into().unwrap();
+    let hi: [f32; 16] = x[m - 2 * s - 16..m - 2 * s].try_into().unwrap();
+    let cr: [f32; 8] = tr[s..s + 8].try_into().unwrap();
+    let ci: [f32; 8] = ti[s..s + 8].try_into().unwrap();
+    let (mut r, mut i) = ([0f32; 8], [0f32; 8]);
+    for e in 0..8 {
+        let (a, c) = (lo[2 * e], hi[15 - 2 * e]);
+        r[e] = a * cr[e] - c * ci[e];
+        i[e] = a * ci[e] + c * cr[e];
+    }
+    (r, i)
+}
+
+multiversion! {
+    fn pre_first(f: &Fft, x: &[f32], tr: &[f32], ti: &[f32], re: &mut [f32], im: &mut [f32]) = pre_first_body;
+}
+
+/// The pre-rotation, bit reversal and first radix-4 pass of the FFT in one:
+/// the rotated pairs z(j) come from `x` in contiguous blocks, the group of
+/// quarter offset j (z at j, j + q/2, j + q/4, j + 3q/4 after the
+/// reversal) is computed for eight j at once and stored at 4·rev4[j]; then
+/// the remaining stages. `q` (the FFT size) is at least 32.
+#[inline(always)]
+fn pre_first_body(f: &Fft, x: &[f32], tr: &[f32], ti: &[f32], re: &mut [f32], im: &mut [f32]) {
+    let (m, q) = (x.len(), re.len());
+    let n4 = q / 4;
+    for j in (0..n4).step_by(8) {
+        let (z0r, z0i) = rotated8(x, tr, ti, m, j);
+        let (z1r, z1i) = rotated8(x, tr, ti, m, j + 2 * n4);
+        let (z2r, z2i) = rotated8(x, tr, ti, m, j + n4);
+        let (z3r, z3i) = rotated8(x, tr, ti, m, j + 3 * n4);
+        let mut o = [[0f32; 8]; 8];
+        for e in 0..8 {
+            let (a0r, a0i) = (z0r[e] + z1r[e], z0i[e] + z1i[e]);
+            let (a1r, a1i) = (z0r[e] - z1r[e], z0i[e] - z1i[e]);
+            let (b0r, b0i) = (z2r[e] + z3r[e], z2i[e] + z3i[e]);
+            let (b1r, b1i) = (z2r[e] - z3r[e], z2i[e] - z3i[e]);
+            o[0][e] = a0r + b0r;
+            o[1][e] = a1r + b1i;
+            o[2][e] = a0r - b0r;
+            o[3][e] = a1r - b1i;
+            o[4][e] = a0i + b0i;
+            o[5][e] = a1i - b1r;
+            o[6][e] = a0i - b0i;
+            o[7][e] = a1i + b1r;
+        }
+        for e in 0..8 {
+            let t = 4 * f.rev4[j + e] as usize;
+            re[t..t + 4].copy_from_slice(&[o[0][e], o[1][e], o[2][e], o[3][e]]);
+            im[t..t + 4].copy_from_slice(&[o[4][e], o[5][e], o[6][e], o[7][e]]);
+        }
+    }
+    stages_body(f, re, im);
+}
+
 multiversion! {
     fn pre(x: &[f32], tr: &[f32], ti: &[f32], re: &mut [f32], im: &mut [f32]) = pre_body;
 }
 
 #[inline(always)]
 fn pre_body(x: &[f32], tr: &[f32], ti: &[f32], re: &mut [f32], im: &mut [f32]) {
-    // (x[2j], x[m−1−2j]) are pair j's even and pair (q−1−j)'s odd value;
-    // gather them, then rotate in contiguous runs.
-    let q = re.len();
-    for (j, c) in x.as_chunks::<2>().0.iter().enumerate() {
-        re[j] = c[0];
-        im[q - 1 - j] = c[1];
-    }
-    for (((r, i), &cr), &ci) in re.iter_mut().zip(im.iter_mut()).zip(tr).zip(ti) {
-        let (a, b) = (*r, *i);
-        *r = a * cr - b * ci;
-        *i = a * ci + b * cr;
+    // Pair j is (x[2j], x[m−1−2j]): for j = 8b + e the evens of the 16
+    // values at 16b and, reversed, the odds of the 16 at m − 16 − 16b.
+    let m = x.len();
+    let (re8, im8) = (re.as_chunks_mut::<8>().0, im.as_chunks_mut::<8>().0);
+    let (tr8, ti8) = (tr.as_chunks::<8>().0, ti.as_chunks::<8>().0);
+    for b in 0..re8.len() {
+        let lo: [f32; 16] = x[16 * b..16 * b + 16].try_into().unwrap();
+        let hi: [f32; 16] = x[m - 16 - 16 * b..m - 16 * b].try_into().unwrap();
+        let (cr, ci) = (tr8[b], ti8[b]);
+        let (mut r, mut i) = ([0f32; 8], [0f32; 8]);
+        for e in 0..8 {
+            let (a, c) = (lo[2 * e], hi[15 - 2 * e]);
+            r[e] = a * cr[e] - c * ci[e];
+            i[e] = a * ci[e] + c * cr[e];
+        }
+        (re8[b], im8[b]) = (r, i);
     }
 }
 
@@ -374,17 +502,24 @@ multiversion! {
 
 #[inline(always)]
 fn post_body(re: &mut [f32], im: &mut [f32], tr: &[f32], ti: &[f32], out: &mut [f32]) {
-    // Rotate, then out[2k] = Re c(k) and out[m−1−2k] = −Im c(k): pair k
-    // takes Re c(k) and −Im c(q−1−k).
+    // Rotate, then out[2k] = Re c(k) and out[m−1−2k] = −Im c(k): the 16
+    // outputs at 16b take Re c(8b + e) and −Im c(q − 1 − 8b − e).
     let q = re.len();
     for (((r, i), &cr), &ci) in re.iter_mut().zip(im.iter_mut()).zip(tr).zip(ti) {
         let (a, b) = (*r, *i);
         *r = a * cr - b * ci;
         *i = a * ci + b * cr;
     }
-    for (k, c) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        c[0] = re[k];
-        c[1] = -im[q - 1 - k];
+    let out16 = out.as_chunks_mut::<16>().0;
+    for (b, o) in out16.iter_mut().enumerate() {
+        let r: [f32; 8] = re[8 * b..8 * b + 8].try_into().unwrap();
+        let i: [f32; 8] = im[q - 8 - 8 * b..q - 8 * b].try_into().unwrap();
+        let mut v = [0f32; 16];
+        for e in 0..8 {
+            v[2 * e] = r[e];
+            v[2 * e + 1] = -i[7 - e];
+        }
+        *o = v;
     }
 }
 

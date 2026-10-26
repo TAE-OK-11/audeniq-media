@@ -13,12 +13,9 @@ use crate::Error;
 use crate::ps::Ps;
 use crate::sbr_tables as tab;
 use media_bits::{Bits, Huffman as Tree};
-use media_dsp::{Dct4, Fft};
+use media_dsp::{Dct4, Fft, History};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
-
-/// Synthesis buffer: room for v (1280 values) to slide 8 slots.
-const V_BUF: usize = 2304;
 
 /// QMF slots between the HF generator's input and the envelope grid.
 const ENV_OFF: usize = 2;
@@ -96,18 +93,6 @@ fn huff(b: &mut Bits, table: usize) -> Result<i32, Error> {
     Ok(statics().trees[table].decode(b)? as i32 - tab::LAV[table])
 }
 
-/// Start of the next slot's v (`len` values, newest first) in the sliding
-/// buffer `buf`, `step` new values in front of the kept ones.
-fn slide(buf: &mut [f32], off: &mut usize, len: usize, step: usize) -> usize {
-    if *off < step {
-        let kept = len - step;
-        buf.copy_within(*off..*off + kept, buf.len() - kept);
-        *off = buf.len() - kept;
-    }
-    *off -= step;
-    *off
-}
-
 /// Scratch for a frame's QMF transforms run side by side, one lane per
 /// slot (and per cosine/sine half in synthesis): `x`, `y` hold 64 points ×
 /// 64 lanes, `re`, `im` 32 × 64.
@@ -141,11 +126,8 @@ struct Channel {
     invf_mode: [[u8; 5]; 2],
     add_harmonic: [u8; 48],
     amp_res: u8,
-    /// Synthesis v (newest first, from `v_off`) and analysis input (oldest
-    /// first). v slides down a buffer about twice its length and is moved
-    /// back up only when it reaches the start.
-    v: Vec<f32>,
-    v_off: usize,
+    /// Synthesis v (newest first) and analysis input (oldest first).
+    v: History,
     x: Vec<f32>,
     e_a: [i32; 2],
     bw: [f32; 5],
@@ -181,8 +163,7 @@ impl Channel {
             invf_mode: [[0; 5]; 2],
             add_harmonic: [0; 48],
             amp_res: 0,
-            v: vec![0.0; V_BUF],
-            v_off: V_BUF - 1280,
+            v: History::new(1280),
             x: vec![0.0; 1312],
             e_a: [0, -1],
             bw: [0.0; 5],
@@ -1170,8 +1151,7 @@ impl Sbr {
         }
         statics().dct64.run_lanes(xin, y, &mut sc.re, &mut sc.im, L);
         for slot in 0..32 {
-            let at = slide(&mut ch.v, &mut ch.v_off, 1280, 128);
-            let v = &mut ch.v[at..at + 1280];
+            let v = ch.v.push(1280, 128);
             for n in 0..64 {
                 let c4 = y[n * L + slot];
                 let s4 = if n % 2 == 0 { 1.0 } else { -1.0 } * y[n * L + 32 + slot];
@@ -1200,8 +1180,7 @@ impl Sbr {
         let c = &tab::QMF_WINDOW;
         let (mut re, mut im) = ([0f32; 64], [0f32; 64]);
         for slot in 0..32 {
-            let at = slide(&mut ch.v, &mut ch.v_off, 640, 64);
-            let v = &mut ch.v[at..at + 640];
+            let v = ch.v.push(640, 64);
             let (xr, xi) = (&x[0][slot], &x[1][slot]);
             let (pr, pi) = (&st.syn_pre.re, &st.syn_pre.im);
             for k in 0..32 {

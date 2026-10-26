@@ -296,6 +296,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-aac"
+version = "0.1.0"
+
+[[package]]
+name = "media-adm"
+version = "0.1.0"
+dependencies = [
+ "media-json",
+]
+
+[[package]]
 name = "media-engine-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -304,7 +315,10 @@ dependencies = [
  "crc32fast",
  "libfuzzer-sys",
  "md-5",
+ "media-aac",
+ "media-adm",
  "media-hash",
+ "media-video",
  "photo-deflate",
  "sha2",
 ]
@@ -316,6 +330,15 @@ version = "0.1.0"
 [[package]]
 name = "media-json"
 version = "0.1.0"
+
+[[package]]
+name = "media-video"
+version = "0.1.0"
+dependencies = [
+ "audeniq-qc",
+ "media-aac",
+ "media-json",
+]
 
 [[package]]
 name = "moxcms"

@@ -1,0 +1,133 @@
+//! `audeniq-music video …` command line.
+//!
+//! ```text
+//! video probe [--sound] FILE   report JSON on stdout, exit 0; `--sound`
+//!                              also decodes and measures the sound track
+//! video sound-ranges FILE      byte ranges of the sound track's data
+//! video convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N]
+//!       [--rate 44100|48000] IN OUT
+//!                              copy the picture, convert the sound to a
+//!                              distributor's spec (default preset from
+//!                              OUT's extension: .mov → pcm24, else aac-320)
+//! video capabilities           engine and rule versions
+//! ```
+//!
+//! Errors go to stderr as `{"detail":…,"error":"IO|INVALID|LIMIT|USAGE"}`
+//! with exit code 2, the contract of `audeniq-music qc`.
+use std::io::Write;
+use std::process::ExitCode;
+
+fn fail(code: &str, detail: &str) -> ExitCode {
+    let v = media_json::json!({"error": code, "detail": detail});
+    let _ = writeln!(std::io::stderr(), "{}", media_json::to_string(&v));
+    ExitCode::from(2)
+}
+
+fn emit(v: &impl media_json::ToJson) -> ExitCode {
+    let mut out = media_json::to_vec(v);
+    out.push(b'\n');
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(&out).and_then(|()| stdout.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail("IO", &e.to_string()),
+    }
+}
+
+/// `convert-audio` options and paths.
+fn convert_args(
+    args: &[std::ffi::OsString],
+) -> Result<
+    (
+        crate::convert::Options,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ),
+    String,
+> {
+    use crate::convert::{Codec, Container, preset};
+    let mut paths = Vec::new();
+    let (mut name, mut codec, mut bitrate, mut rate) = (None, None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || {
+            it.next()
+                .and_then(|v| v.to_str())
+                .ok_or_else(|| format!("{} needs a value", a.to_string_lossy()))
+        };
+        match a.to_str() {
+            Some("--preset") => name = Some(value()?.to_string()),
+            Some("--codec") => codec = Some(value()?.to_string()),
+            Some("--bitrate") => {
+                bitrate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?)
+            }
+            Some("--rate") => rate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?),
+            Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            _ => paths.push(std::path::PathBuf::from(a)),
+        }
+    }
+    let [input, output] =
+        <[_; 2]>::try_from(paths).map_err(|_| "IN and OUT are required".to_string())?;
+    let mov = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mov"));
+    let name = name.unwrap_or_else(|| if mov { "pcm24" } else { "aac-320" }.into());
+    let mut o = preset(&name).ok_or_else(|| format!("unknown preset {name}"))?;
+    o.container = if mov { Container::Mov } else { Container::Mp4 };
+    match codec.as_deref() {
+        Some("aac") => o.codec = Codec::Aac(bitrate.unwrap_or(320_000)),
+        Some("pcm24") => o.codec = Codec::Pcm24,
+        Some(c) => return Err(format!("unknown codec {c}")),
+        None => {
+            if let (Some(b), Codec::Aac(_)) = (bitrate, o.codec) {
+                o.codec = Codec::Aac(b);
+            }
+        }
+    }
+    if let Some(r) = rate {
+        o.sample_rate = r;
+    }
+    Ok((o, input, output))
+}
+
+pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
+    let usage = format!(
+        "usage: {prog} probe [--sound] FILE | {prog} sound-ranges FILE | {prog} convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N] [--rate HZ] IN OUT | {prog} capabilities"
+    );
+    let words: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
+    match words.as_slice() {
+        [Some("probe"), Some("--sound"), _] | [Some("probe"), _] => {
+            let sound = words[1] == Some("--sound");
+            let path: &std::path::Path = args[args.len() - 1].as_ref();
+            match crate::probe_path(path, sound) {
+                Ok(report) => emit(&report),
+                Err(e) => fail(e.code(), &e.to_string()),
+            }
+        }
+        [Some("sound-ranges"), _] => match crate::sound_ranges(args[1].as_ref()) {
+            Ok(ranges) => {
+                let total: u64 = ranges.iter().map(|r| r.1).sum();
+                let list: Vec<[u64; 2]> = ranges.iter().map(|&(o, l)| [o, l]).collect();
+                emit(&media_json::json!({"ranges": list, "bytes": total}))
+            }
+            Err(e) => fail(e.code(), &e.to_string()),
+        },
+        [Some("convert-audio"), ..] => match convert_args(&args[1..]) {
+            Ok((opts, input, output)) => match crate::convert::convert(&input, &output, &opts) {
+                Ok(c) => emit(&c),
+                Err(e) => fail(e.code(), &e.to_string()),
+            },
+            Err(e) => fail("USAGE", &format!("{e}; {usage}")),
+        },
+        [Some("capabilities")] => emit(&media_json::json!({
+            "engine": crate::ENGINE_VERSION,
+            "rule": crate::RULE_VERSION,
+            "containers": ["mp4", "mov"],
+            "max_moov_bytes": crate::file::MAX_MOOV,
+            "sound_codecs": ["aac", "pcm"],
+            "max_sound_bytes": crate::sound::MAX_SOUND_BYTES,
+            "convert_presets": crate::convert::PRESETS.iter().map(|p| p.0).collect::<Vec<_>>(),
+        })),
+        _ => fail("USAGE", &usage),
+    }
+}

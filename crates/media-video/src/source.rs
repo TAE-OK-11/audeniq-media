@@ -427,20 +427,32 @@ impl Source {
                         Err(_) => false,
                     }
                 }
-                Dec::Mp3(d) => match d.decode(packet, &mut self.pcm_f) {
-                    Ok(f) => {
-                        if self.names.is_empty() && f.channels > 0 {
-                            self.rate = f.sample_rate;
-                            self.names = if f.channels == 1 {
-                                vec!["C"]
-                            } else {
-                                vec!["L", "R"]
-                            };
+                Dec::Mp3(d) => {
+                    let mut pcm = std::mem::take(&mut self.pcm_f);
+                    pcm.clear();
+                    let r = d.decode(packet, &mut pcm);
+                    let ok = match r {
+                        Ok(f) => {
+                            if self.names.is_empty() {
+                                self.rate = f.sample_rate;
+                                self.names = if f.channels == 1 {
+                                    vec!["C"]
+                                } else {
+                                    vec!["L", "R"]
+                                };
+                            }
+                            // A stream may switch between mono and stereo
+                            // frames; keep the first frame's channels.
+                            let mut fixed = Vec::new();
+                            media_mp3::to_channels(&pcm, f.channels, self.names.len(), &mut fixed);
+                            pcm = fixed;
+                            true
                         }
-                        true
-                    }
-                    Err(_) => false,
-                },
+                        Err(_) => false,
+                    };
+                    self.pcm_f = pcm;
+                    ok
+                }
             };
             let ch = self.names.len().max(1);
             if ok {

@@ -318,6 +318,7 @@ dependencies = [
  "media-aac",
  "media-adm",
  "media-hash",
+ "media-mp3",
  "media-video",
  "photo-deflate",
  "sha2",

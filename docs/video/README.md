@@ -7,6 +7,7 @@
 audeniq-music video probe FILE           보고서 JSON (stdout, 종료 0) — 색인만 읽음
 audeniq-music video probe --sound FILE   + 소리 트랙을 디코드해 음량·피크·클리핑·무음 측정
 audeniq-music video sound-ranges FILE    소리 데이터가 있는 바이트 범위 {"ranges": [[offset, len], …], "bytes": N}
+audeniq-music video convert-audio [--preset NAME] IN OUT   영상은 그대로, 소리를 배급 사양으로 변환 (CONVERT.md)
 audeniq-music video capabilities         엔진·규칙 버전
 ```
 

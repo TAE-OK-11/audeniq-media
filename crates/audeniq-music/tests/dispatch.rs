@@ -83,3 +83,27 @@ fn photo_commands_run() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(out.stderr, b"upload sanitization failed\n");
 }
+
+#[test]
+fn video_group_routes_to_the_video_probe() {
+    let out = music(&["video", "capabilities"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(&format!("\"engine\":\"{}\"", media_video::ENGINE_VERSION)));
+    assert!(text.ends_with("}\n"));
+
+    let out = music(&["video", "probe", "/nonexistent/audeniq-music-test.mp4"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.starts_with("{\"detail\":"), "{err}");
+    assert!(err.contains("\"error\":\"IO\""), "{err}");
+
+    let out = music(&["video", "probe"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("\"error\":\"USAGE\"")
+    );
+}

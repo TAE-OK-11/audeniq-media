@@ -3,6 +3,7 @@
 //! ```text
 //! audeniq-music qc <command> ...      audio engine, same commands and JSON as `audeniq-qc`
 //! audeniq-music photo <command> ...   image/PDF tools, same commands and output as `audeniq-photo`
+//! audeniq-music video <command> ...   music-video probe and delivery checks (`media-video`)
 //! audeniq-music --version
 //! ```
 //!
@@ -17,7 +18,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: audeniq-music qc <command> ... | audeniq-music photo <command> ... | audeniq-music --version";
+const USAGE: &str = "usage: audeniq-music qc <command> ... | audeniq-music photo <command> ... | audeniq-music video <command> ... | audeniq-music --version";
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -47,6 +48,7 @@ fn main() -> ExitCode {
             };
             photo_cli::main("audeniq-music photo", args)
         }
+        Some("video") => media_video::cli::main("audeniq-music video", args.collect()),
         Some("--version" | "-V") => {
             println!(
                 "audeniq-music {} ({})",

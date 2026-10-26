@@ -617,6 +617,15 @@ impl Mix {
         }
     }
 
+    /// The AAC profile the first track's decoder found (HE-AAC is only
+    /// known for sure once decoded).
+    pub fn aac_profile(&self) -> Option<&'static str> {
+        match &self.sources.first()?.dec {
+            Dec::Aac(d) => Some(d.profile()),
+            _ => None,
+        }
+    }
+
     pub fn packets(&self) -> u64 {
         self.sources.iter().map(|s| s.packets).sum()
     }

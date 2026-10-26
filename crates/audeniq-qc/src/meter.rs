@@ -186,6 +186,28 @@ pub fn analyze(
     Ok(analyzer.finish(reader.decoded_frames(), crate::hex(&hash.finish().0)))
 }
 
+/// The same meters over PCM decoded elsewhere (a music video's sound track):
+/// interleaved, left-aligned 32-bit samples of one or two channels. No PCM
+/// hash and no fingerprint.
+pub struct PcmMeter(Analyzer);
+
+impl PcmMeter {
+    pub fn new(spec: AudioSpec) -> Result<Self> {
+        if !(1..=2).contains(&spec.channels) || spec.sample_rate == 0 {
+            return Err(Error::Unsupported("meter needs 1 or 2 channels"));
+        }
+        Analyzer::new(spec, Backend::detect(), false).map(Self)
+    }
+
+    pub fn push(&mut self, samples: &[i32]) {
+        self.0.push(samples);
+    }
+
+    pub fn finish(self, frames: u64) -> Analysis {
+        self.0.finish(frames, String::new())
+    }
+}
+
 /// Shared streaming meters for standalone analysis and verified FLAC conversion.
 /// Hashing remains with the caller so conversion + QC never hashes PCM twice.
 pub(crate) struct Analyzer {

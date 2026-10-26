@@ -1,0 +1,16 @@
+[package]
+name = "media-video"
+description = "MP4/QuickTime video probe and music-video delivery checks for AUDENIQ (replaces FFprobe for MV uploads)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+media-json.workspace = true
+media-aac.workspace = true
+media-resample.workspace = true
+audeniq-qc = { path = "../audeniq-qc" }
+
+[lints]
+workspace = true

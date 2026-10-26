@@ -14,8 +14,12 @@ use crate::bits::Bits;
 use crate::huffman::Tree;
 use crate::ps::Ps;
 use crate::sbr_tables as tab;
+use media_dsp::{Dct4, Fft};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
+
+/// Synthesis buffer: room for v (1280 values) to slide 8 slots.
+const V_BUF: usize = 2304;
 
 /// QMF slots between the HF generator's input and the envelope grid.
 const ENV_OFF: usize = 2;
@@ -38,51 +42,92 @@ const F_ENV_BAL_3_0: usize = 7;
 const T_NOISE_3_0: usize = 8;
 const T_NOISE_BAL_3_0: usize = 9;
 
+/// Complex factors as (re, im) arrays.
+struct Rot {
+    re: Vec<f32>,
+    im: Vec<f32>,
+}
+
+fn rot(n: usize, scale: f64, angle: impl Fn(f64) -> f64) -> Rot {
+    let (re, im) = (0..n)
+        .map(|i| {
+            let a = angle(i as f64);
+            ((scale * a.cos()) as f32, (scale * a.sin()) as f32)
+        })
+        .unzip();
+    Rot { re, im }
+}
+
+/// The QMF banks as fast transforms. With C₆₄ the DCT-IV of size 64,
+/// C(j) = Σ a(m) cos(π/64 (j+½)(m+½)), extended to all j by C(−1−j) = C(j)
+/// and C(j+128) = −C(j):
+///
+/// - analysis, W(k) = Σ u(n)·2e^{iπ(k+½)(2n−½)/64}, k < 32, is the kernel
+///   at the odd inputs m = 2n − 1. Folding those into 0..64 (m = −1 → 0,
+///   m > 63 → −(127 − m)) gives one C₆₄ whose outputs k and 63 − k are
+///   Re W(k)/2 and −Im W(k)/2;
+/// - synthesis, v(n) = Re Σ X(k)e^{iπ(k+½)(2n−255)/128}/64, is at the
+///   DCT-IV index j = n − 128: v(n) = (S(n) − C(n))/64 for n < 64 and
+///   (C(127−n) + S(127−n))/64 above, with C = C₆₄[Re X] and the DST-IV
+///   S(j) = Σ Im X(k) sin(π/64 (k+½)(j+½)) = (−1)ʲ C₆₄[Im X(63−k)](j);
+/// - downsampled synthesis (a rotation, an inverse DFT and a rotation), phase (k+½)(2n−127.5)/64 over 32 bands:
+///   Re(e^{i(πn/64 − 127.5π/128)} · IDFT₆₄[X(k)e^{iπk/128}](n))/64 (the
+///   offset 127.5 times the output as the reference decoder does,
+///   conformance stream `al_sbr_sr_48_2_fsaac48`).
 struct Static {
     trees: Vec<Tree>,
-    /// Analysis matrix 2·exp(iπ(k+½)(2n−½)/64): [k][n] (re, im).
-    ana: Vec<[[f32; 2]; 64]>,
-    /// Synthesis matrix exp(iπ(k+½)(2n−255)/128)/64: [n][k] (re, im).
-    syn: Vec<[[f32; 2]; 64]>,
-    /// Downsampled (32-band) synthesis exp(iπ(k+½)(2n−127.5)/64)/64: unity
-    /// gain with the analysis bank, timed as the reference decoder's output
-    /// (conformance stream `al_sbr_sr_48_2_fsaac48`).
-    syn_ds: Vec<[[f32; 2]; 32]>,
+    fft64: Fft,
+    dct64: Dct4,
+    syn_pre: Rot,
+    ds_post: Rot,
 }
 
 fn statics() -> &'static Static {
     static S: OnceLock<Static> = OnceLock::new();
     S.get_or_init(|| Static {
         trees: tab::HUFF.iter().map(|(c, l)| Tree::new(c, l)).collect(),
-        ana: (0..32)
-            .map(|k| {
-                std::array::from_fn(|n| {
-                    let a = PI * (k as f64 + 0.5) * (2.0 * n as f64 - 0.5) / 64.0;
-                    [(2.0 * a.cos()) as f32, (2.0 * a.sin()) as f32]
-                })
-            })
-            .collect(),
-        syn: (0..128)
-            .map(|n| {
-                std::array::from_fn(|k| {
-                    let a = PI * (k as f64 + 0.5) * (2.0 * n as f64 - 255.0) / 128.0;
-                    [(a.cos() / 64.0) as f32, (a.sin() / 64.0) as f32]
-                })
-            })
-            .collect(),
-        syn_ds: (0..64)
-            .map(|n| {
-                std::array::from_fn(|k| {
-                    let a = PI * (k as f64 + 0.5) * (2.0 * n as f64 - 127.5) / 64.0;
-                    [(a.cos() / 64.0) as f32, (a.sin() / 64.0) as f32]
-                })
-            })
-            .collect(),
+        fft64: Fft::new(64),
+        dct64: Dct4::new(64),
+        syn_pre: rot(64, 1.0, |k| PI * k / 128.0),
+        ds_post: rot(64, 1.0 / 64.0, |n| PI * n / 64.0 - 127.5 * PI / 128.0),
     })
 }
 
 fn huff(b: &mut Bits, table: usize) -> Result<i32, Error> {
     Ok(statics().trees[table].decode(b)? as i32 - tab::LAV[table])
+}
+
+/// Start of the next slot's v (`len` values, newest first) in the sliding
+/// buffer `buf`, `step` new values in front of the kept ones.
+fn slide(buf: &mut [f32], off: &mut usize, len: usize, step: usize) -> usize {
+    if *off < step {
+        let kept = len - step;
+        buf.copy_within(*off..*off + kept, buf.len() - kept);
+        *off = buf.len() - kept;
+    }
+    *off -= step;
+    *off
+}
+
+/// Scratch for a frame's QMF transforms run side by side, one lane per
+/// slot (and per cosine/sine half in synthesis): `x`, `y` hold 64 points ×
+/// 64 lanes, `re`, `im` 32 × 64.
+struct Lanes {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    re: Vec<f32>,
+    im: Vec<f32>,
+}
+
+impl Default for Lanes {
+    fn default() -> Lanes {
+        Lanes {
+            x: vec![0.0; 64 * 64],
+            y: vec![0.0; 64 * 64],
+            re: vec![0.0; 32 * 64],
+            im: vec![0.0; 32 * 64],
+        }
+    }
 }
 
 /// One channel's SBR data and filter-bank state.
@@ -97,8 +142,11 @@ struct Channel {
     invf_mode: [[u8; 5]; 2],
     add_harmonic: [u8; 48],
     amp_res: u8,
-    /// Synthesis v (newest first) and analysis input (oldest first).
+    /// Synthesis v (newest first, from `v_off`) and analysis input (oldest
+    /// first). v slides down a buffer about twice its length and is moved
+    /// back up only when it reaches the start.
     v: Vec<f32>,
+    v_off: usize,
     x: Vec<f32>,
     e_a: [i32; 2],
     bw: [f32; 5],
@@ -134,7 +182,8 @@ impl Channel {
             invf_mode: [[0; 5]; 2],
             add_harmonic: [0; 48],
             amp_res: 0,
-            v: vec![0.0; 1280],
+            v: vec![0.0; V_BUF],
+            v_off: V_BUF - 1280,
             x: vec![0.0; 1312],
             e_a: [0, -1],
             bw: [0.0; 5],
@@ -195,6 +244,7 @@ pub(crate) struct Sbr {
     patch_num_subbands: [usize; 6],
     patch_start_subband: [usize; 6],
     x_low: Box<[[[f32; 2]; 40]; 32]>,
+    lanes: Lanes,
     x_high: Box<[[[f32; 2]; 40]; 64]>,
     /// Reconstructed QMF signal per channel: [re/im][slot][band].
     x: Box<[[[[f32; 64]; 38]; 2]; 2]>,
@@ -259,6 +309,7 @@ impl Sbr {
             patch_num_subbands: [0; 6],
             patch_start_subband: [0; 6],
             x_low: Box::new([[[0.0; 2]; 40]; 32]),
+            lanes: Lanes::default(),
             x_high: Box::new([[[0.0; 2]; 40]; 64]),
             x: Box::new([[[[0.0; 64]; 38]; 2]; 2]),
             alpha0: [[0.0; 2]; 64],
@@ -1069,78 +1120,101 @@ impl Sbr {
     }
 
     /// 32 slots of QMF analysis of 1024 core samples into `w[ypos]`.
-    fn analysis(ch: &mut Channel, input: &[f32]) {
+    fn analysis(ch: &mut Channel, input: &[f32], sc: &mut Lanes) {
+        const L: usize = 32;
         let st = statics();
         let x = &mut ch.x;
         x.copy_within(1024..1312, 0);
         for (d, &v) in x[288..].iter_mut().zip(input) {
             *d = v * SCALE;
         }
-        let w = &mut ch.w[ch.ypos];
-        for (slot, ws) in w.iter_mut().enumerate() {
-            let base = 32 * slot;
+        let (a, d) = (&mut sc.x[..64 * L], &mut sc.y[..64 * L]);
+        for slot in 0..32 {
+            // u(n) = Σ_j c(2(n + 64j))·x(n + 64j), x(0) the newest sample.
+            let newest = 32 * slot + 319;
             let mut u = [0f32; 64];
-            for (n, un) in u.iter_mut().enumerate() {
-                let mut s = 0f32;
-                for j in 0..5 {
-                    let i = n + 64 * j;
-                    s += tab::QMF_WINDOW[2 * i] * x[base + 319 - i];
+            for j in 0..5 {
+                let c = &tab::QMF_WINDOW[128 * j..];
+                let xs = &x[newest - 64 * j - 63..=newest - 64 * j];
+                for n in 0..64 {
+                    u[n] += c[2 * n] * xs[63 - n];
                 }
-                *un = s;
             }
+            a[slot] = u[0];
+            for p in 1..32 {
+                a[2 * p * L + slot] = -u[64 - p];
+            }
+            for p in 0..32 {
+                a[(2 * p + 1) * L + slot] = u[p + 1];
+            }
+        }
+        st.dct64
+            .run_lanes(a, d, &mut sc.re[..32 * L], &mut sc.im[..32 * L], L);
+        for (slot, ws) in ch.w[ch.ypos].iter_mut().enumerate() {
             for (k, wk) in ws.iter_mut().enumerate() {
-                let m = &st.ana[k];
-                let (mut re, mut im) = (0f32, 0f32);
-                for (un, mk) in u.iter().zip(m) {
-                    re += un * mk[0];
-                    im += un * mk[1];
-                }
-                *wk = [re, im];
+                *wk = [2.0 * d[k * L + slot], -2.0 * d[(63 - k) * L + slot]];
             }
         }
     }
 
     /// 32 slots of 64-band QMF synthesis of `x` into 2048 samples.
-    fn synthesis(v: &mut [f32], x: &[[[f32; 64]; 38]; 2], out: &mut [f32]) {
-        let st = statics();
+    fn synthesis(ch: &mut Channel, x: &[[[f32; 64]; 38]; 2], out: &mut [f32], sc: &mut Lanes) {
+        const L: usize = 64;
         let c = &tab::QMF_WINDOW;
+        let (xin, y) = (&mut sc.x[..], &mut sc.y[..]);
         for slot in 0..32 {
-            v.copy_within(0..1152, 128);
-            let (re, im) = (&x[0][slot], &x[1][slot]);
-            for (n, vn) in v[..128].iter_mut().enumerate() {
-                let m = &st.syn[n];
-                let mut s = 0f32;
-                for k in 0..64 {
-                    s += re[k] * m[k][0] - im[k] * m[k][1];
-                }
-                *vn = s;
+            let (xr, xi) = (&x[0][slot], &x[1][slot]);
+            for k in 0..64 {
+                xin[k * L + slot] = xr[k];
+                xin[(63 - k) * L + 32 + slot] = xi[k];
             }
-            for j in 0..64 {
-                let mut s = 0f32;
-                for i in 0..5 {
-                    s += v[256 * i + j] * c[128 * i + j];
-                    s += v[256 * i + 192 + j] * c[128 * i + 64 + j];
+        }
+        statics().dct64.run_lanes(xin, y, &mut sc.re, &mut sc.im, L);
+        for slot in 0..32 {
+            let at = slide(&mut ch.v, &mut ch.v_off, 1280, 128);
+            let v = &mut ch.v[at..at + 1280];
+            for n in 0..64 {
+                let c4 = y[n * L + slot];
+                let s4 = if n % 2 == 0 { 1.0 } else { -1.0 } * y[n * L + 32 + slot];
+                v[n] = (s4 - c4) * (1.0 / 64.0);
+                v[127 - n] = (c4 + s4) * (1.0 / 64.0);
+            }
+            let o = &mut out[64 * slot..64 * slot + 64];
+            o.fill(0.0);
+            for i in 0..5 {
+                let (a, b) = (&v[256 * i..256 * i + 64], &v[256 * i + 192..256 * i + 256]);
+                let (ca, cb) = (&c[128 * i..128 * i + 64], &c[128 * i + 64..128 * i + 128]);
+                for j in 0..64 {
+                    o[j] += a[j] * ca[j] + b[j] * cb[j];
                 }
-                out[64 * slot + j] = s / SCALE;
+            }
+            for s in o.iter_mut() {
+                *s /= SCALE;
             }
         }
     }
 
     /// Downsampled synthesis (4.6.18.4.3): the lower 32 bands into 1024
     /// samples at the core rate, for SBR signalled at the core's rate.
-    fn synthesis_ds(v: &mut [f32], x: &[[[f32; 64]; 38]; 2], out: &mut [f32]) {
+    fn synthesis_ds(ch: &mut Channel, x: &[[[f32; 64]; 38]; 2], out: &mut [f32], _: &mut Lanes) {
         let st = statics();
         let c = &tab::QMF_WINDOW;
+        let (mut re, mut im) = ([0f32; 64], [0f32; 64]);
         for slot in 0..32 {
-            v.copy_within(0..576, 64);
-            let (re, im) = (&x[0][slot], &x[1][slot]);
-            for (n, vn) in v[..64].iter_mut().enumerate() {
-                let m = &st.syn_ds[n];
-                let mut s = 0f32;
-                for k in 0..32 {
-                    s += re[k] * m[k][0] - im[k] * m[k][1];
-                }
-                *vn = s;
+            let at = slide(&mut ch.v, &mut ch.v_off, 640, 64);
+            let v = &mut ch.v[at..at + 640];
+            let (xr, xi) = (&x[0][slot], &x[1][slot]);
+            let (pr, pi) = (&st.syn_pre.re, &st.syn_pre.im);
+            for k in 0..32 {
+                re[k] = xr[k] * pr[k] - xi[k] * pi[k];
+                im[k] = xr[k] * pi[k] + xi[k] * pr[k];
+            }
+            re[32..].fill(0.0);
+            im[32..].fill(0.0);
+            st.fft64.inverse(&mut re, &mut im);
+            let (qr, qi) = (&st.ds_post.re, &st.ds_post.im);
+            for n in 0..64 {
+                v[n] = re[n] * qr[n] - im[n] * qi[n];
             }
             for j in 0..32 {
                 let mut s = 0f32;
@@ -1618,7 +1692,7 @@ impl Sbr {
             self.ready = false;
         }
         for c in 0..nch {
-            Self::analysis(&mut self.ch[c], core[c]);
+            Self::analysis(&mut self.ch[c], core[c], &mut self.lanes);
             self.lf_gen(c);
             self.ch[c].ypos ^= 1;
             if self.start {
@@ -1648,9 +1722,9 @@ impl Sbr {
         } else {
             Self::synthesis
         };
-        synth(&mut self.ch[0].v, &self.x[0], out_l);
+        synth(&mut self.ch[0], &self.x[0], out_l, &mut self.lanes);
         if stereo {
-            synth(&mut self.ch[1].v, &self.x[1], out_r);
+            synth(&mut self.ch[1], &self.x[1], out_r, &mut self.lanes);
         }
     }
 }

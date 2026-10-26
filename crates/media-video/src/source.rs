@@ -225,6 +225,8 @@ pub(crate) struct Source {
     buf: Vec<u8>,
     pcm_i: Vec<i32>,
     pcm_f: Vec<f32>,
+    /// Decoded samples of the read in hand, kept for reuse.
+    scratch: Vec<f32>,
 }
 
 fn invalid(s: impl Into<String>) -> Error {
@@ -265,6 +267,44 @@ fn edit(trak: &[u8]) -> (u64, u64, Option<u64>) {
     (empty, 0, None)
 }
 
+/// Packets per read at most, and PCM bytes per read at most: one read is
+/// decoded at a time, so memory stays bounded whatever the chunk layout (an
+/// audio-only file may hold all its sound in one chunk).
+const READ_PACKETS: usize = 64;
+const READ_PCM_BYTES: usize = 256 << 10;
+
+/// `reads` cut into pieces of at most [`READ_PACKETS`] packets (compressed)
+/// or [`READ_PCM_BYTES`] of whole frames (PCM, where a chunk is one packet).
+fn bounded(reads: Vec<(u64, Vec<u32>)>, pcm_frame: Option<usize>) -> Vec<(u64, Vec<u32>)> {
+    let mut out = Vec::with_capacity(reads.len());
+    for (off, sizes) in reads {
+        match pcm_frame {
+            Some(frame) if frame > 0 => {
+                let step = (READ_PCM_BYTES / frame).max(1) * frame;
+                let mut at = off;
+                for &size in &sizes {
+                    let mut left = size as usize;
+                    while left > 0 {
+                        let n = left.min(step);
+                        out.push((at, vec![n as u32]));
+                        at += n as u64;
+                        left -= n;
+                    }
+                }
+            }
+            _ if sizes.len() > READ_PACKETS => {
+                let mut at = off;
+                for group in sizes.chunks(READ_PACKETS) {
+                    out.push((at, group.to_vec()));
+                    at += group.iter().map(|&s| u64::from(s)).sum::<u64>();
+                }
+            }
+            _ => out.push((off, sizes)),
+        }
+    }
+    out
+}
+
 impl Source {
     /// Open the track's decoder; compressed sound is decoded up to the
     /// first good packet, which settles the output rate and channels
@@ -302,7 +342,7 @@ impl Source {
             codec => return Err(invalid(format!("{codec} 소리는 아직 디코딩하지 않습니다"))),
         };
         let mut s = Source {
-            reads: sound::reads(layout, c)?,
+            reads: bounded(sound::reads(layout, c)?, sound::pcm_frame(&c.cfg)),
             next: 0,
             dec,
             use_,
@@ -318,6 +358,7 @@ impl Source {
             buf: Vec::new(),
             pcm_i: Vec::new(),
             pcm_f: Vec::new(),
+            scratch: Vec::new(),
         };
         match &s.dec {
             Dec::Pcm(_) => {
@@ -487,11 +528,14 @@ impl Source {
         }
         let mut pcm = std::mem::take(&mut self.primed);
         let more = if pcm.is_empty() {
+            pcm = std::mem::take(&mut self.scratch);
+            pcm.clear();
             self.decode_chunk(r, &mut pcm)?
         } else {
             true
         };
         if !more {
+            self.scratch = pcm;
             return Ok(false);
         }
         let mut frames = &pcm[..pcm.len() / ch * ch];
@@ -504,6 +548,7 @@ impl Source {
             *k -= take as u64;
         }
         out.extend_from_slice(frames);
+        self.scratch = pcm;
         Ok(true)
     }
 }

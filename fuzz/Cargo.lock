@@ -367,6 +367,7 @@ dependencies = [
  "audeniq-qc",
  "media-aac",
  "media-bits",
+ "media-dsp",
  "media-json",
  "media-mp3",
  "media-resample",

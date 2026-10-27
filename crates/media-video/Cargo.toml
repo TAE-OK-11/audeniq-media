@@ -10,6 +10,7 @@ license.workspace = true
 media-json.workspace = true
 media-aac.workspace = true
 media-bits.workspace = true
+media-dsp.workspace = true
 media-mp3.workspace = true
 media-resample.workspace = true
 audeniq-qc = { path = "../audeniq-qc" }

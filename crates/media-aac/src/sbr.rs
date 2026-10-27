@@ -364,7 +364,8 @@ impl Bands {
     fn master(h: &Header, k0: usize, k2: usize) -> Option<Vec<usize>> {
         if h.freq_scale == 0 {
             let dk = if h.alter_scale { 2 } else { 1 };
-            let n = 2 * ((k2 - k0) / (2 * dk));
+            // 2·NINT((k2 − k0) / 2dk): an even count, rounded.
+            let n = 2 * nint((k2 - k0) as f64 / (2 * dk) as f64) as usize;
             if n == 0 {
                 return None;
             }
@@ -426,6 +427,7 @@ impl Bands {
     /// The patches: from the goal subband 2.048 MHz / rate down, runs of
     /// low subbands (ending at an even distance below k0) copied up until
     /// kx + m is covered; a last patch narrower than 3 subbands is dropped.
+    /// Up to six patches (the conformance streams at 44.1 kHz need six).
     fn patches(
         master: &[usize],
         k0: usize,
@@ -468,7 +470,7 @@ impl Bands {
                 if patches.len() > 1 && patches.last()?.1 < 3 {
                     patches.pop();
                 }
-                return (1..=5).contains(&patches.len()).then_some(patches);
+                return (1..=6).contains(&patches.len()).then_some(patches);
             }
         }
         None
@@ -1599,16 +1601,37 @@ impl Sbr {
             ch.kx_prev = kx;
             ch.m_prev = m;
             ch.frame = None;
+            if ps && channels == 1 {
+                // Parametric stereo: two frames from the mono one, the
+                // right one through the second channel's synthesis.
+                let mut l: Box<Qmf> = Box::new([[[0.0; 64]; SLOTS]; 2]);
+                let mut r: Box<Qmf> = Box::new([[[0.0; 64]; SLOTS]; 2]);
+                // The hybrid filters' look-ahead: the lowest subbands 6
+                // slots on, already in the analysis buffer.
+                let mut ahead = [[[0f32; 2]; SLOTS]; 5];
+                for (q, row) in ahead.iter_mut().enumerate() {
+                    for (j, v) in row.iter_mut().enumerate() {
+                        let s = (j + ADJ + 6).min(SPAN - 1);
+                        *v = [ch.low[0][s][q], ch.low[1][s][q]];
+                    }
+                }
+                self.ps.apply(&x, &ahead, &mut l, &mut r);
+                let [c0, c1] = &mut self.ch;
+                if down {
+                    Self::synthesis_ds(c0, &l, out_l, &mut self.lanes);
+                    Self::synthesis_ds(c1, &r, out_r, &mut self.lanes);
+                } else {
+                    Self::synthesis(c0, &l, out_l, &mut self.lanes);
+                    Self::synthesis(c1, &r, out_r, &mut self.lanes);
+                }
+                continue;
+            }
             let out = if c == 0 { &mut *out_l } else { &mut *out_r };
             if down {
                 Self::synthesis_ds(ch, &x, out, &mut self.lanes);
             } else {
                 Self::synthesis(ch, &x, out, &mut self.lanes);
             }
-        }
-        if ps && channels == 1 {
-            let n = if down { 1024 } else { 2048 };
-            out_r[..n].copy_from_slice(&out_l[..n]);
         }
     }
 }

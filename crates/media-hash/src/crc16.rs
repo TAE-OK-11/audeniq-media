@@ -237,6 +237,7 @@ mod arm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{vec, vec::Vec};
 
     /// Bit-at-a-time definition, independent of the tables and folding.
     fn bitwise(data: &[u8]) -> u16 {

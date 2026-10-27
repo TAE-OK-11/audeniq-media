@@ -19,6 +19,7 @@ use crate::tables::{
     NUM_SWB_LONG, NUM_SWB_SHORT, SF_BITS, SF_CODES, SPECTRAL, SWB_LONG, SWB_SHORT,
 };
 use crate::{Error, RATES};
+use media_bits::BeWriter;
 
 /// Encoder delay: the first access unit decodes to this many samples of
 /// silence (MP4 edit lists skip it).
@@ -37,40 +38,6 @@ const ONLY_LONG: u8 = 0;
 const LONG_START: u8 = 1;
 const EIGHT_SHORT: u8 = 2;
 const LONG_STOP: u8 = 3;
-
-struct BitWriter {
-    out: Vec<u8>,
-    acc: u64,
-    n: u32,
-}
-
-impl BitWriter {
-    fn new() -> Self {
-        BitWriter {
-            out: Vec::with_capacity(2048),
-            acc: 0,
-            n: 0,
-        }
-    }
-    fn put(&mut self, bits: u32, v: u32) {
-        if bits == 0 {
-            return;
-        }
-        self.acc = (self.acc << bits) | (u64::from(v) & ((1u64 << bits) - 1));
-        self.n += bits;
-        while self.n >= 8 {
-            self.n -= 8;
-            self.out.push((self.acc >> self.n) as u8);
-        }
-    }
-    fn finish(mut self) -> Vec<u8> {
-        if self.n > 0 {
-            let pad = 8 - self.n;
-            self.put(pad, 0);
-        }
-        self.out
-    }
-}
 
 /// Codebook shape: (dimensions, signed, modulo, offset, largest |value|).
 fn shape(cb: usize) -> (usize, bool, i32, i32, i32) {
@@ -118,7 +85,7 @@ fn band_bits(q: &[i32], cb: usize) -> Option<u32> {
     Some(bits)
 }
 
-fn write_band(w: &mut BitWriter, q: &[i32], cb: usize) {
+fn write_band(w: &mut BeWriter, q: &[i32], cb: usize) {
     let (dims, signed, modulo, off, _) = shape(cb);
     let (codes, lens) = SPECTRAL[cb - 1];
     for t in q.chunks(dims) {
@@ -127,14 +94,14 @@ fn write_band(w: &mut BitWriter, q: &[i32], cb: usize) {
             let a = if cb == 11 { v.abs().min(16) } else { v.abs() };
             idx = idx * modulo + if signed { v + off } else { a };
         }
-        w.put(
+        w.put_u32(
             u32::from(lens[idx as usize]),
             u32::from(codes[idx as usize]),
         );
         if !signed {
             for &v in t {
                 if v != 0 {
-                    w.put(1, u32::from(v < 0));
+                    w.put_u32(1, u32::from(v < 0));
                 }
             }
         }
@@ -143,9 +110,9 @@ fn write_band(w: &mut BitWriter, q: &[i32], cb: usize) {
                 let a = v.unsigned_abs();
                 if a >= 16 {
                     let n = 31 - a.leading_zeros() - 4;
-                    w.put(n, (1 << n) - 1);
-                    w.put(1, 0);
-                    w.put(n + 4, a - (1 << (n + 4)));
+                    w.put_u32(n, (1 << n) - 1);
+                    w.put_u32(1, 0);
+                    w.put_u32(n + 4, a - (1 << (n + 4)));
                 }
             }
         }
@@ -177,6 +144,40 @@ impl Layout {
     }
     fn info_bits(&self) -> u32 {
         if self.short() { 15 } else { 11 }
+    }
+}
+
+/// What a frame's rate search has already measured, per (group, band):
+/// quantization noise and codebook bit costs by scalefactor. Neither depends
+/// on the SNR being tried, so the bisection reuses them.
+#[derive(Default)]
+struct Memo {
+    noise: Vec<Vec<(i32, f32)>>,
+    cost: Vec<Vec<(i32, [u32; 12])>>,
+}
+
+impl Memo {
+    fn reset(&mut self, n: usize) {
+        self.noise.resize_with(n, Vec::new);
+        self.cost.resize_with(n, Vec::new);
+        self.noise.iter_mut().for_each(Vec::clear);
+        self.cost.iter_mut().for_each(Vec::clear);
+    }
+
+    fn noise(
+        &mut self,
+        i: usize,
+        x: &[f32],
+        pow34: &[f32],
+        ranges: &[std::ops::Range<usize>],
+        sf: i32,
+    ) -> f32 {
+        if let Some(&(_, e)) = self.noise[i].iter().find(|(s, _)| *s == sf) {
+            return e;
+        }
+        let e = noise(x, pow34, ranges, sf);
+        self.noise[i].push((sf, e));
+        e
     }
 }
 
@@ -214,6 +215,8 @@ pub struct Encoder {
     ath_short: Vec<f32>,
     snr: f32,
     reservoir: i64,
+    /// Rate-search memos per channel, kept to reuse their allocations.
+    memos: Vec<Memo>,
 }
 
 fn ath_table(sample_rate: u32, offsets: &[u16], bands: usize, n: usize) -> Vec<f32> {
@@ -279,6 +282,7 @@ impl Encoder {
             ),
             snr: 20.0,
             reservoir: 0,
+            memos: Vec::new(),
         })
     }
 
@@ -534,19 +538,21 @@ impl Encoder {
         let fits = |coded: &[Coded]| {
             header + coded.iter().map(|c| i64::from(c.bits)).sum::<i64>() <= budget
         };
+        let mut memos = std::mem::take(&mut self.memos);
+        memos.resize_with(ch, Memo::default);
+        for m in &mut memos {
+            m.reset(n);
+        }
+        let mut code = |snr: f32| -> Vec<Coded> {
+            (0..ch)
+                .map(|c| self.code_channel(layout, &spec[c], &pow34[c], snr, &mut memos[c]))
+                .collect()
+        };
         // Widen the bracket until it holds the answer, then bisect.
-        let coded_lo: Vec<Coded> = spec
-            .iter()
-            .zip(&pow34)
-            .map(|(s, p)| self.code_channel(layout, s, p, lo))
-            .collect();
+        let coded_lo = code(lo);
         if fits(&coded_lo) {
             best = Some((lo, coded_lo));
-            let coded_hi: Vec<Coded> = spec
-                .iter()
-                .zip(&pow34)
-                .map(|(s, p)| self.code_channel(layout, s, p, hi))
-                .collect();
+            let coded_hi = code(hi);
             if fits(&coded_hi) {
                 best = Some((hi, coded_hi));
                 lo = hi;
@@ -561,11 +567,7 @@ impl Encoder {
                 break;
             }
             let mid = (lo + hi) / 2.0;
-            let coded: Vec<Coded> = spec
-                .iter()
-                .zip(&pow34)
-                .map(|(s, p)| self.code_channel(layout, s, p, mid))
-                .collect();
+            let coded = code(mid);
             if fits(&coded) {
                 best = Some((mid, coded));
                 lo = mid;
@@ -573,37 +575,31 @@ impl Encoder {
                 hi = mid;
             }
         }
-        let (snr, coded) = best.unwrap_or_else(|| {
-            (
-                -20.0,
-                spec.iter()
-                    .zip(&pow34)
-                    .map(|(s, p)| self.code_channel(layout, s, p, -20.0))
-                    .collect(),
-            )
-        });
+        let (snr, coded) = best.unwrap_or_else(|| (-20.0, code(-20.0)));
+        self.memos = memos;
         self.snr = snr;
-        let mut w = BitWriter::new();
+        let mut w = BeWriter::new();
         if ch == 1 {
-            w.put(3, 0);
-            w.put(4, 0);
+            w.put_u32(3, 0);
+            w.put_u32(4, 0);
             write_ics(&mut w, &coded[0], layout, true);
         } else {
-            w.put(3, 1);
-            w.put(4, 0);
-            w.put(1, 1); // common_window
+            w.put_u32(3, 1);
+            w.put_u32(4, 0);
+            w.put_u32(1, 1); // common_window
             write_ics_info(&mut w, layout);
-            w.put(2, u32::from(ms_any));
+            w.put_u32(2, u32::from(ms_any));
             if ms_any {
                 for &m in &ms {
-                    w.put(1, u32::from(m));
+                    w.put_u32(1, u32::from(m));
                 }
             }
             write_ics(&mut w, &coded[0], layout, false);
             write_ics(&mut w, &coded[1], layout, false);
         }
-        w.put(3, 7); // END
-        let au = w.finish();
+        w.put_u32(3, 7); // END
+        w.align();
+        let au = w.bytes;
         let used = au.len() as i64 * 8;
         self.reservoir =
             (self.reservoir + target - used).clamp(0, (6144 * ch as i64 - target).max(0));
@@ -612,7 +608,14 @@ impl Encoder {
 
     /// Scalefactors, codebooks and quantized values of one channel at a
     /// given SNR, with its bit count.
-    fn code_channel(&self, layout: &Layout, x: &[f32], pow34: &[f32], snr: f32) -> Coded {
+    fn code_channel(
+        &self,
+        layout: &Layout,
+        x: &[f32],
+        pow34: &[f32],
+        snr: f32,
+        memo: &mut Memo,
+    ) -> Coded {
         let bands = layout.bands;
         let n = layout.groups.len() * bands;
         let ath = if layout.short() {
@@ -669,14 +672,15 @@ impl Encoder {
                 let min_sf = (100.0 + (0.75 * peak.max(1e-9).log2() - 8191f32.log2()) / 0.1875)
                     .ceil()
                     .max(0.0) as i32;
+                let i = g * bands + b;
                 let (mut a, mut z) = (min_sf.min(255), 255);
-                if noise(x, pow34, &ranges, a) > allowed {
-                    sf[g * bands + b] = a;
+                if memo.noise(i, x, pow34, &ranges, a) > allowed {
+                    sf[i] = a;
                     continue;
                 }
                 while z - a > 1 {
                     let mid = (a + z) / 2;
-                    if noise(x, pow34, &ranges, mid) <= allowed {
+                    if memo.noise(i, x, pow34, &ranges, mid) <= allowed {
                         a = mid;
                     } else {
                         z = mid;
@@ -763,15 +767,26 @@ impl Encoder {
                     cost[b][0] = 0;
                     continue;
                 }
+                if let Some(&(_, c)) = memo.cost[i].iter().find(|(s, _)| *s == sf[i]) {
+                    cost[b] = c;
+                    continue;
+                }
                 buf.clear();
                 for r in layout.ranges(g, b) {
                     buf.extend_from_slice(&q[r]);
                 }
+                // Codebooks whose largest value is below the band's cannot
+                // code it.
+                let max = buf.iter().fold(0, |m, v| m.max(v.abs()));
                 for c in 1..12 {
+                    if shape(c).4 < max {
+                        continue;
+                    }
                     if let Some(v) = band_bits(&buf, c) {
                         cost[b][c] = v;
                     }
                 }
+                memo.cost[i].push((sf[i], cost[b]));
             }
             let (cbs, spectral, section) = sections(&cost, if layout.short() { 3 } else { 5 });
             cb[g * bands..g * bands + bands].copy_from_slice(&cbs);
@@ -861,12 +876,12 @@ fn sections(cost: &[[u32; 12]], len_field: u32) -> (Vec<u8>, u32, u32) {
     (cbs, spectral, section)
 }
 
-fn write_ics_info(w: &mut BitWriter, l: &Layout) {
-    w.put(1, 0);
-    w.put(2, u32::from(l.seq));
-    w.put(1, 0); // sine
+fn write_ics_info(w: &mut BeWriter, l: &Layout) {
+    w.put_u32(1, 0);
+    w.put_u32(2, u32::from(l.seq));
+    w.put_u32(1, 0); // sine
     if l.short() {
-        w.put(4, l.bands as u32);
+        w.put_u32(4, l.bands as u32);
         // scale_factor_grouping: bit set = window joins the previous group.
         let mut grouping = 0u32;
         for &(w0, n) in &l.groups {
@@ -874,17 +889,17 @@ fn write_ics_info(w: &mut BitWriter, l: &Layout) {
                 grouping |= 1 << (7 - win);
             }
         }
-        w.put(7, grouping);
+        w.put_u32(7, grouping);
     } else {
-        w.put(6, l.bands as u32);
-        w.put(1, 0); // predictor_data_present
+        w.put_u32(6, l.bands as u32);
+        w.put_u32(1, 0); // predictor_data_present
     }
 }
 
-fn write_ics(w: &mut BitWriter, c: &Coded, l: &Layout, info: bool) {
+fn write_ics(w: &mut BeWriter, c: &Coded, l: &Layout, info: bool) {
     let n = l.groups.len() * l.bands;
     let global = (0..n).find(|&i| c.cb[i] != 0).map_or(100, |i| c.sf[i]);
-    w.put(8, global as u32);
+    w.put_u32(8, global as u32);
     if info {
         write_ics_info(w, l);
     }
@@ -897,13 +912,13 @@ fn write_ics(w: &mut BitWriter, c: &Coded, l: &Layout, info: bool) {
             while e < l.bands && c.cb[g * l.bands + e] == cb {
                 e += 1;
             }
-            w.put(4, u32::from(cb));
+            w.put_u32(4, u32::from(cb));
             let mut run = (e - b) as u32;
             while run >= esc {
-                w.put(len_field, esc);
+                w.put_u32(len_field, esc);
                 run -= esc;
             }
-            w.put(len_field, run);
+            w.put_u32(len_field, run);
             b = e;
         }
     }
@@ -913,12 +928,12 @@ fn write_ics(w: &mut BitWriter, c: &Coded, l: &Layout, info: bool) {
             continue;
         }
         let d = (c.sf[i] - prev + 60) as usize;
-        w.put(u32::from(SF_BITS[d]), SF_CODES[d]);
+        w.put_u32(u32::from(SF_BITS[d]), SF_CODES[d]);
         prev = c.sf[i];
     }
-    w.put(1, 0); // pulse
-    w.put(1, 0); // tns
-    w.put(1, 0); // gain control
+    w.put_u32(1, 0); // pulse
+    w.put_u32(1, 0); // tns
+    w.put_u32(1, 0); // gain control
     let mut buf = Vec::with_capacity(1024);
     for g in 0..l.groups.len() {
         for b in 0..l.bands {

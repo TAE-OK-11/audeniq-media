@@ -2,6 +2,7 @@ name: FLAC levels on the IETF corpus
 on:
   push:
     paths:
+      - crates/media-bits/**
       - crates/media-hash/**
       - crates/media-json/**
       - crates/audeniq-qc/src/flac.rs
@@ -33,7 +34,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg time
           grep -m4 -E "model name|CPU implementer|CPU part" /proc/cpuinfo || true
-      - run: cargo build --release --locked
+      - run: cargo build -p audeniq-qc --release --locked
       - run: cargo build --manifest-path round12/Cargo.toml --release --locked --target-dir round12/target
       - name: CC0 corpus (IETF CELLAR FLAC test files, supported formats) as WAV
         run: |

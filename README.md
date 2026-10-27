@@ -6,21 +6,25 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
 
 - 오디오: 무손실 디코딩/FLAC 정규화, LUFS·True Peak QC, 지문 입력 — [docs/audio/README.md](docs/audio/README.md)
 - 이미지·PDF: 메타데이터, 색상·출처 보고, QR, OCR, 업로드 정화, PDF — [docs/photo/README.md](docs/photo/README.md)
-- 뮤직비디오: MP4/MOV 분석(FFprobe 필드), 소리 디코드·음량 측정(자체 AAC 디코더), 배급 규격 검사 — [docs/video/README.md](docs/video/README.md)
+- 뮤직비디오: MP4/MOV 분석(FFprobe 필드), 소리 디코드·음량 측정(자체 AAC·HE-AAC·MP3 디코더), 배급 규격 검사, 배급 사양 소리 변환 — [docs/video/README.md](docs/video/README.md)
 - Dolby Atmos: ADM BWF 마스터(BW64/RF64) 읽기와 공간 음향 납품 검사 — [docs/atmos/README.md](docs/atmos/README.md)
 
 ## 구성
 
 | 경로 | 역할 |
 |---|---|
-| `crates/media-hash` | **공통** MD5·SHA-256·CRC32 (SHA-NI/ARMv8 SHA2, PCLMUL/VPCLMUL/PMULL 런타임 선택), MD5+SHA-256 융합 경로 |
+| `crates/media-hash` | **공통** MD5·SHA-256·CRC32·CRC16·CRC8 (SHA-NI/ARMv8 SHA2, PCLMUL/VPCLMUL/PMULL 런타임 선택), MD5+SHA-256 융합 경로 |
+| `crates/media-bits` | **공통** 비트 읽기(MSB 캐시 워드·LSB)·쓰기·허프만 표 조회 — FLAC·ALAC·TTA·WavPack·AAC·SBR·MP3·H.264/HEVC SPS가 함께 씀 |
+| `crates/media-dsp` | **공통** FFT·DCT-IV(여러 변환을 벡터 레인으로 한 번에)·dot·필터뱅크 이력 버퍼, x86-64 AVX2 런타임 선택·AArch64 NEON |
 | `crates/media-json` | **공통** JSON 값·출력·파서 — serde_json 1.0과 바이트 단위로 같은 출력, 외부 크레이트 없음 |
 | `crates/audeniq-qc` | 오디오 엔진 라이브러리·명령행(`cli`)과 `audeniq-qc` 바이너리 |
 | `crates/audeniq-qc-tools` | 오디오 검증·벤치마크 도구 (`audeniq-qc-tools`) |
 | `crates/audeniq-photo` | 이미지·PDF 통합 API |
 | `crates/photo-cli` | photo 명령행 라이브러리와 `audeniq-photo` 바이너리 |
 | `crates/media-video` | 뮤직비디오 MP4/MOV 분석·소리 측정·배급 검사 (`audeniq-music video …`) |
-| `crates/media-aac` | AAC-LC 디코더 (뮤직비디오 소리 측정) |
+| `crates/media-aac` | AAC-LC 디코더·인코더, HE-AAC(SBR)·HE-AACv2(PS) 디코드 (뮤직비디오 소리) |
+| `crates/media-mp3` | MP3(MPEG-1/2/2.5 Layer III) 디코더 (뮤직비디오 소리) |
+| `crates/media-resample` | 폴리페이즈 리샘플러(카이저 192탭)·스테레오 다운믹스 |
 | `crates/media-adm` | Dolby Atmos ADM BWF 분석·납품 검사 (`audeniq-music atmos …`) |
 | `crates/audeniq-music` | 백엔드가 설치하는 단일 바이너리 `audeniq-music` (`qc …`, `photo …`, `video …`, `atmos …`) |
 | `crates/photo-bench` | 외부 도구 대비 벤치마크 (`audeniq-photo-bench`) |
@@ -30,6 +34,9 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
 
 - **해시**: qc의 `src/{md5,sha256,crc32,hash_fused}.rs`와 photo의 `photo-hash` 복사본 → `media-hash` 한 벌.
   photo의 PNG CRC·zlib·PDF 암호 경로와 오디오의 PCM SHA-256·FLAC MD5·TTA CRC가 같은 커널을 씁니다.
+- **비트스트림**: qc의 `msb.rs`·`bits.rs`(LSB 리더·쓰기), AAC·MP3·비디오 SPS 파서가 각자 갖던 비트 리더·허프만 트리,
+  AAC 인코더의 비트 쓰기 → `media-bits` 한 벌. FLAC CRC16·CRC8은 `media-hash`로.
+- **신호 처리**: AAC IMDCT·인코더 MDCT, SBR QMF, MP3 IMDCT·합성, 리샘플러가 `media-dsp`의 FFT·DCT-IV·dot·이력 버퍼를 씁니다.
 - **JSON**: qc의 `src/json.rs` → `media-json`. photo의 serde_json 의존을 없앴습니다(출력은 바이트 단위로 동일).
 - **툴체인·잠금·CI**: `rust-toolchain.toml`(1.98.1), `Cargo.lock`, 워크스페이스 린트·프로필을 하나로.
 

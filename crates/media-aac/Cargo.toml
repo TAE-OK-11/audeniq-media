@@ -1,11 +1,15 @@
 [package]
 name = "media-aac"
-description = "AAC-LC decoder and encoder (ISO/IEC 14496-3) for AUDENIQ music-video sound checks and deliveries"
+description = "AAC-LC decoder and encoder, HE-AAC (SBR) and HE-AACv2 (PS) decoding (ISO/IEC 14496-3) for AUDENIQ music-video sound checks and deliveries"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# Codebook and band tables are transcribed from FFmpeg (LGPL).
+# Codebook, band, SBR and PS tables are transcribed from FFmpeg (LGPL).
 license = "LGPL-2.1-or-later"
+
+[dependencies]
+media-bits.workspace = true
+media-dsp.workspace = true
 
 [lints]
 workspace = true

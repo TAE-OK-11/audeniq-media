@@ -35,24 +35,6 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// Dot product in eight independent lanes, which the compiler vectorizes.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut lanes = [0f32; 8];
-    for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-        for i in 0..8 {
-            lanes[i] += x[i] * y[i];
-        }
-    }
-    let tail: f32 = a
-        .chunks_exact(8)
-        .remainder()
-        .iter()
-        .zip(b.chunks_exact(8).remainder())
-        .map(|(x, y)| x * y)
-        .sum();
-    lanes.iter().sum::<f32>() + tail
-}
-
 pub struct Resampler {
     channels: usize,
     up: usize,
@@ -157,22 +139,49 @@ impl Resampler {
         // Buffered frames start at input frame `base - (HALF_TAPS - 1)`.
         let frames = self.buf[0].len() as u64;
         let target = self.output_len(self.in_frames);
-        loop {
-            if last && self.out_frames >= target {
-                break;
-            }
-            let t = self.pos * self.down as u64; // in up-steps
+        // Where output frame `pos` reads: its taps and first input frame,
+        // or `None` when its input is not all buffered yet.
+        let at = |pos: u64, base: u64| {
+            let t = pos * self.down as u64; // in up-steps
             let centre = t / self.up as u64; // input frame at or before the instant
             let phase = (t % self.up as u64) as usize;
             // Taps cover input frames centre - (HALF_TAPS-1) ..= centre + HALF_TAPS;
             // buf[k] holds input frame base - (HALF_TAPS-1) + k.
-            let first = (centre - self.base) as usize;
-            if first as u64 + width as u64 > frames {
+            let first = (centre - base) as usize;
+            (first as u64 + width as u64 <= frames).then_some((phase * width, first))
+        };
+        loop {
+            if last && self.out_frames >= target {
                 break;
             }
-            let h = &self.taps[phase * width..phase * width + width];
-            for b in &self.buf {
-                out.push(dot(h, &b[first..first + width]));
+            // Stereo, four frames at a time when all four are ready.
+            if let [l, r] = &self.buf[..]
+                && (!last || self.out_frames + 4 <= target)
+                && let Some(p3) = at(self.pos + 3, self.base)
+            {
+                let ps = [0, 1, 2].map(|k| at(self.pos + k, self.base).unwrap());
+                let ps = [ps[0], ps[1], ps[2], p3];
+                let h = ps.map(|(t, _)| &self.taps[t..t + width]);
+                let ls = ps.map(|(_, f)| &l[f..f + width]);
+                let rs = ps.map(|(_, f)| &r[f..f + width]);
+                for (a, b) in media_dsp::dot2x4(h, ls, rs) {
+                    out.extend([a, b]);
+                }
+                self.pos += 4;
+                self.out_frames += 4;
+                continue;
+            }
+            let Some((t, first)) = at(self.pos, self.base) else {
+                break;
+            };
+            let h = &self.taps[t..t + width];
+            if let [l, r] = &self.buf[..] {
+                let (l, r) = media_dsp::dot2(h, &l[first..first + width], &r[first..first + width]);
+                out.extend([l, r]);
+            } else {
+                for b in &self.buf {
+                    out.push(media_dsp::dot(h, &b[first..first + width]));
+                }
             }
             self.pos += 1;
             self.out_frames += 1;
@@ -204,8 +213,8 @@ pub fn downmix_stereo(input: &[f32], layout: &[&str]) -> Vec<f32> {
     let gains: Vec<(f32, f32)> = layout
         .iter()
         .map(|n| match *n {
-            "L" | "FL" => (1.0, 0.0),
-            "R" | "FR" => (0.0, 1.0),
+            "L" | "FL" | "FLC" => (1.0, 0.0),
+            "R" | "FR" | "FRC" => (0.0, 1.0),
             "C" | "FC" | "M" if ch == 1 => (1.0, 1.0),
             "C" | "FC" => (k, k),
             "Ls" | "SL" | "BL" | "Lss" | "Lrs" => (k, 0.0),

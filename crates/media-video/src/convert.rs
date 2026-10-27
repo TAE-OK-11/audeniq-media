@@ -5,17 +5,20 @@
 //! Every track but the sound (video, timecode, captions) is copied sample
 //! for sample: the bytes and the sample tables that describe them (`stsd`,
 //! `stts`, `ctts`, `stss`, `sdtp`, …) are kept, only `stsc` and the chunk
-//! offsets are rewritten. The sound track is decoded (AAC with `media-aac`,
-//! PCM directly), cut to its edit list, folded to stereo, resampled
-//! (`media-resample`) and coded again: AAC-LC (`media_aac::encoder`) or
-//! 24-bit PCM. Other sound tracks are dropped. The output has `moov` first
-//! and the tracks interleaved in half-second chunks.
+//! offsets are rewritten. The sound ([`crate::source`]: the sound track, a
+//! mono left/right track pair, or picked channels) is decoded, cut to its
+//! edit list, folded to stereo, resampled (`media-resample`) and coded
+//! again: AAC-LC (`media_aac::encoder`) or 24-bit PCM. Other sound tracks
+//! are dropped. The output has `moov` first and the tracks interleaved in
+//! half-second chunks.
 use crate::Error;
 use crate::boxes::{child, children, path, u16_at, u32_at, u64_at};
-use crate::sound::{self, Chosen};
+use crate::sound;
+use crate::source::{Mix, Pick, Plan, Use};
 use crate::track;
+use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
@@ -36,6 +39,9 @@ pub struct Options {
     pub container: Container,
     pub codec: Codec,
     pub sample_rate: u32,
+    /// Source channels to use (one-based across all sound tracks in file
+    /// order); `None` lets [`crate::source::plan`] decide.
+    pub pick: Option<Pick>,
 }
 
 /// Named delivery targets. Stereo 48 kHz throughout.
@@ -63,6 +69,7 @@ pub fn preset(name: &str) -> Option<Options> {
         container,
         codec,
         sample_rate: 48000,
+        pick: None,
     })
 }
 
@@ -84,6 +91,12 @@ media_json::json_struct!(SourceSound {
 pub struct Converted {
     pub container: String,
     pub source_sound: SourceSound,
+    /// How the source channels were used: `mono`, `stereo`, `downmix`,
+    /// `dual-mono` (two mono tracks as left and right) or `channels`
+    /// (picked, or the first two of discrete channels).
+    pub mapping: String,
+    /// (track id, one-based channel) of each source channel used.
+    pub source_channels: Vec<[u32; 2]>,
     pub codec_name: String,
     pub sample_rate: u32,
     pub channels: u32,
@@ -92,7 +105,7 @@ pub struct Converted {
     /// Sound frames presented and their length in seconds.
     pub frames: u64,
     pub duration: f64,
-    /// Track ids copied untouched, and sound tracks dropped.
+    /// Track ids copied untouched, and sound tracks not used.
     pub copied_tracks: Vec<u32>,
     pub dropped_tracks: Vec<u32>,
     /// Samples beyond full scale after downmix and resampling (PCM clips
@@ -103,6 +116,8 @@ pub struct Converted {
 media_json::json_struct!(Converted {
     container,
     source_sound,
+    mapping,
+    source_channels,
     codec_name,
     sample_rate,
     channels,
@@ -162,8 +177,85 @@ struct Out {
 enum Data {
     /// Source file offsets, one per sample.
     Copy(Vec<u64>),
-    /// Coded here.
-    Owned(Vec<u8>),
+    /// Coded here, back to back in the spill file.
+    Spilled,
+}
+
+/// The coded sound, written to a hidden file beside the output as it is
+/// made and removed afterwards, so memory stays flat however long the
+/// sound is; the bytes later move into `mdat` file to file.
+struct Spill {
+    path: PathBuf,
+    w: BufWriter<File>,
+    /// The first write error, reported once the sink is done.
+    error: Option<std::io::Error>,
+}
+
+impl Spill {
+    fn new(output: &Path) -> Result<Spill, Error> {
+        let name = output
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path = output.with_file_name(format!(".{name}.{}.sound", std::process::id()));
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Spill {
+            path,
+            w: BufWriter::with_capacity(1 << 18, file),
+            error: None,
+        })
+    }
+
+    fn write(&mut self, b: &[u8]) {
+        if self.error.is_none()
+            && let Err(e) = self.w.write_all(b)
+        {
+            self.error = Some(e);
+        }
+    }
+
+    /// The spilled bytes, readable from the start.
+    fn file(&mut self) -> Result<&File, Error> {
+        if let Some(e) = self.error.take() {
+            return Err(e.into());
+        }
+        self.w.flush()?;
+        Ok(self.w.get_ref())
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `len` bytes of `src` from `start` appended to `w`: file to file in the
+/// kernel (`copy_file_range`) where the platform has it.
+fn copy_range(src: &File, start: u64, len: u64, w: &mut BufWriter<File>) -> Result<(), Error> {
+    let mut src = src;
+    src.seek(SeekFrom::Start(start))?;
+    let copied = std::io::copy(&mut src.take(len), w)?;
+    if copied != len {
+        return Err(invalid("source ends inside a sample"));
+    }
+    Ok(())
+}
+
+/// 24-bit little-endian PCM of `v` (full scale ±1), rounded half away from
+/// zero and clamped. `v · 2²³` is exact in f64 and adding ½ to it is too,
+/// or rounds the same way, so the truncation equals `round()` without the
+/// library call.
+#[inline]
+fn pcm24(v: f32) -> [u8; 3] {
+    let x = f64::from(v) * 8_388_608.0;
+    let s = ((x + 0.5f64.copysign(x)) as i32).clamp(-8_388_608, 8_388_607);
+    let b = s.to_le_bytes();
+    [b[0], b[1], b[2]]
 }
 
 enum Trak {
@@ -185,174 +277,53 @@ struct SoundTrak {
 /// One interleaved chunk: track index, first sample, samples.
 type Chunk = (usize, usize, usize);
 
-/// The edit that presents the source sound: leading empty edits (movie
-/// timescale) and the first media edit (media time, duration in movie
-/// timescale; `None` for the rest of the media).
-fn sound_edit(trak: &[u8]) -> (u64, u64, Option<u64>) {
-    let Some(elst) = path(trak, &[b"edts", b"elst"]) else {
-        return (0, 0, None);
-    };
-    let v1 = elst.first() == Some(&1);
-    let n = u32_at(elst, 4).unwrap_or(0) as usize;
-    let w = if v1 { 20 } else { 12 };
-    let mut empty = 0u64;
-    for i in 0..n.min(64) {
-        let at = 8 + i * w;
-        let (dur, time) = if v1 {
-            (u64_at(elst, at), u64_at(elst, at + 8).map(|t| t as i64))
-        } else {
-            (
-                u32_at(elst, at).map(u64::from),
-                u32_at(elst, at + 4).map(|t| i64::from(t as i32)),
-            )
-        };
-        let (Some(dur), Some(time)) = (dur, time) else {
-            break;
-        };
-        if time < 0 {
-            empty = empty.saturating_add(dur);
-        } else {
-            return (empty, time as u64, (dur > 0).then_some(dur));
-        }
-    }
-    (empty, 0, None)
-}
-
-/// Decoded source sound: frames pass through `skip`, then at most `keep`,
-/// folded to stereo, resampled and handed to `sink` in blocks.
-struct Pipe<'a> {
-    skip: u64,
-    keep: Option<u64>,
-    layout: Vec<&'static str>,
-    resampler: media_resample::Resampler,
-    sink: &'a mut dyn FnMut(&[f32]),
-    block: Vec<f32>,
-}
-
-impl Pipe<'_> {
-    fn push(&mut self, pcm: &[f32]) {
-        let ch = self.layout.len();
-        let mut frames = &pcm[..pcm.len() / ch * ch];
-        let skip = (self.skip as usize).min(frames.len() / ch);
-        frames = &frames[skip * ch..];
-        self.skip -= skip as u64;
-        if let Some(k) = &mut self.keep {
-            let take = (*k as usize).min(frames.len() / ch);
-            frames = &frames[..take * ch];
-            *k -= take as u64;
-        }
-        if frames.is_empty() {
-            return;
-        }
-        let stereo = media_resample::downmix_stereo(frames, &self.layout);
-        self.block.clear();
-        self.resampler.push(&stereo, &mut self.block);
-        (self.sink)(&self.block);
-    }
-
-    fn finish(&mut self) {
-        self.block.clear();
-        self.resampler.finish(&mut self.block);
-        (self.sink)(&self.block);
-    }
-}
-
-/// Channel names of a PCM source in file order.
-fn pcm_layout(channels: u32) -> Option<Vec<&'static str>> {
-    Some(match channels {
-        1 => vec!["C"],
-        2 => vec!["L", "R"],
-        6 => vec!["L", "R", "C", "LFE", "Ls", "Rs"],
-        _ => return None,
-    })
-}
-
-fn decode_sound<R: Read + Seek>(
+/// Decode the planned sound with its edit lists applied, fold it to stereo,
+/// resample it to `out_rate` and hand it to `sink` in blocks. Decoding runs
+/// on its own thread, a few blocks ahead of the resampling and `sink` here
+/// (the encoder or the PCM packer), so the two halves overlap.
+fn decode_sound<R: Read + Seek + Send>(
     r: &mut R,
     layout: &crate::file::Layout,
-    c: &Chosen,
+    plan: &Plan,
     movie_timescale: u32,
     out_rate: u32,
     sink: &mut dyn FnMut(&[f32]),
 ) -> Result<(), Error> {
-    let frame = sound::pcm_frame(&c.cfg);
-    let mut aac = match (c.cfg.codec.as_str(), frame) {
-        ("aac", _) => Some(
-            media_aac::Decoder::new(&c.cfg.asc)
-                .map_err(|e| invalid(format!("AAC를 디코딩할 수 없습니다: {e}")))?,
-        ),
-        (_, Some(_)) => None,
-        (codec, None) => return Err(invalid(format!("{codec} 소리는 아직 변환하지 않습니다"))),
-    };
-    let (rate, names) = match &aac {
-        Some(d) => (d.config.sample_rate, d.layout().to_vec()),
-        None => (
-            c.cfg.sample_rate,
-            pcm_layout(c.cfg.channels).ok_or_else(|| {
-                invalid(format!("{}채널 PCM은 변환하지 않습니다", c.cfg.channels))
-            })?,
-        ),
-    };
-    if rate == 0 || names.is_empty() {
-        return Err(invalid("소리 트랙의 샘플레이트·채널을 알 수 없습니다"));
-    }
-    let mdhd = path(c.trak, &[b"mdia", b"mdhd"]).ok_or_else(|| invalid("mdhd"))?;
-    let media_ts = if mdhd.first() == Some(&1) {
-        u32_at(mdhd, 20)
-    } else {
-        u32_at(mdhd, 12)
-    }
-    .filter(|&t| t > 0)
-    .ok_or_else(|| invalid("mdhd timescale"))?;
-    let (empty, media_time, dur) = sound_edit(c.trak);
-    let mt = u64::from(movie_timescale.max(1));
-    let rescale = |v: u64, from: u64| (u128::from(v) * u128::from(rate) / u128::from(from)) as u64;
-    let lead = rescale(empty, mt);
-    let mut pipe = Pipe {
-        skip: rescale(media_time, u64::from(media_ts)),
-        keep: dur.map(|d| rescale(d, mt)),
-        layout: names,
-        resampler: media_resample::Resampler::new(rate, out_rate, 2),
-        sink,
-        block: Vec::new(),
-    };
-    if lead > 0 {
-        let ch = pipe.layout.len();
-        let silence = vec![0f32; (lead as usize).min(rate as usize * 60) * ch];
-        let (skip, keep) = (pipe.skip, pipe.keep);
-        (pipe.skip, pipe.keep) = (0, None);
-        pipe.push(&silence);
-        (pipe.skip, pipe.keep) = (skip, keep);
-    }
-    let (mut buf, mut pcm_f, mut pcm_i) = (Vec::new(), Vec::new(), Vec::new());
-    for (off, sizes) in sound::reads(layout, c)? {
-        let len: usize = sizes.iter().map(|&s| s as usize).sum();
-        buf.resize(len, 0);
-        r.seek(SeekFrom::Start(off))?;
-        r.read_exact(&mut buf)?;
-        let mut at = 0;
-        for &s in &sizes {
-            let packet = &buf[at..at + s as usize];
-            at += s as usize;
-            pcm_f.clear();
-            match &mut aac {
-                Some(d) => {
-                    if d.decode(packet, &mut pcm_f).is_err() {
-                        // A damaged packet becomes silence; timing holds.
-                        pcm_f.clear();
-                        pcm_f.resize(1024 * d.channels(), 0.0);
+    let mut mix = Mix::open(r, layout, plan, movie_timescale, Use::Convert)?;
+    let names = mix.names();
+    let mut resampler = media_resample::Resampler::new(mix.rate(), out_rate, 2);
+    let mut block = Vec::new();
+    std::thread::scope(|scope| {
+        let (full, filled) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        let (spare, spares) = std::sync::mpsc::channel::<Vec<f32>>();
+        let decoder = scope.spawn(move || -> Result<(), Error> {
+            let mut pcm = Vec::new();
+            while mix.pull(r, &mut pcm)? {
+                if !pcm.is_empty() {
+                    let next = spares.try_recv().unwrap_or_default();
+                    if full.send(std::mem::replace(&mut pcm, next)).is_err() {
+                        break;
                     }
-                }
-                None => {
-                    pcm_i.clear();
-                    sound::pcm_to_i32(&c.cfg.codec, packet, &mut pcm_i);
-                    pcm_f.extend(pcm_i.iter().map(|&v| v as f32 / 2_147_483_648.0));
+                    pcm.clear();
                 }
             }
-            pipe.push(&pcm_f);
+            Ok(())
+        });
+        for pcm in filled {
+            block.clear();
+            if names.len() == 2 {
+                resampler.push(&pcm, &mut block);
+            } else {
+                resampler.push(&media_resample::downmix_stereo(&pcm, &names), &mut block);
+            }
+            sink(&block);
+            let _ = spare.send(pcm);
         }
-    }
-    pipe.finish();
+        decoder.join().expect("sound decoder thread")
+    })?;
+    block.clear();
+    resampler.finish(&mut block);
+    sink(&block);
     Ok(())
 }
 
@@ -631,7 +602,10 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
     if opts.container == Container::Mp4 && opts.codec == Codec::Pcm24 {
         return Err(Error::Limit("24-bit PCM goes in .mov, not .mp4".into()));
     }
-    let mut f = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(input)?);
+    let mut f = std::io::BufReader::with_capacity(1 << 16, File::open(input)?);
+    // Sound reads go through their own small buffer (see `READ_BUFFER`); the
+    // large one serves the video copy, read in long runs.
+    let mut sound_in = std::io::BufReader::with_capacity(crate::READ_BUFFER, File::open(input)?);
     let size = f.seek(SeekFrom::End(0))?;
     let layout = crate::file::walk(&mut f, size)?;
     let moov = layout
@@ -646,7 +620,10 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
     let movie_ts = u32_at(mvhd, if mvhd_v1 { 20 } else { 12 })
         .filter(|&t| t > 0)
         .ok_or_else(|| invalid("mvhd timescale"))?;
-    let chosen = sound::choose(&moov).ok_or_else(|| invalid("소리 트랙이 없습니다"))?;
+    let plan =
+        crate::source::plan(&moov, opts.pick)?.ok_or_else(|| invalid("소리 트랙이 없습니다"))?;
+    let chosen = &plan.tracks[0];
+    let merged: Vec<u32> = plan.tracks.iter().map(|c| c.id).collect();
     let source_sound = SourceSound {
         track_id: chosen.id,
         codec_name: chosen.cfg.codec.clone(),
@@ -678,9 +655,12 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
                 timescale: opts.sample_rate,
                 sizes: Vec::new(),
                 times: Vec::new(),
-                data: Data::Owned(Vec::new()),
+                data: Data::Spilled,
                 trak: Trak::Copy(Vec::new()),
             });
+            continue;
+        }
+        if merged.contains(&tr.id) {
             continue;
         }
         if matches!(tr.kind, track::Kind::Audio(..)) {
@@ -715,70 +695,74 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
     }
     let sound_at = sound_at.ok_or_else(|| invalid("sound track"))?;
 
-    // The new sound.
+    // The new sound, into the spill file.
+    let mut spill = Spill::new(output)?;
     let mut over = 0u64;
     let mut frames = 0u64;
-    let (bytes_per_frame, units, pcm, asc) = match opts.codec {
+    let mut unit_sizes: Vec<u32> = Vec::new();
+    let (bytes_per_frame, asc) = match opts.codec {
         Codec::Aac(bit_rate) => {
             let mut enc = media_aac::encoder::Encoder::new(opts.sample_rate, 2, bit_rate)
                 .map_err(|e| Error::Limit(e.to_string()))?;
-            let mut units = Vec::new();
+            let mut put = |units: Vec<Vec<u8>>, spill: &mut Spill| {
+                for u in units {
+                    unit_sizes.push(u.len() as u32);
+                    spill.write(&u);
+                }
+            };
             decode_sound(
-                &mut f,
+                &mut sound_in,
                 &layout,
-                &chosen,
+                &plan,
                 movie_ts,
                 opts.sample_rate,
                 &mut |b: &[f32]| {
                     over += b.iter().filter(|v| v.abs() > 1.0).count() as u64;
                     frames += (b.len() / 2) as u64;
-                    units.extend(enc.push(b));
+                    put(enc.push(b), &mut spill);
                 },
             )?;
-            units.extend(enc.finish());
-            (None, units, Vec::new(), enc.asc().to_vec())
+            put(enc.finish(), &mut spill);
+            (None, enc.asc().to_vec())
         }
         Codec::Pcm24 => {
-            let mut pcm = Vec::new();
+            let mut bytes = Vec::new();
             decode_sound(
-                &mut f,
+                &mut sound_in,
                 &layout,
-                &chosen,
+                &plan,
                 movie_ts,
                 opts.sample_rate,
                 &mut |b: &[f32]| {
                     frames += (b.len() / 2) as u64;
-                    for &v in b {
-                        if v.abs() > 1.0 {
-                            over += 1;
-                        }
-                        let s = (f64::from(v) * 8_388_608.0)
-                            .round()
-                            .clamp(-8_388_608.0, 8_388_607.0)
-                            as i32;
-                        pcm.extend(&s.to_le_bytes()[..3]);
-                    }
+                    over += b.iter().filter(|v| v.abs() > 1.0).count() as u64;
+                    bytes.clear();
+                    bytes.extend(b.iter().flat_map(|&v| pcm24(v)));
+                    spill.write(&bytes);
                 },
             )?;
-            (Some(6u32), Vec::new(), pcm, Vec::new())
+            (Some(6u32), Vec::new())
         }
     };
+    let spilled = spill.file()?;
     if frames == 0 {
         return Err(invalid("소리 트랙이 비어 있습니다"));
     }
     let (priming, media_frames) = match opts.codec {
-        Codec::Aac(_) => (media_aac::encoder::DELAY as u64, units.len() as u64 * 1024),
+        Codec::Aac(_) => (
+            media_aac::encoder::DELAY as u64,
+            unit_sizes.len() as u64 * 1024,
+        ),
         Codec::Pcm24 => (0, frames),
     };
-    let max_unit = units.iter().map(Vec::len).max().unwrap_or(0) as u32;
+    let max_unit = unit_sizes.iter().copied().max().unwrap_or(0);
     let entry = sample_entry(opts, &asc, max_unit);
     {
         let o = &mut outs[sound_at];
         match opts.codec {
             Codec::Aac(_) => {
-                o.sizes = units.iter().map(|u| u.len() as u32).collect();
-                o.times = (0..units.len() as u64).map(|i| i * 1024).collect();
-                o.data = Data::Owned(units.concat());
+                o.times = (0..unit_sizes.len() as u64).map(|i| i * 1024).collect();
+                o.sizes = unit_sizes;
             }
             Codec::Pcm24 => {
                 let blocks = frames.div_ceil(PCM_BLOCK);
@@ -786,7 +770,6 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
                     .map(|b| ((frames - b * PCM_BLOCK).min(PCM_BLOCK) * 6) as u32)
                     .collect();
                 o.times = (0..blocks).map(|b| b * PCM_BLOCK).collect();
-                o.data = Data::Owned(pcm);
             }
         }
         o.trak = Trak::Sound(Box::new(sound_trak(
@@ -913,40 +896,40 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
     let moov_out = build(base);
     debug_assert_eq!(moov_out.len(), probe.len());
 
-    let file = std::fs::File::create(output)?;
+    let file = File::create(output)?;
     let mut w = BufWriter::with_capacity(1 << 20, file);
     w.write_all(&ftyp)?;
     w.write_all(&moov_out)?;
     w.write_all(&1u32.to_be_bytes())?;
     w.write_all(b"mdat")?;
     w.write_all(&(mdat_len + 16).to_be_bytes())?;
-    let mut buf = Vec::new();
+    let src = f.into_inner();
+    // Where each sample of the spilled sound starts.
+    let mut spill_at = 0u64;
     for &(_, (ti, first, n)) in &chunks {
         let o = &outs[ti];
         match &o.data {
-            Data::Owned(bytes) => {
-                let start: u64 = o.sizes[..first].iter().map(|&s| u64::from(s)).sum();
+            Data::Spilled => {
+                // Chunks of the sound come in order.
                 let len: u64 = o.sizes[first..first + n]
                     .iter()
                     .map(|&s| u64::from(s))
                     .sum();
-                w.write_all(&bytes[start as usize..(start + len) as usize])?;
+                copy_range(spilled, spill_at, len, &mut w)?;
+                spill_at += len;
             }
             Data::Copy(offsets) => {
-                // Runs of samples stored back to back read in one go.
+                // Runs of samples stored back to back go in one copy.
                 let mut i = first;
                 while i < first + n {
                     let start = offsets[i];
                     let mut len = u64::from(o.sizes[i]);
                     let mut j = i + 1;
-                    while j < first + n && offsets[j] == start + len && len < 16 << 20 {
+                    while j < first + n && offsets[j] == start + len {
                         len += u64::from(o.sizes[j]);
                         j += 1;
                     }
-                    buf.resize(len as usize, 0);
-                    f.seek(SeekFrom::Start(start))?;
-                    f.read_exact(&mut buf)?;
-                    w.write_all(&buf)?;
+                    copy_range(&src, start, len, &mut w)?;
                     i = j;
                 }
             }
@@ -965,6 +948,8 @@ pub fn convert(input: &Path, output: &Path, opts: &Options) -> Result<Converted,
         }
         .into(),
         source_sound,
+        mapping: plan.kind.into(),
+        source_channels: plan.source_channels(),
         codec_name: codec_name.into(),
         sample_rate: opts.sample_rate,
         channels: 2,

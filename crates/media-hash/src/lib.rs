@@ -1,5 +1,6 @@
-//! Streaming MD5, SHA-256 and IEEE CRC-32 shared by the audio engine
-//! (audeniq-qc) and the image/PDF crates (audeniq-photo).
+//! Streaming MD5, SHA-256, IEEE CRC-32 and the FLAC CRC-16/CRC-8 shared by
+//! the audio engine (audeniq-qc), the media codecs and the image/PDF crates
+//! (audeniq-photo).
 //!
 //! Each hash selects a hardware kernel at runtime (SHA-NI / AArch64 SHA2,
 //! PCLMULQDQ / VPCLMULQDQ / PMULL) and falls back to portable code. Without
@@ -12,7 +13,10 @@
 extern crate std;
 
 #[allow(unsafe_code)]
+mod crc16;
+#[allow(unsafe_code)]
 mod crc32;
+mod crc8;
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod fused;
@@ -20,7 +24,9 @@ mod md5;
 #[allow(unsafe_code)]
 mod sha256;
 
+pub use crc16::crc16;
 pub use crc32::{crc32, Crc32};
+pub use crc8::crc8;
 pub use md5::Md5;
 pub use sha256::Sha256;
 

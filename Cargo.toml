@@ -31,6 +31,9 @@ photo-pdf-cmap = { path = "crates/photo-pdf-cmap" }
 photo-pdf-postscript = { path = "crates/photo-pdf-postscript" }
 media-video = { path = "crates/media-video" }
 media-aac = { path = "crates/media-aac" }
+media-mp3 = { path = "crates/media-mp3" }
+media-bits = { path = "crates/media-bits" }
+media-dsp = { path = "crates/media-dsp" }
 media-adm = { path = "crates/media-adm" }
 media-resample = { path = "crates/media-resample" }
 

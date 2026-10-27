@@ -1,14 +1,23 @@
 //! `audeniq-music video …` command line.
 //!
 //! ```text
-//! video probe [--sound] FILE   report JSON on stdout, exit 0; `--sound`
-//!                              also decodes and measures the sound track
+//! video probe [--sound] [--profile NAME] [--master FILE] FILE
+//!                              report JSON on stdout, exit 0; `--sound`
+//!                              also decodes and measures the sound track,
+//!                              `--profile` adds one platform's spec checks
+//!                              (youtube, spotify, apple), `--master` compares
+//!                              the sound with the released master
 //! video sound-ranges FILE      byte ranges of the sound track's data
 //! video convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N]
-//!       [--rate 44100|48000] IN OUT
+//!       [--rate 44100|48000] [--channels L,R|M] IN OUT
 //!                              copy the picture, convert the sound to a
 //!                              distributor's spec (default preset from
-//!                              OUT's extension: .mov → pcm24, else aac-320)
+//!                              OUT's extension: .mov → pcm24, else aac-320);
+//!                              `--channels` picks source channels, counted
+//!                              from 1 across all sound tracks in file order
+//! video profiles               the platform specs `--profile` checks
+//! video match-master MV MASTER is the MV's sound the released master?
+//!                              (offset, drift, level, null-test SNR, verdict)
 //! video capabilities           engine and rule versions
 //! ```
 //!
@@ -47,6 +56,7 @@ fn convert_args(
     use crate::convert::{Codec, Container, preset};
     let mut paths = Vec::new();
     let (mut name, mut codec, mut bitrate, mut rate) = (None, None, None, None);
+    let mut pick = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || {
@@ -61,6 +71,19 @@ fn convert_args(
                 bitrate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?)
             }
             Some("--rate") => rate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?),
+            Some("--channels") => {
+                let v = value()?;
+                let n: Vec<u16> = v
+                    .split(',')
+                    .map(|c| c.trim().parse::<u16>().ok().filter(|&c| c > 0))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| format!("--channels {v}: channel numbers from 1"))?;
+                pick = Some(match n.as_slice() {
+                    [m] => crate::Pick::Mono(*m),
+                    [l, r] => crate::Pick::Stereo(*l, *r),
+                    _ => return Err(format!("--channels {v}: one (mono) or two (L,R) channels")),
+                });
+            }
             Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => paths.push(std::path::PathBuf::from(a)),
         }
@@ -87,20 +110,53 @@ fn convert_args(
     if let Some(r) = rate {
         o.sample_rate = r;
     }
+    o.pick = pick;
     Ok((o, input, output))
 }
 
 pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
     let usage = format!(
-        "usage: {prog} probe [--sound] FILE | {prog} sound-ranges FILE | {prog} convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N] [--rate HZ] IN OUT | {prog} capabilities"
+        "usage: {prog} probe [--sound] [--profile NAME] [--master FILE] FILE | {prog} profiles | {prog} match-master MV MASTER | {prog} sound-ranges FILE | {prog} convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N] [--rate HZ] [--channels L,R|M] IN OUT | {prog} capabilities"
     );
     let words: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
     match words.as_slice() {
-        [Some("probe"), Some("--sound"), _] | [Some("probe"), _] => {
-            let sound = words[1] == Some("--sound");
+        [Some("probe"), .., _] => {
+            let (mut sound, mut profile, mut master) = (false, None, None);
+            let mut opts = words[1..words.len() - 1].iter();
+            while let Some(o) = opts.next() {
+                match o {
+                    Some("--sound") => sound = true,
+                    Some("--profile") => {
+                        let name = opts.next().copied().flatten().unwrap_or("");
+                        match crate::check::profile(name) {
+                            Some(p) => profile = Some(p),
+                            None => {
+                                let names: Vec<_> =
+                                    crate::check::PROFILES.iter().map(|p| p.name).collect();
+                                return fail(
+                                    "USAGE",
+                                    &format!("unknown profile {name:?} ({})", names.join(", ")),
+                                );
+                            }
+                        }
+                    }
+                    Some("--master") => match opts.next().copied().flatten() {
+                        Some(m) => master = Some(std::path::PathBuf::from(m)),
+                        None => return fail("USAGE", &usage),
+                    },
+                    _ => return fail("USAGE", &usage),
+                }
+            }
             let path: &std::path::Path = args[args.len() - 1].as_ref();
-            match crate::probe_path(path, sound) {
+            match crate::probe_path_master(path, sound, profile, master.as_deref()) {
                 Ok(report) => emit(&report),
+                Err(e) => fail(e.code(), &e.to_string()),
+            }
+        }
+        [Some("profiles")] => emit(&crate::check::PROFILES.to_vec()),
+        [Some("match-master"), _, _] => {
+            match crate::master::match_master(args[1].as_ref(), args[2].as_ref()) {
+                Ok(m) => emit(&m),
                 Err(e) => fail(e.code(), &e.to_string()),
             }
         }
@@ -124,9 +180,10 @@ pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
             "rule": crate::RULE_VERSION,
             "containers": ["mp4", "mov"],
             "max_moov_bytes": crate::file::MAX_MOOV,
-            "sound_codecs": ["aac", "pcm"],
+            "sound_codecs": ["aac", "alac", "mp3", "pcm"],
             "max_sound_bytes": crate::sound::MAX_SOUND_BYTES,
             "convert_presets": crate::convert::PRESETS.iter().map(|p| p.0).collect::<Vec<_>>(),
+            "profiles": crate::check::PROFILES.iter().map(|p| p.version).collect::<Vec<_>>(),
         })),
         _ => fail("USAGE", &usage),
     }

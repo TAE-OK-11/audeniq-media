@@ -34,6 +34,7 @@ dependencies = [
 name = "audeniq-qc"
 version = "0.1.0"
 dependencies = [
+ "media-bits",
  "media-hash",
  "media-json",
 ]
@@ -298,6 +299,10 @@ dependencies = [
 [[package]]
 name = "media-aac"
 version = "0.1.0"
+dependencies = [
+ "media-bits",
+ "media-dsp",
+]
 
 [[package]]
 name = "media-adm"
@@ -305,6 +310,14 @@ version = "0.1.0"
 dependencies = [
  "media-json",
 ]
+
+[[package]]
+name = "media-bits"
+version = "0.1.0"
+
+[[package]]
+name = "media-dsp"
+version = "0.1.0"
 
 [[package]]
 name = "media-engine-fuzz"
@@ -318,6 +331,7 @@ dependencies = [
  "media-aac",
  "media-adm",
  "media-hash",
+ "media-mp3",
  "media-video",
  "photo-deflate",
  "sha2",
@@ -332,12 +346,31 @@ name = "media-json"
 version = "0.1.0"
 
 [[package]]
+name = "media-mp3"
+version = "0.1.0"
+dependencies = [
+ "media-bits",
+ "media-dsp",
+]
+
+[[package]]
+name = "media-resample"
+version = "0.1.0"
+dependencies = [
+ "media-dsp",
+]
+
+[[package]]
 name = "media-video"
 version = "0.1.0"
 dependencies = [
  "audeniq-qc",
  "media-aac",
+ "media-bits",
+ "media-dsp",
  "media-json",
+ "media-mp3",
+ "media-resample",
 ]
 
 [[package]]

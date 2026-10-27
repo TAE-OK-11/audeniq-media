@@ -14,6 +14,59 @@ pub struct AudioConfig {
     pub avg_bit_rate: Option<u64>,
     /// AAC `AudioSpecificConfig` bytes (empty for other codecs).
     pub asc: Vec<u8>,
+    /// ALAC magic cookie (`ALACSpecificConfig`, 24 bytes).
+    pub cookie: Vec<u8>,
+    /// Speaker of each channel in file order from a QuickTime `chan` box;
+    /// `None` without one or for discrete (unassigned) channels.
+    pub layout: Option<Vec<&'static str>>,
+}
+
+/// Speaker names of WAVE channel-mask bits (CoreAudio labels 1–18 are the
+/// same bits, plus one).
+const MASK_NAMES: [&str; 18] = [
+    "L", "R", "C", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "TC", "TFL", "TFC", "TFR",
+    "TBL", "TBC", "TBR",
+];
+
+/// QuickTime `chan` (CoreAudio `AudioChannelLayout`), payload after the
+/// box header: the layout of `channels` channels when it names speakers.
+fn channel_layout(b: &[u8], channels: u32) -> Option<Vec<&'static str>> {
+    let tag = u32_at(b, 4)?;
+    let names: Vec<&'static str> = match tag {
+        // Channel descriptions: one label each.
+        0 => {
+            let n = u32_at(b, 12)? as usize;
+            (0..n.min(64))
+                .map(|i| match u32_at(b, 16 + i * 20)? {
+                    l @ 1..=18 => Some(MASK_NAMES[l as usize - 1]),
+                    42 => Some("C"),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?
+        }
+        // Channel bitmap: the set bits in order.
+        0x1_0000 => {
+            let mask = u32_at(b, 8)?;
+            (0..18)
+                .filter(|i| mask >> i & 1 == 1)
+                .map(|i| MASK_NAMES[i])
+                .collect()
+        }
+        t => match t >> 16 {
+            100 => vec!["C"],
+            101 | 102 => vec!["L", "R"],
+            121 => vec!["L", "R", "C", "LFE", "Ls", "Rs"],
+            122 => vec!["L", "R", "Ls", "Rs", "C", "LFE"],
+            123 => vec!["L", "C", "R", "Ls", "Rs", "LFE"],
+            124 => vec!["C", "L", "R", "Ls", "Rs", "LFE"],
+            126 => vec!["L", "R", "C", "LFE", "Ls", "Rs", "FLC", "FRC"],
+            127 => vec!["C", "FLC", "FRC", "L", "R", "Ls", "Rs", "LFE"],
+            128 => vec!["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs"],
+            // Discrete in order, unknown, or a tag we do not name.
+            _ => return None,
+        },
+    };
+    (names.len() == channels as usize).then_some(names)
 }
 
 /// MPEG-4 descriptor: tag, then a 1–4 byte length (7 bits per byte).
@@ -142,6 +195,19 @@ fn esds(entry: &mut AudioConfig, b: &[u8]) -> Option<()> {
         if let Some(rate) = asc.rate {
             entry.sample_rate = rate;
         }
+        // SBR signalled after the core config (backward compatible): the
+        // decoder runs at the extension rate.
+        if asc.object == 2
+            && let Ok((c, _)) = media_aac::parse_config(&entry.asc)
+            && c.sbr == 1
+        {
+            entry.profile = Some("HE-AAC".into());
+            entry.sample_rate = if c.ext_rate != 0 {
+                c.ext_rate
+            } else {
+                2 * c.sample_rate
+            };
+        }
         // HE-AACv2 is coded mono; the decoder outputs stereo.
         if asc.object == 29 {
             entry.channels = 2;
@@ -204,6 +270,7 @@ pub(crate) fn sample_entry(fourcc: &[u8; 4], e: &[u8]) -> Option<AudioConfig> {
         .and_then(|b| b.get(1).copied())
         .map(|v| v & 1 == 1);
     let bits = cfg.bits_per_sample.unwrap_or(16);
+    cfg.layout = find(b"chan").and_then(|c| channel_layout(c, cfg.channels));
     cfg.codec = match fourcc {
         b"mp4a" => {
             cfg.codec = "aac".into();
@@ -235,6 +302,7 @@ pub(crate) fn sample_entry(fourcc: &[u8; 4], e: &[u8]) -> Option<AudioConfig> {
         b"alac" => {
             // Magic cookie: a full box whose config holds depth, channels, rate.
             if let Some(c) = find(b"alac").and_then(|c| c.get(4..28)) {
+                cfg.cookie = c.to_vec();
                 cfg.bits_per_sample = Some(u32::from(c[5]));
                 cfg.channels = u32::from(c[9]);
                 cfg.sample_rate = u32_at(c, 20)?;

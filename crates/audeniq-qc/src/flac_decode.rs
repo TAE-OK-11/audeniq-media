@@ -2,7 +2,8 @@
 //! ported/reworked from FFmpeg flac.c, flacdec.c, flacdsp.c (LGPL-2.1-or-later).
 //! Copyright (c) 2003 Alex Beregszaszi; (c) 2012 Mans Rullgard.
 //! See THIRD_PARTY.md.
-use crate::{kernels::Backend, msb::Bits, AudioSpec, Error, Limits, Result};
+use crate::{kernels::Backend, AudioSpec, Error, Limits, Result};
+use media_bits::Bits;
 use media_hash::Md5;
 use std::{
     fs::File,
@@ -310,7 +311,7 @@ pub(crate) fn decode(
 ) -> Result<(usize, Header)> {
     let mut b = Bits::new(data);
     let h = header(&mut b, spec, maximum)?;
-    let header_len = b.pos / 8;
+    let header_len = b.pos() / 8;
     let crc = b.get(8)?;
     if crate::bits::crc8(&data[..header_len]) as u32 != crc {
         return invalid("FLAC header CRC");
@@ -322,7 +323,7 @@ pub(crate) fn decode(
         subframe(&mut b, plane, bits)?;
     }
     b.align_zero()?;
-    let length = b.pos / 8;
+    let length = b.pos() / 8;
     let crc = b.get(16)?;
     if crate::bits::crc16(&data[..length]) as u32 != crc {
         return invalid("FLAC frame CRC");
@@ -390,7 +391,7 @@ pub(crate) fn verify(
 ) -> Result<(usize, Header)> {
     let mut b = Bits::new(data);
     let h = header(&mut b, spec, maximum)?;
-    let header_len = b.pos / 8;
+    let header_len = b.pos() / 8;
     let crc = b.get(8)?;
     if crate::bits::crc8(&data[..header_len]) as u32 != crc {
         return invalid("FLAC header CRC");
@@ -451,7 +452,7 @@ pub(crate) fn verify(
         )?;
     }
     b.align_zero()?;
-    let length = b.pos / 8;
+    let length = b.pos() / 8;
     let crc = b.get(16)?;
     if crate::bits::crc16(&data[..length]) as u32 != crc {
         return invalid("FLAC frame CRC");
@@ -810,7 +811,7 @@ fn verify_residual(b: &mut Bits<'_>, e: &[i32], order: usize) -> Result<bool> {
     for i in 0..parts.count {
         let values = &e[parts.range(i)];
         match parts.parameter(b)? {
-            Some(k) => match rice_codes_at(b.data(), b.pos, k, values) {
+            Some(k) => match rice_codes_at(b.data(), b.pos(), k, values) {
                 Some(end) => b.seek(end)?,
                 None => return Ok(false),
             },

@@ -1,0 +1,13 @@
+[package]
+name = "media-dsp"
+description = "FFT, DCT-IV and dot-product kernels for the AUDENIQ media codecs, with runtime-selected AVX2 builds on x86-64 (NEON is baseline on AArch64)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+
+# Not the workspace lints: `unsafe` is denied crate-wide and allowed only in
+# `simd`, which calls the AVX2 builds after runtime detection (as in
+# media-hash).
+[lints.clippy]
+needless_range_loop = "allow"

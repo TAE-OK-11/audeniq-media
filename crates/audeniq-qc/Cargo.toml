@@ -8,6 +8,7 @@ description = "Bounded, lossless-only audio normalization and QC for AUDENIQ"
 repository = "https://github.com/TAE-OK-11/audeniq-qc"
 
 [dependencies]
+media-bits.workspace = true
 media-hash = { workspace = true, features = ["std"] }
 media-json.workspace = true
 symphonia = { version = "=0.5.4", optional = true, default-features = false, features = ["flac", "alac", "isomp4"] }

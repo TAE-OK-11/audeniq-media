@@ -6,6 +6,8 @@ use photo_core::{Error, Result};
 
 const MAX_CHUNKS: usize = 4096;
 
+/// RIFF INFO chunk id → its name in the RIFF specification (Microsoft
+/// Multimedia Programming Interface and Data Specifications 1.0).
 fn info_name(id: &[u8]) -> String {
     match id {
         b"IARL" => "ArchivalLocation",
@@ -143,6 +145,8 @@ pub(crate) fn aiff(d: &[u8], m: &mut Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Vorbis comment field (the Ogg Vorbis I specification's field names and
+/// common ones) → the field name in CamelCase.
 fn vorbis_name(key: &str) -> String {
     match key.to_ascii_uppercase().as_str() {
         "TITLE" => "Title",

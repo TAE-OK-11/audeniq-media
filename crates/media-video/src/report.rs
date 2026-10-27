@@ -19,6 +19,8 @@ pub struct Report {
     /// The measured sound track (`probe --sound`), or why it was not.
     pub sound: Option<crate::sound::Sound>,
     pub sound_note: Option<String>,
+    /// The sound against the released master (`probe --master`).
+    pub master: Option<crate::master::MasterMatch>,
     pub issues: Vec<Issue>,
     /// No issue of severity `error`.
     pub mv_ready: bool,
@@ -33,6 +35,7 @@ media_json::json_struct!(Report {
     other,
     sound,
     sound_note,
+    master,
     issues,
     mv_ready
 });
@@ -529,6 +532,7 @@ pub(crate) fn build(l: &Layout) -> Result<(Report, Vec<Track>), Error> {
         other: Vec::new(),
         sound: None,
         sound_note: None,
+        master: None,
         issues: Vec::new(),
         mv_ready: false,
     };

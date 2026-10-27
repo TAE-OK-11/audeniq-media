@@ -1,11 +1,12 @@
 //! `audeniq-music video …` command line.
 //!
 //! ```text
-//! video probe [--sound] [--profile NAME] FILE
+//! video probe [--sound] [--profile NAME] [--master FILE] FILE
 //!                              report JSON on stdout, exit 0; `--sound`
 //!                              also decodes and measures the sound track,
 //!                              `--profile` adds one platform's spec checks
-//!                              (youtube, spotify, apple)
+//!                              (youtube, spotify, apple), `--master` compares
+//!                              the sound with the released master
 //! video sound-ranges FILE      byte ranges of the sound track's data
 //! video convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N]
 //!       [--rate 44100|48000] [--channels L,R|M] IN OUT
@@ -15,6 +16,8 @@
 //!                              `--channels` picks source channels, counted
 //!                              from 1 across all sound tracks in file order
 //! video profiles               the platform specs `--profile` checks
+//! video match-master MV MASTER is the MV's sound the released master?
+//!                              (offset, drift, level, null-test SNR, verdict)
 //! video capabilities           engine and rule versions
 //! ```
 //!
@@ -113,12 +116,12 @@ fn convert_args(
 
 pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
     let usage = format!(
-        "usage: {prog} probe [--sound] [--profile NAME] FILE | {prog} profiles | {prog} sound-ranges FILE | {prog} convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N] [--rate HZ] [--channels L,R|M] IN OUT | {prog} capabilities"
+        "usage: {prog} probe [--sound] [--profile NAME] [--master FILE] FILE | {prog} profiles | {prog} match-master MV MASTER | {prog} sound-ranges FILE | {prog} convert-audio [--preset NAME] [--codec aac|pcm24] [--bitrate N] [--rate HZ] [--channels L,R|M] IN OUT | {prog} capabilities"
     );
     let words: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
     match words.as_slice() {
         [Some("probe"), .., _] => {
-            let (mut sound, mut profile) = (false, None);
+            let (mut sound, mut profile, mut master) = (false, None, None);
             let mut opts = words[1..words.len() - 1].iter();
             while let Some(o) = opts.next() {
                 match o {
@@ -137,16 +140,26 @@ pub fn main(prog: &str, args: Vec<std::ffi::OsString>) -> ExitCode {
                             }
                         }
                     }
+                    Some("--master") => match opts.next().copied().flatten() {
+                        Some(m) => master = Some(std::path::PathBuf::from(m)),
+                        None => return fail("USAGE", &usage),
+                    },
                     _ => return fail("USAGE", &usage),
                 }
             }
             let path: &std::path::Path = args[args.len() - 1].as_ref();
-            match crate::probe_path_for(path, sound, profile) {
+            match crate::probe_path_master(path, sound, profile, master.as_deref()) {
                 Ok(report) => emit(&report),
                 Err(e) => fail(e.code(), &e.to_string()),
             }
         }
         [Some("profiles")] => emit(&crate::check::PROFILES.to_vec()),
+        [Some("match-master"), _, _] => {
+            match crate::master::match_master(args[1].as_ref(), args[2].as_ref()) {
+                Ok(m) => emit(&m),
+                Err(e) => fail(e.code(), &e.to_string()),
+            }
+        }
         [Some("sound-ranges"), _] => match crate::sound_ranges(args[1].as_ref()) {
             Ok(ranges) => {
                 let total: u64 = ranges.iter().map(|r| r.1).sum();

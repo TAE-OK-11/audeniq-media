@@ -10,6 +10,8 @@ use crate::{ENGINE_VERSION, Error, RULE_VERSION};
 pub struct Report {
     pub engine: &'static str,
     pub rule: &'static str,
+    /// The platform spec also checked (`probe --profile`), as its version.
+    pub profile: Option<&'static str>,
     pub container: Container,
     pub video: Vec<VideoStream>,
     pub audio: Vec<AudioStream>,
@@ -17,6 +19,8 @@ pub struct Report {
     /// The measured sound track (`probe --sound`), or why it was not.
     pub sound: Option<crate::sound::Sound>,
     pub sound_note: Option<String>,
+    /// The sound against the released master (`probe --master`).
+    pub master: Option<crate::master::MasterMatch>,
     pub issues: Vec<Issue>,
     /// No issue of severity `error`.
     pub mv_ready: bool,
@@ -24,12 +28,14 @@ pub struct Report {
 media_json::json_struct!(Report {
     engine,
     rule,
+    profile,
     container,
     video,
     audio,
     other,
     sound,
     sound_note,
+    master,
     issues,
     mv_ready
 });
@@ -510,6 +516,7 @@ pub(crate) fn build(l: &Layout) -> Result<(Report, Vec<Track>), Error> {
     let mut report = Report {
         engine: ENGINE_VERSION,
         rule: RULE_VERSION,
+        profile: None,
         container: Container {
             format: if quicktime { "mov" } else { "mp4" },
             major_brand,
@@ -525,6 +532,7 @@ pub(crate) fn build(l: &Layout) -> Result<(Report, Vec<Track>), Error> {
         other: Vec::new(),
         sound: None,
         sound_note: None,
+        master: None,
         issues: Vec::new(),
         mv_ready: false,
     };

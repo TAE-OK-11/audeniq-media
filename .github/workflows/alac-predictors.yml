@@ -2,6 +2,7 @@ name: Native ALAC predictor dispatch comparison
 on:
   push:
     paths:
+      - crates/media-bits/**
       - crates/media-hash/**
       - crates/media-json/**
       - crates/audeniq-qc/src/alac.rs

@@ -227,12 +227,16 @@ pub(crate) struct Ps {
     last_opd: [i8; MAX_PAR],
     /// The configuration in use (34 bands) and its state.
     wide: bool,
+    /// Hybrid bands with signal this frame.
+    used: usize,
     /// Split QMF subbands' last 12 slots, [band][slot].
     split_history: [[C; 12]; 5],
     /// Decorrelator input history per hybrid band (14 slots).
     delay: Box<[[C; 14]; 91]>,
     /// All-pass link states per band: up to 5 past values per link.
-    links: Box<[[[C; 5]; 3]; 50]>,
+    /// All-pass link states: the last 5 values of each link, [re/im][link]
+    /// [slot][band].
+    links: Box<[[[[f32; 50]; 5]; 3]; 2]>,
     peak: [f32; MAX_PAR],
     power: [f32; MAX_PAR],
     peak_diff: [f32; MAX_PAR],
@@ -241,6 +245,35 @@ pub(crate) struct Ps {
     /// IPD/OPD of the last two envelopes per band (as indices).
     ipd_hist: [[i8; 2]; MAX_PAR],
     opd_hist: [[i8; 2]; MAX_PAR],
+    /// Taken out while a frame is processed.
+    work: Option<Box<Work>>,
+}
+
+/// Per-frame hybrid-domain buffers (mono, decorrelated, left, right),
+/// kept between frames.
+struct Work {
+    s: [[C; SLOTS]; 91],
+    d: [[C; SLOTS]; 91],
+    l: [[C; SLOTS]; 91],
+    r: [[C; SLOTS]; 91],
+    /// All-pass link values over the frame (5 kept + 32), [re/im][link]
+    /// [slot][band].
+    w: [[[[f32; 50]; 5 + SLOTS]; 3]; 2],
+    /// Interpolated mixing matrices of an envelope, [band][slot].
+    ramp: [[Mix; SLOTS]; MAX_PAR],
+}
+
+impl Work {
+    fn new() -> Box<Work> {
+        Box::new(Work {
+            s: [[[0.0; 2]; SLOTS]; 91],
+            d: [[[0.0; 2]; SLOTS]; 91],
+            l: [[[0.0; 2]; SLOTS]; 91],
+            r: [[[0.0; 2]; SLOTS]; 91],
+            w: [[[[0.0; 50]; 5 + SLOTS]; 3]; 2],
+            ramp: [[identity(); SLOTS]; MAX_PAR],
+        })
+    }
 }
 
 impl Ps {
@@ -253,15 +286,17 @@ impl Ps {
             last_ipd: [0; MAX_PAR],
             last_opd: [0; MAX_PAR],
             wide: false,
+            used: 0,
             split_history: [[[0.0; 2]; 12]; 5],
             delay: Box::new([[[0.0; 2]; 14]; 91]),
-            links: Box::new([[[[0.0; 2]; 5]; 3]; 50]),
+            links: Box::new([[[[0.0; 50]; 5]; 3]; 2]),
             peak: [0.0; MAX_PAR],
             power: [0.0; MAX_PAR],
             peak_diff: [0.0; MAX_PAR],
             mix_prev: [identity(); MAX_PAR],
             ipd_hist: [[0; 2]; MAX_PAR],
             opd_hist: [[0; 2]; MAX_PAR],
+            work: Some(Work::new()),
         }
     }
 
@@ -587,11 +622,67 @@ fn to_config(p: &[i8; MAX_PAR], n: usize, wide: bool, average: bool) -> [i8; MAX
     }
 }
 
+/// Per configuration: each split's hybrid filters (13 complex taps per
+/// band) and each all-pass band's fractional delay, link factors and
+/// gains, computed once.
+struct Tables {
+    taps: Vec<Vec<[C; 13]>>,
+    phi: Vec<C>,
+    q: Vec<[C; 3]>,
+    a: Vec<[f32; 3]>,
+}
+
+fn tables(wide: bool) -> &'static Tables {
+    static T: [OnceLock<Tables>; 2] = [OnceLock::new(), OnceLock::new()];
+    T[usize::from(wide)].get_or_init(|| {
+        let cfg = if wide { &CONFIG_34 } else { &CONFIG_20 };
+        let taps = split_of(wide)
+            .iter()
+            .map(|sp| {
+                let g = |t: usize| sp.taps[t.min(12 - t)];
+                (0..sp.bands)
+                    .map(|b| {
+                        std::array::from_fn(|t| {
+                            let tt = t as f32 - 6.0;
+                            if sp.real {
+                                [g(t) * (PI * b as f32 * tt).cos(), 0.0]
+                            } else {
+                                let a = 2.0 * PI * (b as f32 + 0.5) * tt / sp.bands as f32;
+                                [g(t) * a.cos(), g(t) * a.sin()]
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let f = |k: usize| center(wide, k);
+        Tables {
+            taps,
+            phi: (0..cfg.allpass)
+                .map(|k| expj(-PI * PHI_FRACTION * f(k)))
+                .collect(),
+            q: (0..cfg.allpass)
+                .map(|k| std::array::from_fn(|m| expj(-PI * LINK_FRACTION[m] * f(k))))
+                .collect(),
+            a: (0..cfg.allpass)
+                .map(|k| {
+                    let decay = if k < cfg.decay_cutoff {
+                        1.0
+                    } else {
+                        (1.0 - DECAY_SLOPE * (k - cfg.decay_cutoff) as f32).max(0.0)
+                    };
+                    ALLPASS_A.map(|a| a * decay)
+                })
+                .collect(),
+        }
+    })
+}
+
 impl Ps {
     fn reset_state(&mut self) {
         self.split_history = [[[0.0; 2]; 12]; 5];
         *self.delay = [[[0.0; 2]; 14]; 91];
-        *self.links = [[[[0.0; 2]; 5]; 3]; 50];
+        *self.links = [[[[0.0; 50]; 5]; 3]; 2];
         self.peak = [0.0; MAX_PAR];
         self.power = [0.0; MAX_PAR];
         self.peak_diff = [0.0; MAX_PAR];
@@ -603,7 +694,14 @@ impl Ps {
     /// Stereo QMF frames `l`, `r` from the mono frame `x`; `ahead` holds
     /// the lowest five subbands 6 slots later (the hybrid filters' look-
     /// ahead, from the SBR analysis buffer), so nothing is delayed.
-    pub(crate) fn apply(&mut self, x: &Qmf, ahead: &[[C; SLOTS]; 5], l: &mut Qmf, r: &mut Qmf) {
+    pub(crate) fn apply(
+        &mut self,
+        x: &Qmf,
+        ahead: &[[C; SLOTS]; 5],
+        top: usize,
+        l: &mut Qmf,
+        r: &mut Qmf,
+    ) {
         let Some(h) = self.header else {
             *l = *x;
             *r = *x;
@@ -633,15 +731,35 @@ impl Ps {
             self.wide = wide;
         }
         let cfg = if wide { &CONFIG_34 } else { &CONFIG_20 };
-        let mut s = Box::new([[[0f32; 2]; SLOTS]; 91]);
-        self.analysis(x, ahead, cfg, &mut s);
-        let mut d = Box::new([[[0f32; 2]; SLOTS]; 91]);
-        self.decorrelate(&s, cfg, &mut d);
-        let mut hl = Box::new([[[0f32; 2]; SLOTS]; 91]);
-        let mut hr = Box::new([[[0f32; 2]; SLOTS]; 91]);
-        self.mix(&h, &p, cfg, &s, &d, &mut hl, &mut hr);
-        synthesis(&hl, cfg, wide, l);
-        synthesis(&hr, cfg, wide, r);
+        let mut w = self.work.take().unwrap_or_else(Work::new);
+        let Work {
+            s,
+            d,
+            l: hl,
+            r: hr,
+            w: links,
+            ramp,
+        } = &mut *w;
+        // Hybrid bands from QMF subband `top` up carry no signal.
+        let top = top.clamp(cfg.split, 64);
+        let used = cfg.split_bands + top - cfg.split;
+        for k in used..cfg.bands {
+            self.delay[k] = [[0.0; 2]; 14];
+        }
+        for part in self.links.iter_mut() {
+            for link in part.iter_mut() {
+                for slot in link.iter_mut() {
+                    slot[used.min(50)..].fill(0.0);
+                }
+            }
+        }
+        self.used = used;
+        self.analysis(x, ahead, cfg, s);
+        self.decorrelate(s, cfg, d, links);
+        self.mix(&h, &p, cfg, s, d, hl, hr, ramp);
+        synthesis(hl, cfg, wide, used, l);
+        synthesis(hr, cfg, wide, used, r);
+        self.work = Some(w);
     }
 
     /// Hybrid analysis: the split subbands through their filters (centered
@@ -654,24 +772,17 @@ impl Ps {
         s: &mut [[C; SLOTS]; 91],
     ) {
         let wide = self.wide;
+        for row in &mut s[..cfg.split_bands] {
+            *row = [[0.0; 2]; SLOTS];
+        }
         for (q, sp) in split_of(wide).iter().enumerate() {
             let mut z = [[0f32; 2]; 12 + SLOTS];
             z[..12].copy_from_slice(&self.split_history[q]);
             z[12..].copy_from_slice(&ahead[q]);
             self.split_history[q].copy_from_slice(&z[SLOTS..]);
-            let g = |t: usize| sp.taps[t.min(12 - t)];
+            let taps = &tables(wide).taps[q];
             for b in 0..sp.bands {
-                // Taps of band b: g(t)·e^{j2π(b+½)(t−6)/Q}, or the cosine.
-                let mut c = [[0f32; 2]; 13];
-                for (t, ct) in c.iter_mut().enumerate() {
-                    let tt = t as f32 - 6.0;
-                    *ct = if sp.real {
-                        [g(t) * (PI * b as f32 * tt).cos(), 0.0]
-                    } else {
-                        let a = 2.0 * PI * (b as f32 + 0.5) * tt / sp.bands as f32;
-                        [g(t) * a.cos(), g(t) * a.sin()]
-                    };
-                }
+                let c = &taps[b];
                 let out = &mut s[sp.to[b]];
                 for n in 0..SLOTS {
                     let mut acc = [0f32; 2];
@@ -685,7 +796,7 @@ impl Ps {
                 }
             }
         }
-        for q in cfg.split..64 {
+        for q in cfg.split..cfg.split + self.used - cfg.split_bands {
             let k = cfg.split_bands + q - cfg.split;
             for n in 0..SLOTS {
                 s[k][n] = [x[0][n][q], x[1][n][q]];
@@ -695,75 +806,106 @@ impl Ps {
 
     /// The decorrelated signal: all-pass chains in the lower bands, delays
     /// of 14 and 1 slots above, attenuated at transients.
-    fn decorrelate(&mut self, s: &[[C; SLOTS]; 91], cfg: &Config, d: &mut [[C; SLOTS]; 91]) {
+    fn decorrelate(
+        &mut self,
+        s: &[[C; SLOTS]; 91],
+        cfg: &Config,
+        d: &mut [[C; SLOTS]; 91],
+        w: &mut [[[[f32; 50]; 5 + SLOTS]; 3]; 2],
+    ) {
         let wide = self.wide;
         // Transient attenuation per parameter band and slot: the smoothed
         // power against the smoothed drop below its decaying peak.
-        let mut gain = [[1f32; SLOTS]; MAX_PAR];
-        for n in 0..SLOTS {
-            let mut power = [0f32; MAX_PAR];
-            for k in 0..cfg.bands {
-                let v = s[k][n];
-                power[cfg.k_to_i[k]] += v[0] * v[0] + v[1] * v[1];
+        // Band powers per parameter band, accumulated band by band.
+        let mut power = [[0f32; SLOTS]; MAX_PAR];
+        for k in 0..self.used {
+            let p = &mut power[cfg.k_to_i[k]];
+            for (pn, v) in p.iter_mut().zip(&s[k]) {
+                *pn += v[0] * v[0] + v[1] * v[1];
             }
-            for i in 0..cfg.parameters {
-                self.peak[i] = (self.peak[i] * PEAK_DECAY).max(power[i]);
-                self.power[i] += SMOOTHING * (power[i] - self.power[i]);
-                self.peak_diff[i] += SMOOTHING * (self.peak[i] - power[i] - self.peak_diff[i]);
-                let limit = TRANSIENT_IMPACT * self.peak_diff[i];
-                gain[i][n] = if limit > self.power[i] {
-                    self.power[i] / limit
+        }
+        // The smoothing runs per slot across all parameter bands at once.
+        let mut gain = [[1f32; MAX_PAR]; SLOTS];
+        let (peak, smooth, diff) = (&mut self.peak, &mut self.power, &mut self.peak_diff);
+        for n in 0..SLOTS {
+            for i in 0..MAX_PAR {
+                let p = power[i][n];
+                peak[i] = (peak[i] * PEAK_DECAY).max(p);
+                smooth[i] += SMOOTHING * (p - smooth[i]);
+                diff[i] += SMOOTHING * (peak[i] - p - diff[i]);
+                let limit = TRANSIENT_IMPACT * diff[i];
+                gain[n][i] = if limit > smooth[i] {
+                    smooth[i] / limit
                 } else {
                     1.0
                 };
             }
         }
-        for k in 0..cfg.bands {
-            let mut ext = [[0f32; 2]; 14 + SLOTS];
-            ext[..14].copy_from_slice(&self.delay[k]);
-            ext[14..].copy_from_slice(&s[k]);
-            self.delay[k].copy_from_slice(&ext[SLOTS..]);
-            let out = &mut d[k];
-            if k < cfg.allpass {
-                // z⁻² with a fractional delay, then three all-pass links
-                // (Q z^-d − a) / (1 − a Q z^-d) whose gains decay above the
-                // cutoff band.
-                let f = center(wide, k);
-                let decay = if k < cfg.decay_cutoff {
-                    1.0
+        // All-pass bands side by side, slot by slot: z⁻² with a fractional
+        // delay, then three links (Q z^-d − a) / (1 − a Q z^-d) whose gains
+        // decay above the cutoff band.
+        let ap = cfg.allpass.min(self.used);
+        let t = tables(wide);
+        for part in 0..2 {
+            for m in 0..3 {
+                w[part][m][..5].copy_from_slice(&self.links[part][m]);
+            }
+        }
+        for n in 0..SLOTS {
+            let mut ur = [0f32; 50];
+            let mut ui = [0f32; 50];
+            for k in 0..ap {
+                let x = if n >= 2 {
+                    s[k][n - 2]
                 } else {
-                    (1.0 - DECAY_SLOPE * (k - cfg.decay_cutoff) as f32).max(0.0)
+                    self.delay[k][12 + n]
                 };
-                let phi = expj(-PI * PHI_FRACTION * f);
-                let q: [C; 3] = std::array::from_fn(|m| expj(-PI * LINK_FRACTION[m] * f));
-                let mut w = [[[0f32; 2]; 5 + SLOTS]; 3];
-                for m in 0..3 {
-                    w[m][..5].copy_from_slice(&self.links[k][m]);
-                }
-                for n in 0..SLOTS {
-                    let mut u = mul(phi, ext[14 + n - 2]);
-                    for m in 0..3 {
-                        let a = ALLPASS_A[m] * decay;
-                        let past = mul(q[m], w[m][5 + n - LINK_DELAY[m]]);
-                        let wn = [u[0] + a * past[0], u[1] + a * past[1]];
-                        w[m][5 + n] = wn;
-                        u = [past[0] - a * wn[0], past[1] - a * wn[1]];
-                    }
-                    out[n] = u;
-                }
-                for m in 0..3 {
-                    self.links[k][m].copy_from_slice(&w[m][SLOTS..]);
-                }
-            } else {
-                let delay = if k < cfg.short { 14 } else { 1 };
-                for n in 0..SLOTS {
-                    out[n] = ext[14 + n - delay];
+                let v = mul(t.phi[k], x);
+                ur[k] = v[0];
+                ui[k] = v[1];
+            }
+            for m in 0..3 {
+                let back = 5 + n - LINK_DELAY[m];
+                let [wr, wi] = &mut *w;
+                let (pr, pi) = (wr[m][back], wi[m][back]);
+                let (nr, ni) = (&mut wr[m][5 + n], &mut wi[m][5 + n]);
+                for k in 0..ap {
+                    let q = t.q[k][m];
+                    let a = t.a[k][m];
+                    let (er, ei) = (q[0] * pr[k] - q[1] * pi[k], q[0] * pi[k] + q[1] * pr[k]);
+                    let (xr, xi) = (ur[k] + a * er, ui[k] + a * ei);
+                    nr[k] = xr;
+                    ni[k] = xi;
+                    ur[k] = er - a * xr;
+                    ui[k] = ei - a * xi;
                 }
             }
-            let g = &gain[cfg.k_to_i[k]];
-            for n in 0..SLOTS {
-                out[n][0] *= g[n];
-                out[n][1] *= g[n];
+            for k in 0..ap {
+                d[k][n] = [ur[k], ui[k]];
+            }
+        }
+        for part in 0..2 {
+            for m in 0..3 {
+                self.links[part][m].copy_from_slice(&w[part][m][SLOTS..]);
+            }
+        }
+        for k in 0..self.used {
+            if k >= ap {
+                let delay = if k < cfg.short { 14 } else { 1 };
+                let out = &mut d[k];
+                for n in 0..SLOTS {
+                    out[n] = if n >= delay {
+                        s[k][n - delay]
+                    } else {
+                        self.delay[k][14 + n - delay]
+                    };
+                }
+            }
+            self.delay[k].copy_from_slice(&s[k][SLOTS - 14..]);
+            let i = cfg.k_to_i[k];
+            for (o, g) in d[k].iter_mut().zip(&gain) {
+                o[0] *= g[i];
+                o[1] *= g[i];
             }
         }
     }
@@ -781,6 +923,7 @@ impl Ps {
         d: &[[C; SLOTS]; 91],
         l: &mut [[C; SLOTS]; 91],
         r: &mut [[C; SLOTS]; 91],
+        ramp: &mut [[Mix; SLOTS]; MAX_PAR],
     ) {
         let wide = self.wide;
         let iid_n = h.iid.map_or(10, par_count);
@@ -852,32 +995,54 @@ impl Ps {
                 }
                 target[b] = m;
             }
-            // Interpolate from the previous matrices over the envelope.
+            // Interpolate from the previous matrices over the envelope, once
+            // per parameter band and slot.
             let end = p.borders[e] + 1;
             let width = (end - start) as f32;
-            for k in 0..cfg.bands {
-                let b = cfg.k_to_i[k];
+            let mut complex = [false; MAX_PAR];
+            for b in 0..cfg.parameters {
                 let (from, to) = (self.mix_prev[b], target[b]);
-                let neg = negative(wide, k);
+                complex[b] = from.iter().chain(&to).any(|v| v[1] != 0.0);
                 for n in start..end {
                     let t = (n + 1 - start) as f32 / width;
-                    let mut mm = [[0f32; 2]; 4];
-                    for (j, v) in mm.iter_mut().enumerate() {
-                        *v = [
+                    ramp[b][n] = std::array::from_fn(|j| {
+                        [
                             from[j][0] + t * (to[j][0] - from[j][0]),
                             from[j][1] + t * (to[j][1] - from[j][1]),
+                        ]
+                    });
+                }
+            }
+            for k in 0..self.used {
+                let b = cfg.k_to_i[k];
+                let ramp = &ramp[b];
+                let (sk, dk) = (&s[k], &d[k]);
+                let (lk, rk) = (&mut l[k], &mut r[k]);
+                if !complex[b] {
+                    // Real matrices: four real-by-complex products.
+                    for n in start..end {
+                        let m = &ramp[n];
+                        let (sv, dv) = (sk[n], dk[n]);
+                        lk[n] = [
+                            m[0][0] * sv[0] + m[2][0] * dv[0],
+                            m[0][0] * sv[1] + m[2][0] * dv[1],
                         ];
-                        if neg {
-                            v[1] = -v[1];
-                        }
+                        rk[n] = [
+                            m[1][0] * sv[0] + m[3][0] * dv[0],
+                            m[1][0] * sv[1] + m[3][0] * dv[1],
+                        ];
                     }
-                    let (sv, dv) = (s[k][n], d[k][n]);
-                    let a = mul(mm[0], sv);
-                    let b2 = mul(mm[2], dv);
-                    l[k][n] = [a[0] + b2[0], a[1] + b2[1]];
-                    let a = mul(mm[1], sv);
-                    let b2 = mul(mm[3], dv);
-                    r[k][n] = [a[0] + b2[0], a[1] + b2[1]];
+                    continue;
+                }
+                // Negative-frequency bands take the conjugate phases.
+                let sign = if negative(wide, k) { -1.0 } else { 1.0 };
+                for n in start..end {
+                    let m = ramp[n].map(|v| [v[0], sign * v[1]]);
+                    let (sv, dv) = (sk[n], dk[n]);
+                    let (a, b2) = (mul(m[0], sv), mul(m[2], dv));
+                    lk[n] = [a[0] + b2[0], a[1] + b2[1]];
+                    let (a, b2) = (mul(m[1], sv), mul(m[3], dv));
+                    rk[n] = [a[0] + b2[0], a[1] + b2[1]];
                 }
             }
             self.mix_prev = target;
@@ -888,7 +1053,7 @@ impl Ps {
 
 /// Hybrid synthesis: the split subbands' hybrid bands summed, the others
 /// copied.
-fn synthesis(hy: &[[C; SLOTS]; 91], cfg: &Config, wide: bool, out: &mut Qmf) {
+fn synthesis(hy: &[[C; SLOTS]; 91], cfg: &Config, wide: bool, used: usize, out: &mut Qmf) {
     for part in out.iter_mut() {
         for row in part.iter_mut() {
             row.fill(0.0);
@@ -906,7 +1071,7 @@ fn synthesis(hy: &[[C; SLOTS]; 91], cfg: &Config, wide: bool, out: &mut Qmf) {
             }
         }
     }
-    for q in cfg.split..64 {
+    for q in cfg.split..cfg.split + used - cfg.split_bands {
         let k = cfg.split_bands + q - cfg.split;
         for n in 0..SLOTS {
             out[0][n][q] = hy[k][n][0];

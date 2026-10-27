@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// K-weighting coefficients adapted from FFmpeg libavfilter/ebur128.c.
-// Copyright (c) 2011 Jan Kokemüller; derived from libebur128 (MIT).
 // AUDENIQ: fused 50ms meters, four-scalar gate history, fixed-size histogram,
 // explicit null for silence, polyphase true peak, reusable decode buffers.
 use crate::{
@@ -9,7 +7,7 @@ use crate::{
     resample::{FingerprintTap, TruePeak, Window},
     AudioSpec, Error, Limits, Result,
 };
-use std::{f64::consts::PI, path::Path};
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct Analysis {
@@ -57,6 +55,53 @@ crate::json_struct!(Analysis {
     fingerprint_windows: skip_none,
 });
 
+/// ITU-R BS.1770-5 Table 1 and 2: the K-weighting stages at 48 kHz, as
+/// (b0, b1, b2) / (1, a1, a2): the high-frequency shelf, then the RLB
+/// high-pass.
+const SHELF_48K: ([f64; 3], [f64; 3]) = (
+    [1.53512485958697, -2.69169618940638, 1.19839281085285],
+    [1.0, -1.69065929318241, 0.73248077421585],
+);
+const HIGHPASS_48K: ([f64; 3], [f64; 3]) = (
+    [1.0, -2.0, 1.0],
+    [1.0, -1.99004745483398, 0.99007225036621],
+);
+
+/// A 48 kHz biquad moved to `rate`: the inverse bilinear transform
+/// (s = 2·48000·(1 − z⁻¹)/(1 + z⁻¹)) gives its analog prototype exactly,
+/// and the bilinear transform at `rate` brings that back. With u = s/(2·48000)
+/// the prototype is (B0 + B1 u + B2 u²)/(A0 + A1 u + A2 u²); at `rate` u is
+/// r·w with r = rate/48000 and w = (1 − z⁻¹)/(1 + z⁻¹). At 48 kHz this
+/// returns the standard's coefficients unchanged.
+fn biquad_at(rate: f64, (b, a): ([f64; 3], [f64; 3])) -> ([f64; 3], [f64; 3]) {
+    // z⁻ⁿ terms → powers of u, multiplied through by (1 + u)².
+    let to_u = |c: [f64; 3]| [c[0] + c[1] + c[2], 2.0 * (c[0] - c[2]), c[0] - c[1] + c[2]];
+    // Powers of w → z⁻ⁿ terms, multiplied through by (1 + z⁻¹)².
+    let to_z = |u: [f64; 3]| [u[0] + u[1] + u[2], 2.0 * (u[0] - u[2]), u[0] - u[1] + u[2]];
+    let r = rate / 48000.0;
+    let scale = |u: [f64; 3]| [u[0], u[1] * r, u[2] * r * r];
+    let (nb, na) = (to_z(scale(to_u(b))), to_z(scale(to_u(a))));
+    let k = 1.0 / na[0];
+    (nb.map(|v| v * k), na.map(|v| v * k))
+}
+
+/// The K-weighting filter at `rate` as one fourth-order section: the
+/// product of the two stages.
+fn k_weighting(rate: f64) -> ([f64; 5], [f64; 5]) {
+    let conv = |x: [f64; 3], y: [f64; 3]| {
+        let mut out = [0.0; 5];
+        for (i, &p) in x.iter().enumerate() {
+            for (j, &q) in y.iter().enumerate() {
+                out[i + j] += p * q;
+            }
+        }
+        out
+    };
+    let (sb, sa) = biquad_at(rate, SHELF_48K);
+    let (hb, ha) = biquad_at(rate, HIGHPASS_48K);
+    (conv(sb, hb), conv(sa, ha))
+}
+
 struct KWeight {
     b: [f64; 5],
     a: [f64; 5],
@@ -67,30 +112,7 @@ struct KWeight {
 }
 impl KWeight {
     fn new(rate: u32, channels: usize, backend: Backend) -> Self {
-        let k = (PI * 1681.974450955533 / rate as f64).tan();
-        let q = 0.7071752369554196;
-        let vh = 10f64.powf(3.999843853973347 / 20.0);
-        let vb = vh.powf(0.4996667741545416);
-        let a0 = 1.0 + k / q + k * k;
-        let pb = [
-            (vh + vb * k / q + k * k) / a0,
-            2.0 * (k * k - vh) / a0,
-            (vh - vb * k / q + k * k) / a0,
-        ];
-        let pa = [1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0];
-        let k = (PI * 38.13547087602444 / rate as f64).tan();
-        let q = 0.5003270373238773;
-        let a0 = 1.0 + k / q + k * k;
-        let ra = [1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0];
-        let rb = [1.0, -2.0, 1.0];
-        let mut b = [0.0; 5];
-        let mut a = [0.0; 5];
-        for i in 0..3 {
-            for j in 0..3 {
-                b[i + j] += pb[i] * rb[j];
-                a[i + j] += pa[i] * ra[j];
-            }
-        }
+        let (b, a) = k_weighting(f64::from(rate));
         Self {
             b,
             a,
@@ -483,6 +505,36 @@ mod tests {
     /// Both channels in one SSE2/NEON register give the scalar filter's bits,
     /// including the decay to zero after the input stops.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn k_weighting_is_the_standard_at_48k_and_its_response_elsewhere() {
+        // At 48 kHz: the product of BS.1770's two published stages.
+        let (b, a) = k_weighting(48000.0);
+        let (sb, sa) = SHELF_48K;
+        let (hb, ha) = HIGHPASS_48K;
+        assert!((b[0] - sb[0] * hb[0]).abs() < 1e-12 && (a[1] - (sa[1] + ha[1])).abs() < 1e-12);
+        // Gain at f: |B(e^jw)| / |A(e^jw)|, in dB.
+        let gain = |b: &[f64; 5], a: &[f64; 5], f: f64, rate: f64| {
+            let w = 2.0 * std::f64::consts::PI * f / rate;
+            let eval = |c: &[f64; 5]| {
+                let (re, im) = c.iter().enumerate().fold((0.0, 0.0), |(r, i), (n, &v)| {
+                    (r + v * (n as f64 * w).cos(), i - v * (n as f64 * w).sin())
+                });
+                (re * re + im * im).sqrt()
+            };
+            20.0 * (eval(b) / eval(a)).log10()
+        };
+        // Other rates follow the 48 kHz response within 0.05 dB through
+        // the audio band (the shelf's +4 dB, the high-pass corner).
+        for rate in [44100.0, 88200.0, 96000.0, 192000.0] {
+            let (b2, a2) = k_weighting(rate);
+            for f in [20.0, 40.0, 100.0, 1000.0, 1500.0, 3000.0, 10000.0, 16000.0] {
+                let (g0, g1) = (gain(&b, &a, f, 48000.0), gain(&b2, &a2, f, rate));
+                assert!((g0 - g1).abs() < 0.05, "{rate} Hz at {f} Hz: {g0} vs {g1}");
+            }
+        }
+        // 1 kHz is about 0.7 dB up (BS.1770 offsets that with −0.691).
+        assert!((gain(&b, &a, 997.0, 48000.0) - 0.69).abs() < 0.03);
+    }
     #[test]
     fn vector_stereo_weighting_matches_scalar() {
         for rate in [44100, 48000, 96000, 192000] {

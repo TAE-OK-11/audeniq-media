@@ -457,6 +457,93 @@ fn evaluate_profile(
     }
 }
 
+/// What the comparison with the released master
+/// ([`crate::master::MasterMatch`]) asks staff to look at: warnings, as an
+/// MV may carry a dialogue intro or a different edit on purpose.
+pub(crate) fn master_issues(m: &crate::master::MasterMatch) -> Vec<Issue> {
+    let mut out = Vec::new();
+    let mut add = |code: &'static str, severity: Severity, detail: String| {
+        out.push(Issue {
+            code,
+            severity,
+            detail,
+        })
+    };
+    use Severity::{Info, Warning};
+    let ranges = |r: &[[f64; 2]]| {
+        r.iter()
+            .take(5)
+            .map(|[a, b]| format!("{a:.0}~{b:.0}초"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match m.verdict {
+        "different" => add(
+            "MASTER_DIFFERENT",
+            Warning,
+            "소리가 발매 음원과 다른 곡으로 보입니다. 올바른 음원으로 만든 영상인지 확인해 주세요."
+                .into(),
+        ),
+        "same_song_different_master" => add(
+            "MASTER_DIFFERENT_MIX",
+            Warning,
+            format!(
+                "같은 곡이지만 발매 음원과 다른 믹스·마스터입니다(차이 신호 {:.0}dB, 음색 차이 최대 {:.1}dB). 발매 음원 그대로 넣어 주세요.",
+                m.null_snr_db.unwrap_or(0.0),
+                m.eq_difference_db.unwrap_or(0.0)
+            ),
+        ),
+        "same_master_level_differs" => add(
+            "MASTER_LEVEL",
+            Warning,
+            format!(
+                "발매 음원과 같은 마스터지만 음량이 {:+.1}dB 다릅니다.",
+                m.gain_db
+            ),
+        ),
+        "same_master_speed_differs" => add(
+            "MASTER_SPEED",
+            Warning,
+            format!(
+                "발매 음원보다 속도·음높이가 {:+.2}% 다릅니다(프레임레이트 변환 등). 원래 속도로 다시 넣어 주세요.",
+                m.drift_ppm / 1e4
+            ),
+        ),
+        "same_master_edited" => add(
+            "MASTER_EDITED",
+            Warning,
+            format!(
+                "발매 음원과 같은 마스터지만 다른 구간이 있습니다(영상 기준 {}).",
+                ranges(&m.differing)
+            ),
+        ),
+        _ => {}
+    }
+    if m.verdict != "different" {
+        if m.mv_extra.iter().any(|&s| s >= 1.0) {
+            add(
+                "MASTER_EXTRA",
+                Info,
+                format!(
+                    "음원 앞뒤로 영상에만 있는 소리가 있습니다(앞 {:.1}초, 뒤 {:.1}초: 인트로·아웃트로).",
+                    m.mv_extra[0], m.mv_extra[1]
+                ),
+            );
+        }
+        if m.master_missing.iter().any(|&s| s >= 1.0) {
+            add(
+                "MASTER_PARTIAL",
+                Info,
+                format!(
+                    "음원의 일부가 영상에 없습니다(처음 {:.1}초, 끝 {:.1}초).",
+                    m.master_missing[0], m.master_missing[1]
+                ),
+            );
+        }
+    }
+    out
+}
+
 pub(crate) fn evaluate(
     r: &Report,
     l: &Layout,

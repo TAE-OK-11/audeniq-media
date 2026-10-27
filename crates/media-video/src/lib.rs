@@ -23,6 +23,7 @@ pub mod cli;
 pub mod codec;
 pub mod convert;
 mod file;
+pub mod master;
 mod report;
 pub mod sound;
 mod source;
@@ -143,6 +144,27 @@ pub fn probe_path_for(
 ) -> Result<Report, Error> {
     let mut f = std::io::BufReader::with_capacity(READ_BUFFER, std::fs::File::open(path)?);
     probe_for(&mut f, sound, profile)
+}
+
+/// [`probe_path_for`], and with `master` also compare the sound with the
+/// released master ([`master::match_master`]); its findings join the
+/// issues.
+pub fn probe_path_master(
+    path: &std::path::Path,
+    sound: bool,
+    profile: Option<&'static check::Profile>,
+    master: Option<&std::path::Path>,
+) -> Result<Report, Error> {
+    let mut report = probe_path_for(path, sound, profile)?;
+    if let Some(m) = master
+        && !report.audio.is_empty()
+    {
+        let found = master::match_master(path, m)?;
+        report.issues.extend(check::master_issues(&found));
+        report.master = Some(found);
+        report.mv_ready = report.issues.iter().all(|i| i.severity != Severity::Error);
+    }
+    Ok(report)
 }
 
 /// Byte ranges of the sound track's data ([`sound::ranges`]).

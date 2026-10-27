@@ -8,6 +8,8 @@ audeniq-music video probe FILE           보고서 JSON (stdout, 종료 0) — �
 audeniq-music video probe --sound FILE   + 소리 트랙을 디코드해 음량·피크·클리핑·무음 측정
 audeniq-music video probe --profile NAME FILE   + 플랫폼 사양 검사(youtube, spotify, apple; --sound와 함께 쓰면 음량 기준까지)
 audeniq-music video profiles             프로필별 사양 JSON
+audeniq-music video probe --master MASTER FILE   + 소리가 발매 음원과 같은지 대조(MASTER_* 코드)
+audeniq-music video match-master MV MASTER       대조 결과만 JSON
 audeniq-music video sound-ranges FILE    소리 데이터가 있는 바이트 범위 {"ranges": [[offset, len], …], "bytes": N}
 audeniq-music video convert-audio [--preset NAME] IN OUT   영상은 그대로, 소리를 배급 사양으로 변환 (CONVERT.md)
 audeniq-music video capabilities         엔진·규칙 버전
@@ -150,6 +152,34 @@ MPEG-1/2/2.5 Layer III: 모노·스테레오, M/S·인텐시티 스테레오, �
 사양(예: [FUGA](https://support.fuga.com/hc/en-us/articles/39331113637012-How-to-Deliver-Music-Videos-to-Spotify-via-FUGA),
 [Digdis](https://digdis.helpscoutdocs.com/article/107-requirements-for-spotify-music-videos)). 배급사마다 다른 부분(시작·끝 검은
 화면, 인트로 허용 등)은 넣지 않았습니다. 국내 플랫폼 사양은 문서를 받으면 같은 방식으로 더합니다.
+
+## 발매 음원 대조 (`--master`, `match-master`)
+
+뮤직비디오 소리가 발매된 음원(마스터)과 같은지 봅니다. 마스터는 WAV·AIFF·FLAC·ALAC·WavPack·TTA(음원 엔진의 리더)나
+MP4·MOV·M4A입니다. 둘 다 모노 11.025kHz로 디코드해(`src/master.rs`):
+
+1. **정렬**: 24개 대역 에너지의 상승(46ms 프레임)을 대역별로 상호상관해 더하고, 가장 강한 8개 후보 시점을 파형 상관(±0.5초,
+   표본 단위)으로 영상 처음·가운데·끝 세 곳에서 확인합니다. 셋 중 가운데 값(두 곳이 맞으면 됨)으로 고르므로 박자가 반복되는
+   곡이나 일부만 바뀐 영상에서도 맞는 시점을 찾습니다.
+2. **속도**: 양 끝 1분의 상승 상관(프레임 이하 보간)으로 시점이 얼마나 벌어지는지 보고, 파형이 맞으면 표본 단위로 다듬습니다.
+3. **차이 신호(널 테스트)**: 3초 구간마다 이득을 맞춘 마스터를 빼고(구간마다 ±4ms 다시 정렬) 남은 신호의 SNR을 잽니다.
+   같은 마스터는 AAC 128~256k·MP3 128k를 거쳐도 36~53dB, 다른 믹스·마스터는 20dB 아래입니다.
+4. **음량·음색**: 둘 사이 이득, 이득을 뺀 대역별 레벨 차이의 최대값(EQ·마스터링 차이).
+
+| `verdict` | 뜻 | 코드 |
+|---|---|---|
+| `identical` | 같은 마스터, 음량 차 0.5dB 미만 | — |
+| `same_master_level_differs` | 같은 마스터, 음량만 다름 | `MASTER_LEVEL` |
+| `same_master_edited` | 같은 마스터, 일부 구간이 다름(`differing`: 영상 시각) | `MASTER_EDITED` |
+| `same_master_speed_differs` | 같은 마스터, 속도·음높이가 다름(`drift_ppm`, 예: 24↔23.976fps 변환 −1000ppm) | `MASTER_SPEED` |
+| `same_song_different_master` | 같은 곡, 다른 믹스·마스터 | `MASTER_DIFFERENT_MIX` |
+| `different` | 다른 곡(정렬 값은 0) | `MASTER_DIFFERENT` |
+
+앞뒤로 영상에만 있는 소리(인트로·아웃트로)는 `mv_extra`와 `MASTER_EXTRA`(info), 영상에 없는 음원 부분은 `master_missing`과
+`MASTER_PARTIAL`(info)입니다. 모두 warning·info라 `mv_ready`는 바뀌지 않습니다(대사 인트로 등 일부러 다른 경우가 있음).
+FFmpeg로 만든 4분 사례(같은 마스터 AAC·MP3, −3dB, EQ+컴프레서, 다른 곡, 5초 인트로, 0.1% 빠르게, 가운데 20초 교체)에서
+판정이 모두 맞고(오프셋 표본 단위, 속도 −979ppm/실제 −999ppm), 한 쌍에 1.5~2.5초입니다. 합성 신호 단위 테스트는
+`src/master.rs`의 `tests`입니다.
 
 ## 한계
 

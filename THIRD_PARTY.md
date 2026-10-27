@@ -18,7 +18,6 @@ Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
 * `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3 data) generated from `libavcodec/aactab.c` (FFmpeg n6.1.1); Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007). The decoder code in `crates/media-aac` is AUDENIQ's; its window overlap, intensity/noise gain and TNS coefficient conventions were checked against `libavcodec/aacdec_template.c` and match FFmpeg's output sample for sample (`crates/media-aac/tests/ffmpeg.rs`).
 * `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window and noise table (ISO/IEC 14496-3 data) generated from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c` and `aacpsdata.c` (FFmpeg n6.1.1); Robert Swain (2008-2009), Alex Converse (2008-2010). The window's c(384) and c(512) carry the standard's signs (FFmpeg negates them for its MDCT-based banks). `crates/media-aac/src/sbr.rs` and `ps.rs` are AUDENIQ's: the QMF banks are the standard's complex matrices computed as DCT-IVs of size 64 (`crates/media-dsp`, derived in `sbr.rs`); buffer timing, envelope adjustment and PS mixing follow `libavcodec/aacsbr*.c`, `sbrdsp*.c`, `aacps*.c` step for step so the output matches FFmpeg's and the MPEG conformance references (`crates/media-video/tests/conformance.rs`).
 * `crates/media-mp3/src/tables.rs`: Layer III Huffman codebooks, scale-factor band widths, pretab, slen/LSF tables (ISO/IEC 11172-3, 13818-3 data) generated from `libavcodec/mpegaudiodec_common.c`, and the synthesis window from `mpegaudiodsp_data.c` (FFmpeg n6.1.1); Fabrice Bellard (2001-2003). The decoder code in `crates/media-mp3` is AUDENIQ's (the IMDCT folded to a DCT-IV of size 18 and the synthesis matrixing to a DCT-II of size 32, both from the standard's definitions); bit-reservoir, intensity-stereo and short-block conventions were checked against `mpegaudiodec_template.c` and match FFmpeg's output within 1e-5 (`crates/media-mp3/tests/ffmpeg.rs`).
-* `crates/audeniq-qc/src/meter.rs`: K-weighting coefficient equations from `libavfilter/ebur128.c`; Jan Kokemüller (2011). That source also includes the libebur128 MIT notice below.
 
 Rust translations change storage, bounds handling, error propagation, work limits and dispatch; they do not remove upstream attribution. No FFmpeg binary, libav* library, GPL-only filter, or native media-codec FFI is linked. Media processing is Rust, including CPU intrinsics; normal Rust system-runtime libraries still apply. Full LGPL text: LICENSE; referenced GPL text: COPYING.GPLv2.
 
@@ -34,7 +33,18 @@ Cargo.lock pins transitive dependencies. Dependency sources/license notices rema
 
 `crates/audeniq-qc/src/m4a.rs` and `crates/audeniq-qc/src/msb.rs` are AUDENIQ-specific Rust implementations of the container tables and cached bounded bit reader, rather than copied Symphonia source. The default build has no third-party crates; the `reference-codecs` build adds Symphonia, and the Rust standard library still applies.
 
-## libebur128 MIT notice
+## Clean-room replacements
+
+Modules once derived from the sources above, rewritten from public
+specifications without the derived code (each verified against independent
+oracles: FFmpeg's binaries, conformance references, the previous output):
+
+* `crates/audeniq-qc/src/meter.rs` K-weighting: the coefficients come from
+  ITU-R BS.1770-5's 48 kHz stages, moved to other rates through their exact
+  analog prototype (inverse and forward bilinear transform). Integrated
+  loudness is unchanged at 48 kHz and within 0.005 LU at 44.1 kHz.
+
+## libebur128 MIT notice (historical: no longer used)
 
 Copyright (c) 2011 Jan Kokemüller
 

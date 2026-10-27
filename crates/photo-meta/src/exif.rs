@@ -1,4 +1,4 @@
-//! EXIF / TIFF IFD reader (ExifTool Exif.pm subset with the same names).
+//! EXIF / TIFF IFD reader, written from TIFF 6.0 and EXIF (CIPA DC-008).
 
 use crate::{Metadata, Value, clean, latin1, utf8_or_latin1};
 use std::collections::HashSet;
@@ -6,7 +6,12 @@ use std::collections::HashSet;
 const MAX_ENTRIES: usize = 1000;
 const MAX_IFDS: usize = 32;
 
-/// Tag id → (name, group override for sub-IFD pointers).
+/// Tag id → output name: the TIFF/EXIF tag names, the Windows XP tags
+/// (0x9C9B..0x9C9F) by their Microsoft names, and ExifTool's aliases for
+/// 0x0132 DateTime (`ModifyDate`), 0x8827 PhotographicSensitivity (`ISO`),
+/// 0x9004 DateTimeDigitized (`CreateDate`), 0xA002/0xA003
+/// PixelX/YDimension (`ExifImageWidth/Height`) and 0xA430 CameraOwnerName
+/// (`OwnerName`).
 fn name(id: u16) -> Option<&'static str> {
     Some(match id {
         0x0100 => "ImageWidth",

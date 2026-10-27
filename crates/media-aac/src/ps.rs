@@ -980,17 +980,20 @@ impl Ps {
                 if h.ext && b < cfg.ipd_parameters {
                     // Phases smoothed over this and the last two envelopes.
                     let smooth = |now: i8, hist: [i8; 2]| {
-                        let ph = |v: i8| f32::from(v) * PI / 4.0;
-                        let (a, b0, b1) = (expj(ph(now)), expj(ph(hist[0])), expj(ph(hist[1])));
-                        let re = a[0] + 0.5 * b0[0] + 0.25 * b1[0];
-                        let im = a[1] + 0.5 * b0[1] + 0.25 * b1[1];
+                        let ph = |v: i8| f64::from(v) * std::f64::consts::PI / 4.0;
+                        let (a, b0, b1) = (ph(now), ph(hist[0]), ph(hist[1]));
+                        let re = a.cos() + 0.5 * b0.cos() + 0.25 * b1.cos();
+                        let im = a.sin() + 0.5 * b0.sin() + 0.25 * b1.sin();
                         im.atan2(re)
                     };
                     let po = smooth(opd[b], self.opd_hist[b]);
                     let pi = smooth(ipd[b], self.ipd_hist[b]);
                     self.opd_hist[b] = [opd[b], self.opd_hist[b][0]];
                     self.ipd_hist[b] = [ipd[b], self.ipd_hist[b][0]];
-                    let (p1, p2) = (expj(po), expj(po - pi));
+                    let (p1, p2) = (
+                        [po.cos() as f32, po.sin() as f32],
+                        [(po - pi).cos() as f32, (po - pi).sin() as f32],
+                    );
                     m = [mul(m[0], p1), mul(m[1], p2), mul(m[2], p1), mul(m[3], p2)];
                 }
                 target[b] = m;

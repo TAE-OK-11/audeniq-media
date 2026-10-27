@@ -57,6 +57,7 @@ name = "audeniq-qc"
 version = "0.1.0"
 dependencies = [
  "image",
+ "media-bits",
  "media-hash",
  "media-json",
  "symphonia",
@@ -504,6 +505,10 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 [[package]]
 name = "media-aac"
 version = "0.1.0"
+dependencies = [
+ "media-bits",
+ "media-dsp",
+]
 
 [[package]]
 name = "media-adm"
@@ -511,6 +516,14 @@ version = "0.1.0"
 dependencies = [
  "media-json",
 ]
+
+[[package]]
+name = "media-bits"
+version = "0.1.0"
+
+[[package]]
+name = "media-dsp"
+version = "0.1.0"
 
 [[package]]
 name = "media-hash"
@@ -529,8 +542,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-mp3"
+version = "0.1.0"
+dependencies = [
+ "media-bits",
+ "media-dsp",
+]
+
+[[package]]
 name = "media-resample"
 version = "0.1.0"
+dependencies = [
+ "media-dsp",
+]
 
 [[package]]
 name = "media-video"
@@ -538,7 +562,10 @@ version = "0.1.0"
 dependencies = [
  "audeniq-qc",
  "media-aac",
+ "media-bits",
+ "media-dsp",
  "media-json",
+ "media-mp3",
  "media-resample",
 ]
 

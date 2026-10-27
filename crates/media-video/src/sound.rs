@@ -1,15 +1,16 @@
 //! A music video's sound, decoded and measured with the audio engine's
 //! meters (EBU R128 loudness, true peak, clipping, silence), as the audio
-//! QC does for masters. AAC-LC is decoded by `media-aac`; QuickTime/ISO
-//! integer and float PCM directly. Only the sound track's chunks are read,
+//! QC does for masters. Decoding is [`crate::source`]'s: AAC (with HE-AAC),
+//! ALAC, MP3 and QuickTime/ISO integer and float PCM. Only the sound track's chunks are read,
 //! so a caller holding the file in object storage fetches just those
 //! ([`ranges`]).
 use crate::Error;
 use crate::audio::AudioConfig;
 use crate::boxes::{child, children, path, u32_at};
 use crate::file::Layout;
+use crate::source;
 use crate::track::{self, Kind};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 
 /// Bytes of sound data read at most (24-bit 48 kHz stereo PCM: 15 minutes).
 pub const MAX_SOUND_BYTES: u64 = 256 << 20;
@@ -20,6 +21,13 @@ pub struct Sound {
     pub codec_name: String,
     pub sample_rate: u32,
     pub channels: u32,
+    /// How the channels were taken ([`crate::source::Plan::kind`]):
+    /// `mono`, `stereo`, `dual-mono` (two mono tracks as left and right) or
+    /// `channels` (the first two of discrete channels).
+    pub mapping: String,
+    /// AAC profile as decoded (`LC`, `HE-AAC`, `HE-AACv2`); SBR signalled
+    /// only in the stream itself shows here, not in the index.
+    pub profile: Option<String>,
     pub duration: f64,
     /// Packets decoded and packets the decoder refused.
     pub packets: u64,
@@ -40,6 +48,8 @@ media_json::json_struct!(Sound {
     codec_name,
     sample_rate,
     channels,
+    mapping,
+    profile,
     duration,
     packets,
     decode_errors,
@@ -53,7 +63,7 @@ media_json::json_struct!(Sound {
     longest_silence
 });
 
-/// The sound track the delivery uses: the first enabled one (or the only).
+/// A sound track and its sample description.
 pub(crate) struct Chosen<'a> {
     pub id: u32,
     pub cfg: AudioConfig,
@@ -61,9 +71,13 @@ pub(crate) struct Chosen<'a> {
     pub stbl: &'a [u8],
 }
 
-pub(crate) fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
-    let ts = child(moov, b"mvhd")
-        .and_then(|m| u32_at(m, if m.first() == Some(&1) { 20 } else { 12 }))?;
+/// Every sound track in file order, with its enabled flag.
+pub(crate) fn audio_tracks(moov: &[u8]) -> Vec<(bool, Chosen<'_>)> {
+    let Some(ts) =
+        child(moov, b"mvhd").and_then(|m| u32_at(m, if m.first() == Some(&1) { 20 } else { 12 }))
+    else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
     for (t, trak) in children(moov) {
         if &t != b"trak" {
@@ -73,7 +87,9 @@ pub(crate) fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
             continue;
         };
         if let Kind::Audio(_, cfg) = tr.kind {
-            let stbl = path(trak, &[b"mdia", b"minf", b"stbl"])?;
+            let Some(stbl) = path(trak, &[b"mdia", b"minf", b"stbl"]) else {
+                continue;
+            };
             found.push((
                 tr.enabled,
                 Chosen {
@@ -85,8 +101,7 @@ pub(crate) fn choose(moov: &[u8]) -> Option<Chosen<'_>> {
             ));
         }
     }
-    let only = found.len() == 1;
-    found.into_iter().find(|(e, _)| *e || only).map(|(_, c)| c)
+    found
 }
 
 /// Bytes of one PCM frame, `None` for compressed codecs.
@@ -167,29 +182,17 @@ pub(crate) fn reads(layout: &Layout, c: &Chosen) -> Result<Vec<(u64, Vec<u32>)>,
     Ok(out)
 }
 
-/// Byte ranges (offset, length) holding the sound track's data, adjacent
-/// ones merged. Empty when there is no sound track.
+/// Byte ranges (offset, length) holding the delivery sound's data
+/// ([`crate::source::plan`]: one track, or a left/right pair), adjacent ones
+/// merged. Empty when there is no sound track.
 pub(crate) fn ranges(layout: &Layout) -> Result<Vec<(u64, u64)>, Error> {
-    let Some(c) = layout.moov.as_deref().and_then(choose) else {
+    let Some(moov) = layout.moov.as_deref() else {
         return Ok(Vec::new());
     };
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    let mut total = 0u64;
-    for (off, sizes) in reads(layout, &c)? {
-        let len: u64 = sizes.iter().map(|&s| u64::from(s)).sum();
-        total = total.saturating_add(len);
-        if total > MAX_SOUND_BYTES {
-            return Err(Error::Limit(format!(
-                "sound data over {MAX_SOUND_BYTES} bytes"
-            )));
-        }
-        match out.last_mut() {
-            Some((o, l)) if *o + *l == off => *l += len,
-            _ if len > 0 => out.push((off, len)),
-            _ => {}
-        }
+    match source::plan(moov, None)? {
+        Some(p) => source::ranges(layout, &p),
+        None => Ok(Vec::new()),
     }
-    Ok(out)
 }
 
 /// Interleaved PCM bytes → left-aligned i32.
@@ -242,37 +245,37 @@ fn db(v: f64) -> Option<f64> {
     (v > 0.0).then(|| (20.0 * v.log10() * 100.0).round() / 100.0)
 }
 
-/// Decode and measure the sound track. The inner `Err` says why it cannot
-/// be measured (no track, a codec or layout the meters do not take).
+/// Decode and measure the delivery sound (the sound track, or a mono
+/// left/right pair). The inner `Err` says why it cannot be measured (no
+/// track, a codec or layout the meters do not take).
 pub(crate) fn measure<R: Read + Seek>(
     r: &mut R,
     layout: &Layout,
 ) -> Result<Result<Sound, String>, Error> {
-    let Some(c) = layout.moov.as_deref().and_then(choose) else {
+    let Some(moov) = layout.moov.as_deref() else {
         return Ok(Err("소리 트랙이 없습니다".into()));
     };
-    if !(1..=2).contains(&c.cfg.channels) {
+    let Some(plan) = source::plan(moov, None)? else {
+        return Ok(Err("소리 트랙이 없습니다".into()));
+    };
+    let first = &plan.tracks[0];
+    if plan.kind == "downmix" {
         return Ok(Err(format!(
             "{}채널 소리는 측정하지 않습니다(모노·스테레오만)",
-            c.cfg.channels
+            first.cfg.channels
         )));
     }
-    let frame = pcm_frame(&c.cfg);
-    let mut aac = match (c.cfg.codec.as_str(), frame) {
-        ("aac", _) => match media_aac::Decoder::new(&c.cfg.asc) {
-            Ok(d) => Some(d),
-            Err(e) => return Ok(Err(format!("AAC를 디코딩할 수 없습니다: {e}"))),
-        },
-        (_, Some(_)) => None,
-        (codec, None) => return Ok(Err(format!("{codec} 소리는 아직 측정하지 않습니다"))),
+    let ts = source::movie_timescale(moov).unwrap_or(1);
+    let mut mix = match source::Mix::open(r, layout, &plan, ts, source::Use::Measure) {
+        Ok(m) => m,
+        Err(Error::Invalid(note)) => return Ok(Err(note)),
+        Err(e) => return Err(e),
     };
-    let rate = aac
-        .as_ref()
-        .map_or(c.cfg.sample_rate, |d| d.config.sample_rate);
-    let channels = aac.as_ref().map_or(c.cfg.channels, |d| d.channels() as u32);
+    let rate = mix.rate();
+    let channels = mix.names().len() as u32;
     let spec = audeniq_qc::AudioSpec {
         container: "mp4".into(),
-        codec: c.cfg.codec.clone(),
+        codec: first.cfg.codec.clone(),
         sample_rate: rate,
         channels: channels as u16,
         bits_per_sample: 24,
@@ -281,45 +284,34 @@ pub(crate) fn measure<R: Read + Seek>(
     let Ok(mut meter) = audeniq_qc::meter::PcmMeter::new(spec) else {
         return Ok(Err("측정기를 열 수 없습니다".into()));
     };
-    let (mut packets, mut errors, mut frames) = (0u64, 0u64, 0u64);
-    let (mut buf, mut pcm_f, mut pcm_i) = (Vec::new(), Vec::new(), Vec::new());
-    for (off, sizes) in reads(layout, &c)? {
-        let len: usize = sizes.iter().map(|&s| s as usize).sum();
-        buf.resize(len, 0);
-        r.seek(SeekFrom::Start(off))?;
-        r.read_exact(&mut buf)?;
-        pcm_i.clear();
-        let mut at = 0;
-        for &s in &sizes {
-            let packet = &buf[at..at + s as usize];
-            at += s as usize;
-            packets += 1;
-            match &mut aac {
-                Some(d) => {
-                    pcm_f.clear();
-                    match d.decode(packet, &mut pcm_f) {
-                        Ok(_) => pcm_i.extend(pcm_f.iter().map(|&x| {
-                            (f64::from(x).clamp(-1.0, 1.0) * 2147483647.0).round() as i32
-                        })),
-                        Err(_) => errors += 1,
-                    }
-                }
-                None => pcm_to_i32(&c.cfg.codec, packet, &mut pcm_i),
-            }
+    let mut frames = 0u64;
+    let (mut pcm_f, mut pcm_i) = (Vec::new(), Vec::new());
+    loop {
+        pcm_f.clear();
+        if !mix.pull(r, &mut pcm_f)? {
+            break;
         }
+        pcm_i.clear();
+        pcm_i.extend(
+            pcm_f
+                .iter()
+                .map(|&x| (f64::from(x).clamp(-1.0, 1.0) * 2147483647.0).round() as i32),
+        );
         frames += (pcm_i.len() / channels as usize) as u64;
         meter.push(&pcm_i);
     }
     let a = meter.finish(frames);
     let block = 0.05;
     Ok(Ok(Sound {
-        track_id: c.id,
-        codec_name: c.cfg.codec.clone(),
+        track_id: first.id,
+        codec_name: first.cfg.codec.clone(),
         sample_rate: rate,
         channels,
+        mapping: plan.kind.to_string(),
+        profile: mix.aac_profile().map(str::to_string),
         duration: (a.duration_secs * 1000.0).round() / 1000.0,
-        packets,
-        decode_errors: errors,
+        packets: mix.packets(),
+        decode_errors: mix.errors(),
         integrated_lufs: a.integrated_lufs.map(|v| (v * 100.0).round() / 100.0),
         true_peak_dbtp: a.true_peak_dbtp.map(|v| (v * 100.0).round() / 100.0),
         peak_dbfs: db(a.peak),

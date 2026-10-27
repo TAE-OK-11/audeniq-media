@@ -6,6 +6,8 @@
 ```text
 audeniq-music video probe FILE           보고서 JSON (stdout, 종료 0) — 색인만 읽음
 audeniq-music video probe --sound FILE   + 소리 트랙을 디코드해 음량·피크·클리핑·무음 측정
+audeniq-music video probe --profile NAME FILE   + 플랫폼 사양 검사(youtube, spotify, apple; --sound와 함께 쓰면 음량 기준까지)
+audeniq-music video profiles             프로필별 사양 JSON
 audeniq-music video sound-ranges FILE    소리 데이터가 있는 바이트 범위 {"ranges": [[offset, len], …], "bytes": N}
 audeniq-music video convert-audio [--preset NAME] IN OUT   영상은 그대로, 소리를 배급 사양으로 변환 (CONVERT.md)
 audeniq-music video capabilities         엔진·규칙 버전
@@ -63,7 +65,7 @@ FFprobe와 다르게 두는 것: AV1 색 정보(시퀀스 헤더 OBU)는 읽지 
 | `channels` | 스피커 배치가 없는(디스크리트, 스템) 3채널 이상: 1·2채널. 또는 `convert-audio --channels`로 고른 채널 |
 
 FFmpeg `ebur128`과의 비교(`tests/ffprobe.rs`): AAC MP4·PCM 24비트 MOV·PCM 16비트 빅엔디언 MOV·조각 MP4에서
-통합 음량 ±0.15 LU, True Peak ±0.2 dB 이내. 4분 AAC 스테레오 전체 측정 1.3초(`release-music`).
+통합 음량 ±0.15 LU, True Peak ±0.2 dB 이내. 4분 AAC 스테레오 전체 측정 0.73초(FFmpeg `ebur128` 2.33초, `release-music`).
 
 ### AAC 디코더 (`media-aac`)
 
@@ -74,12 +76,13 @@ IMDCT(DCT-IV를 1/4 크기 복소 FFT로). 채널 구성 0(PCE)도 읽습니다.
 - FFmpeg 디코더와 표본 단위 비교(`crates/media-aac/tests/ffmpeg.rs`): 48/44.1/32/22.05kHz, 모노·스테레오·5.1,
   M/S·IS·TNS 각각과 모두 켠 경우, 64k~384k에서 최대 차이 2.4e-7(float 반올림 수준). PNS는 난수라 블록 에너지 1dB 이내.
 - 손상된 접근 단위 3,000개에서 패닉 없음, 퍼징 대상 `fuzz/fuzz_targets/aac.rs`.
-- 4분 256k 스테레오 디코드 0.85초(FFmpeg 단일 스레드 1.25초).
+- 4분 256k 스테레오 디코드 0.54초(FFmpeg 0.92초). 허프만은 9비트 표 조회(`media-bits`), IMDCT는 `media-dsp`의 DCT-IV.
 
 **HE-AAC (SBR, `src/sbr.rs`)·HE-AACv2 (PS, `src/ps.rs`)**: QMF 분석(32밴드)·HF 생성(패치, 역필터)·엔벨로프 조정(노이즈·사인파·리미터)·
 QMF 합성(64밴드, 같은 샘플레이트로 신호된 SBR은 32밴드 다운샘플 합성), PS의 하이브리드 분석·역상관·IID/ICC/IPD/OPD 믹싱.
 신호 방식은 명시(객체 5·29), 하위 호환(sync extension 0x2b7/0x548), 암시(첫 접근 단위의 SBR) 모두 FFmpeg와 같이 처리하고,
-모노 HE-AAC는 PS 데이터가 없어도 스테레오로 냅니다(FFmpeg와 같음). QMF는 표준의 복소 행렬, 버퍼 시점·이득 계산은 FFmpeg와 같은 순서라
+모노 HE-AAC는 PS 데이터가 없어도 스테레오로 냅니다(FFmpeg와 같음). QMF는 표준의 복소 행렬을 크기 64 DCT-IV로 바꿔 계산하고
+(유도는 `src/sbr.rs`), 프레임의 32슬롯을 벡터 레인으로 한 번에 돌립니다. 버퍼 시점·이득 계산은 FFmpeg와 같은 순서라
 결과가 FFmpeg와 표본 단위로 같습니다. SBR 표는 FFmpeg에서 옮겼고, QMF 창의 c(384)·c(512)는 표준 부호(FFmpeg는 자기 MDCT 구현에 맞춰 뒤집어 둠)입니다.
 
 MPEG 적합성 스트림(FFmpeg FATE가 쓰는 것)의 기준 디코더 출력과 비교(`crates/media-video/tests/conformance.rs`,
@@ -93,18 +96,19 @@ MPEG 적합성 스트림(FFmpeg FATE가 쓰는 것)의 기준 디코더 출력�
 | `CT_DecoderCheck/sbr_{bc,i}-ps_{bc,i,bic}` | 신호 방식 4가지 | 0.28 | 0.28 |
 
 0.5 LSB 안팎은 기준이 16비트로 반올림된 만큼의 차이입니다. 무작위 SBR/PS 페이로드 12,000개(디버그 빌드)에서 패닉 없음.
-32초 HE-AAC 스테레오 디코드 1.0초(FFmpeg 0.25초: FFmpeg는 QMF를 FFT로 계산).
+4.3분 HE-AAC 스테레오 디코드 0.44초(FFmpeg 0.73초), HE-AACv2 0.41초(FFmpeg 0.72초).
 
 ### MP3 디코더 (`media-mp3`)
 
 MPEG-1/2/2.5 Layer III: 모노·스테레오, M/S·인텐시티 스테레오, 긴·짧은·혼합 블록, 비트 저장소(앞 프레임 데이터가 일부 없으면
-받을 수 있는 그래뉼만), CRC 프레임. IMDCT와 다상 합성 필터는 표준의 직접 형태입니다. 허프만·밴드·합성 창 표는 FFmpeg에서 옮겼고
+받을 수 있는 그래뉼만), CRC 프레임. 36점 IMDCT는 크기 18 DCT-IV로, 다상 합성의 행렬은 코사인 대칭으로 크기 32 DCT-II로
+줄여 32개 서브밴드·18개 슬롯을 벡터 레인으로 한 번에 계산합니다. 허프만·밴드·합성 창 표는 FFmpeg에서 옮겼고
 (LGPL-2.1-or-later) 코드는 자체 작성입니다. Free format, Layer I/II는 디코드하지 않습니다.
 
 - FFmpeg 디코더와 비교(`crates/media-mp3/tests/ffmpeg.rs`): LAME으로 만든 44.1/48/22.05/11.025kHz, CBR·VBR, 모노·스테레오에서
   최대 차이 3e-6. ISO 적합성 스트림(`si`·`si_block`·`si_huff`·`sin1k0db`·`compl`·`he_32/44/48khz`)도 1e-5 이내.
 - MP3-in-MP4 변환은 편집 목록(인코더 지연)까지 FFmpeg와 표본 단위로 같습니다(`tests/convert.rs`).
-- 10분 320k 스테레오 디코드 5.9초(FFmpeg 2.4초). 퍼징 대상 `fuzz/fuzz_targets/mp3.rs`.
+- 4분 320k 스테레오 디코드 0.46초(FFmpeg 0.92초). 퍼징 대상 `fuzz/fuzz_targets/mp3.rs`.
 
 ## 배급 검사 (`mv-delivery-v2`)
 
@@ -120,9 +124,37 @@ MPEG-1/2/2.5 Layer III: 모노·스테레오, M/S·인텐시티 스테레오, �
 
 규칙을 바꾸면 `RULE_VERSION`을 올립니다. 백엔드는 보고서의 `rule`을 같이 저장합니다.
 
+### 플랫폼 프로필 (`--profile`)
+
+일반 규칙 위에 한 플랫폼의 사양을 더 봅니다. 결과는 `PROFILE_*` 코드(warning, 음량 안내는 info)로 `issues`에 더해지고,
+보고서의 `profile`에 그 사양 버전(`youtube-2026-10` 등)이 남습니다. 일반 규칙과 `mv_ready`는 바뀌지 않습니다.
+사양은 `src/check.rs`의 `PROFILES`이고 `video profiles`로 볼 수 있습니다.
+
+| 프로필 | 컨테이너 | 영상 | 소리 | 그 밖 |
+|---|---|---|---|---|
+| `youtube` | MP4·MOV | H.264·HEVC·ProRes·AV1·VP9, 4:2:0 | AAC-LC·Opus·PCM, 48kHz | 16:9, Fast Start, 편집 목록 없음, −14 LUFS 재생(넘으면 True Peak −1dBTP 이하) |
+| `spotify` | MOV·MP4 | H.264·HEVC·ProRes, 4:2:0(ProRes 제외), BT.709·BT.2020 | AAC-LC·PCM 16/24비트, 48·96kHz | 16:9, 영상 1·소리 1 트랙만, −14 LUFS 재생(넘으면 True Peak −2dBTP 이하) |
+| `apple` | MOV | ProRes, BT.709 | PCM 16/24비트, 48kHz | 16:9, 영상 1·소리 1 트랙만 |
+
+| 코드 | 뜻 |
+|---|---|
+| `PROFILE_CONTAINER`, `PROFILE_VIDEO_CODEC`, `PROFILE_AUDIO_CODEC` | 받는 컨테이너·코덱이 아님 |
+| `PROFILE_AUDIO_SAMPLE_RATE`, `PROFILE_AUDIO_BIT_DEPTH` | 샘플레이트·PCM 비트 수가 다름 (`convert-audio`로 맞춤) |
+| `PROFILE_ASPECT_RATIO`, `PROFILE_CHROMA`, `PROFILE_COLOR` | 16:9가 아님, 4:2:0이 아님, 색 공간이 다름 |
+| `PROFILE_INDEX_AT_END`, `PROFILE_EDIT_LIST`, `PROFILE_EXTRA_TRACKS` | 색인이 뒤에 있음, 편집 목록이 트랙을 옮기거나 자름(인코더 지연만 건너뛰는 것은 제외), 영상·소리 외 트랙 |
+| `PROFILE_TRUE_PEAK` | 재생 기준보다 큰 마스터의 True Peak가 상한을 넘음 (`--sound`) |
+| `PROFILE_LOUDNESS`(info), `PROFILE_LOUDNESS_NOT_MEASURED`(info) | 재생할 때 얼마나 줄어드는지, 소리를 측정하지 않아 음량 기준을 못 봄 |
+
+출처: [YouTube 권장 업로드 인코딩 설정](https://support.google.com/youtube/answer/1722171),
+[Spotify 음량 정규화](https://support.spotify.com/artists/article/loudness-normalization), Spotify·Apple 뮤직비디오는 배급사가 전하는
+사양(예: [FUGA](https://support.fuga.com/hc/en-us/articles/39331113637012-How-to-Deliver-Music-Videos-to-Spotify-via-FUGA),
+[Digdis](https://digdis.helpscoutdocs.com/article/107-requirements-for-spotify-music-videos)). 배급사마다 다른 부분(시작·끝 검은
+화면, 인트로 허용 등)은 넣지 않았습니다. 국내 플랫폼 사양은 문서를 받으면 같은 방식으로 더합니다.
+
 ## 한계
 
-- 영상 프레임은 디코딩하지 않습니다(깨진 프레임, 실제 화면 내용은 보지 않음). 담당자 확인이 필요합니다. 소리는 `--sound`로 디코드합니다.
+- 영상 프레임은 디코딩하지 않습니다(깨진 프레임, 검은 화면·레터박스 같은 실제 화면 내용은 보지 않음). 담당자 확인이 필요합니다.
+  소리는 `--sound`로 디코드합니다.
 - 색인 한도: `moov` 64MiB, `moof` 하나 16MiB, 트랙당 샘플 5천만 개, 최상위 상자 20만 개. 넘으면 `LIMIT`.
 - MPEG-4 Part 2·MJPEG·DNxHD 등은 코덱 이름만 알려 줍니다(프로파일·픽셀 형식 없음).
 

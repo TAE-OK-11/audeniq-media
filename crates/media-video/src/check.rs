@@ -12,7 +12,7 @@
 //! or more, and sound as long as picture.
 use crate::file::Layout;
 use crate::report::Report;
-use crate::track::Track;
+use crate::track::{Kind, Track};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -106,7 +106,363 @@ fn chunks_inside(track: &Track, l: &Layout) -> (bool, bool) {
     (past_end, outside)
 }
 
-pub(crate) fn evaluate(r: &Report, l: &Layout, tracks: &[Track]) -> Vec<Issue> {
+/// One platform's delivery spec, checked on top of the general rules by
+/// `probe --profile NAME`. Its findings are `PROFILE_*` warnings: what that
+/// platform asks for, which the general bar does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Profile {
+    /// `--profile` name, and the platform's name in the details.
+    pub name: &'static str,
+    pub label: &'static str,
+    /// Spec version: changes whenever a rule here does.
+    pub version: &'static str,
+    /// `mp4`, `mov`.
+    pub containers: &'static [&'static str],
+    pub video_codecs: &'static [&'static str],
+    /// `pcm` for any PCM; `aac` means AAC-LC.
+    pub audio_codecs: &'static [&'static str],
+    pub sample_rates: &'static [u32],
+    /// PCM bit depths, when the spec names them.
+    pub pcm_bits: &'static [u32],
+    pub sixteen_by_nine: bool,
+    /// 4:2:0 chroma for the long-GOP codecs (not ProRes, which is 4:2:2+).
+    pub chroma_420: bool,
+    /// `color_primaries` values; empty takes any.
+    pub primaries: &'static [&'static str],
+    /// Index before the media, and no edit lists that move or cut tracks.
+    pub fast_start: bool,
+    pub no_edits: bool,
+    /// Nothing but one picture and one sound track.
+    pub only_av: bool,
+    /// Playback normalization target (LUFS), and the True Peak ceiling for
+    /// masters louder than it (dBTP).
+    pub loudness_target: Option<f64>,
+    pub true_peak_max: Option<f64>,
+}
+
+media_json::json_struct!(Profile {
+    name,
+    label,
+    version,
+    containers,
+    video_codecs,
+    audio_codecs,
+    sample_rates,
+    pcm_bits,
+    sixteen_by_nine,
+    chroma_420,
+    primaries,
+    fast_start,
+    no_edits,
+    only_av,
+    loudness_target,
+    true_peak_max
+});
+
+/// The platforms' published or distributor-relayed specs (see
+/// docs/video/README.md for sources; distributors differ, so these follow
+/// what the platform itself or most distributors state).
+pub const PROFILES: &[Profile] = &[
+    // YouTube recommended upload encoding settings: MP4, moov at the front,
+    // no edit lists, AAC-LC (or Opus) at 48 kHz, 4:2:0, 16:9 player;
+    // playback normalized to about −14 LUFS.
+    Profile {
+        name: "youtube",
+        label: "YouTube",
+        version: "youtube-2026-10",
+        containers: &["mp4", "mov"],
+        video_codecs: &["h264", "hevc", "prores", "av1", "vp9"],
+        audio_codecs: &["aac", "opus", "pcm"],
+        sample_rates: &[48000],
+        pcm_bits: &[],
+        sixteen_by_nine: true,
+        chroma_420: true,
+        primaries: &[],
+        fast_start: true,
+        no_edits: true,
+        only_av: false,
+        loudness_target: Some(-14.0),
+        true_peak_max: Some(-1.0),
+    },
+    // Spotify music videos through distributors: MOV/MP4, H.264, HEVC or
+    // ProRes 422 HQ, 1080p+, 16:9, Rec.709 or Rec.2020, 4:2:0 for long GOP,
+    // AAC-LC or PCM at 48/96 kHz, one video and one sound asset; Spotify
+    // normalizes to −14 LUFS and asks −2 dBTP for louder masters.
+    Profile {
+        name: "spotify",
+        label: "Spotify",
+        version: "spotify-2026-10",
+        containers: &["mov", "mp4"],
+        video_codecs: &["h264", "hevc", "prores"],
+        audio_codecs: &["aac", "pcm"],
+        sample_rates: &[48000, 96000],
+        pcm_bits: &[16, 24],
+        sixteen_by_nine: true,
+        chroma_420: true,
+        primaries: &["bt709", "bt2020"],
+        fast_start: false,
+        no_edits: false,
+        only_av: true,
+        loudness_target: Some(-14.0),
+        true_peak_max: Some(-2.0),
+    },
+    // Apple Music video (iTunes-era HD spec as relayed by distributors):
+    // ProRes 422 HQ in MOV, 1920×1080, Rec.709, 16/24-bit LPCM at 48 kHz.
+    Profile {
+        name: "apple",
+        label: "Apple Music",
+        version: "apple-2026-10",
+        containers: &["mov"],
+        video_codecs: &["prores"],
+        audio_codecs: &["pcm"],
+        sample_rates: &[48000],
+        pcm_bits: &[16, 24],
+        sixteen_by_nine: true,
+        chroma_420: false,
+        primaries: &["bt709"],
+        fast_start: false,
+        no_edits: false,
+        only_av: true,
+        loudness_target: None,
+        true_peak_max: None,
+    },
+];
+
+/// The profile called `name`.
+pub fn profile(name: &str) -> Option<&'static Profile> {
+    PROFILES.iter().find(|p| p.name == name)
+}
+
+/// `a:b` as a ratio.
+fn ratio(s: &str) -> Option<f64> {
+    let (a, b) = s.split_once(':')?;
+    let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+    (a > 0.0 && b > 0.0).then(|| a / b)
+}
+
+/// A track whose edit list moves its start or cuts its media (a plain
+/// one-edit list that only skips encoder priming does neither).
+fn edited(t: &Track) -> bool {
+    if t.start > 0.0005 {
+        return true;
+    }
+    let media = t.media_duration as f64 / f64::from(t.timescale.max(1));
+    t.edited
+        .is_some_and(|e| matches!(t.kind, Kind::Video(..)) && (media - e).abs() > 0.05)
+}
+
+fn evaluate_profile(
+    p: &Profile,
+    r: &Report,
+    tracks: &[Track],
+    add: &mut dyn FnMut(&'static str, Severity, String),
+) {
+    use Severity::{Info, Warning};
+    let who = p.label;
+    if !p.containers.contains(&r.container.format) {
+        add(
+            "PROFILE_CONTAINER",
+            Warning,
+            format!(
+                "{who} 사양: {} 파일 ({} 파일입니다).",
+                p.containers.join("·").to_uppercase(),
+                r.container.format.to_uppercase()
+            ),
+        );
+    }
+    if p.fast_start && !r.container.fast_start && r.container.fragments == 0 {
+        add(
+            "PROFILE_INDEX_AT_END",
+            Warning,
+            format!(
+                "{who} 사양: 색인(moov)이 파일 앞에 있는 파일(Fast Start). 다시 내보내거나 Fast Start로 저장해 주세요."
+            ),
+        );
+    }
+    if p.no_edits && tracks.iter().any(edited) {
+        add(
+            "PROFILE_EDIT_LIST",
+            Warning,
+            format!(
+                "{who} 사양: 편집 목록(시작 지연·잘라내기)이 없는 파일. 편집을 적용해 내보내 주세요."
+            ),
+        );
+    }
+    if p.only_av && (r.video.len() > 1 || r.audio.len() > 1 || !r.other.is_empty()) {
+        add(
+            "PROFILE_EXTRA_TRACKS",
+            Warning,
+            format!(
+                "{who} 사양: 영상 1개·소리 1개만 있는 파일 (영상 {}·소리 {}·기타 {}개).",
+                r.video.len(),
+                r.audio.len(),
+                r.other.len()
+            ),
+        );
+    }
+    let video = r.video.iter().find(|v| v.enabled || r.video.len() == 1);
+    if let Some(v) = video {
+        if !p.video_codecs.contains(&v.codec_name.as_str()) {
+            add(
+                "PROFILE_VIDEO_CODEC",
+                Warning,
+                format!(
+                    "{who} 사양: 영상 코덱 {} ({}입니다).",
+                    p.video_codecs.join("·"),
+                    v.codec_name
+                ),
+            );
+        }
+        let (w, h) = if v.rotation % 180 == 0 {
+            (v.width, v.height)
+        } else {
+            (v.height, v.width)
+        };
+        let sar = v
+            .sample_aspect_ratio
+            .as_deref()
+            .and_then(ratio)
+            .unwrap_or(1.0);
+        let dar = f64::from(w) * sar / f64::from(h.max(1));
+        if p.sixteen_by_nine && (dar - 16.0 / 9.0).abs() > 0.01 {
+            add(
+                "PROFILE_ASPECT_RATIO",
+                Warning,
+                format!(
+                    "{who} 사양: 16:9 화면 (화면비 {dar:.3}:1, {w}×{h}). 레터박스 없이 16:9로 내보내 주세요."
+                ),
+            );
+        }
+        if p.chroma_420
+            && v.codec_name != "prores"
+            && let Some(f) = v.pix_fmt.as_deref()
+            && !f.starts_with("yuv420p")
+            && !f.starts_with("yuvj420p")
+        {
+            add(
+                "PROFILE_CHROMA",
+                Warning,
+                format!("{who} 사양: 4:2:0 크로마 (픽셀 형식 {f}입니다)."),
+            );
+        }
+        if !p.primaries.is_empty()
+            && let Some(c) = v.color_primaries
+            && !p.primaries.contains(&c)
+        {
+            add(
+                "PROFILE_COLOR",
+                Warning,
+                format!("{who} 사양: 색 공간 {} ({c}입니다).", p.primaries.join("·")),
+            );
+        }
+    }
+    let audio = r.audio.iter().find(|a| a.enabled || r.audio.len() == 1);
+    if let Some(a) = audio {
+        let pcm = a.codec_name.starts_with("pcm_");
+        let kind = if pcm { "pcm" } else { a.codec_name.as_str() };
+        let lc = a.codec_name != "aac" || a.profile.as_deref().is_none_or(|p| p == "LC");
+        if !p.audio_codecs.contains(&kind) || !lc {
+            add(
+                "PROFILE_AUDIO_CODEC",
+                Warning,
+                format!(
+                    "{who} 사양: 소리 코덱 {} ({}{}입니다).",
+                    p.audio_codecs
+                        .iter()
+                        .map(|c| match *c {
+                            "aac" => "AAC-LC",
+                            "pcm" => "PCM",
+                            "opus" => "Opus",
+                            other => other,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("·"),
+                    a.codec_name,
+                    a.profile
+                        .as_deref()
+                        .map(|p| format!(" {p}"))
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        if !p.sample_rates.contains(&a.sample_rate) {
+            add(
+                "PROFILE_AUDIO_SAMPLE_RATE",
+                Warning,
+                format!(
+                    "{who} 사양: 샘플레이트 {}Hz ({}Hz입니다). convert-audio로 맞출 수 있습니다.",
+                    p.sample_rates
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join("·"),
+                    a.sample_rate
+                ),
+            );
+        }
+        if pcm
+            && !p.pcm_bits.is_empty()
+            && let Some(b) = a.bits_per_sample
+            && !p.pcm_bits.contains(&b)
+        {
+            add(
+                "PROFILE_AUDIO_BIT_DEPTH",
+                Warning,
+                format!(
+                    "{who} 사양: PCM {}비트 ({b}비트입니다).",
+                    p.pcm_bits
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join("·")
+                ),
+            );
+        }
+    }
+    if let (Some(target), Some(ceiling)) = (p.loudness_target, p.true_peak_max) {
+        match &r.sound {
+            Some(s) => {
+                if let (Some(l), Some(tp)) = (s.integrated_lufs, s.true_peak_dbtp)
+                    && l > target
+                    && tp > ceiling
+                {
+                    add(
+                        "PROFILE_TRUE_PEAK",
+                        Warning,
+                        format!(
+                            "{who} 사양: {target:.0} LUFS보다 큰 마스터({l:.1} LUFS)는 True Peak {ceiling:.0}dBTP 이하 ({tp:+.1}dBTP입니다). 재생할 때 소리를 줄이면서 찌그러질 수 있습니다."
+                        ),
+                    );
+                }
+                if let Some(l) = s.integrated_lufs
+                    && l > target + 0.5
+                {
+                    add(
+                        "PROFILE_LOUDNESS",
+                        Info,
+                        format!(
+                            "{who} 재생 음량 {target:.0} LUFS: 이 소리({l:.1} LUFS)는 {:.1}dB 작게 재생됩니다.",
+                            l - target
+                        ),
+                    );
+                }
+            }
+            None if r.sound_note.is_none() => add(
+                "PROFILE_LOUDNESS_NOT_MEASURED",
+                Info,
+                format!("{who} 음량 기준은 소리를 측정해야 확인할 수 있습니다(probe --sound)."),
+            ),
+            None => {}
+        }
+    }
+}
+
+pub(crate) fn evaluate(
+    r: &Report,
+    l: &Layout,
+    tracks: &[Track],
+    profile: Option<&Profile>,
+) -> Vec<Issue> {
     let mut out = Vec::new();
     let mut add = |code: &'static str, severity: Severity, detail: String| {
         out.push(Issue {
@@ -485,6 +841,9 @@ pub(crate) fn evaluate(r: &Report, l: &Layout, tracks: &[Track]) -> Vec<Issue> {
             Warning,
             "파일에 길이가 적혀 있지 않습니다.".into(),
         );
+    }
+    if let Some(p) = profile {
+        evaluate_profile(p, r, tracks, &mut add);
     }
     out
 }

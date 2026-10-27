@@ -221,8 +221,6 @@ struct Bands {
     /// First and last-plus-one SBR subband.
     kx: usize,
     m: usize,
-    /// Start of the master table (the lowest source subband bound).
-    k0: usize,
     high: Vec<usize>,
     low: Vec<usize>,
     noise: Vec<usize>,
@@ -348,7 +346,6 @@ impl Bands {
         Some(Bands {
             kx,
             m,
-            k0,
             high,
             low,
             noise,
@@ -909,6 +906,17 @@ pub(crate) struct Sbr {
     ch: [Channel; 2],
     pub(crate) ps: Ps,
     lanes: Lanes,
+    work: Box<Work>,
+}
+
+/// Per-frame buffers, kept between frames to avoid reallocating them.
+struct Work {
+    /// The frame's QMF signal and, for parametric stereo, its two outputs.
+    x: Qmf,
+    l: Qmf,
+    r: Qmf,
+    /// Generated high band before adjustment, [re/im][subband][slot].
+    xh: [[[f32; SPAN]; 64]; 2],
 }
 
 impl Sbr {
@@ -921,6 +929,12 @@ impl Sbr {
             ch: [Channel::new(), Channel::new()],
             ps: Ps::new(),
             lanes: Lanes::default(),
+            work: Box::new(Work {
+                x: [[[0.0; 64]; SLOTS]; 2],
+                l: [[[0.0; 64]; SLOTS]; 2],
+                r: [[[0.0; 64]; SLOTS]; 2],
+                xh: [[[0.0; SPAN]; 64]; 2],
+            }),
         }
     }
 
@@ -1158,30 +1172,51 @@ fn chirp(mode: u8, prev_mode: u8, prev: f32) -> f32 {
 /// buffer (covariance method, 4.6.18.6.2): (α0, α1) as (re, im) pairs,
 /// zero when unstable or degenerate.
 fn predictors(low: &[[[f32; 32]; SPAN]; 2], count: usize) -> [[[f32; 2]; 2]; 32] {
+    // φ(i, j) = Σ x(n − i) x*(n − j) over n = 0..38 of slots offset by
+    // ADJ: entries (0,1), (0,2), (1,2) complex; (1,1), (2,2) real. The
+    // shifted sums share all but their end terms: from the lag-1 sum L1,
+    // the lag-2 sum L2 and the energy E over the buffer, φ01 and φ12 are
+    // L1 less one end product, φ11 and φ22 are E less one end energy.
+    // All subbands are summed side by side, slot by slot.
+    const LAST: usize = SLOTS + 6 + 1; // buffer slots 0..=LAST are used
+    let (re, im) = (&low[0], &low[1]);
+    let mut l1 = [[0f64; 32]; 2];
+    let mut l2 = [[0f64; 32]; 2];
+    let mut energy = [0f64; 32];
+    for m in 1..=LAST {
+        for k in 0..count {
+            let (cr, ci) = (f64::from(re[m][k]), f64::from(im[m][k]));
+            let (ar, ai) = (f64::from(re[m - 1][k]), f64::from(im[m - 1][k]));
+            energy[k] += ar * ar + ai * ai;
+            l1[0][k] += cr * ar + ci * ai;
+            l1[1][k] += ci * ar - cr * ai;
+        }
+    }
+    for m in 2..=LAST {
+        for k in 0..count {
+            let (cr, ci) = (f64::from(re[m][k]), f64::from(im[m][k]));
+            let (br, bi) = (f64::from(re[m - 2][k]), f64::from(im[m - 2][k]));
+            l2[0][k] += cr * br + ci * bi;
+            l2[1][k] += ci * br - cr * bi;
+        }
+    }
     let mut out = [[[0.0; 2]; 2]; 32];
     for (k, o) in out.iter_mut().enumerate().take(count) {
-        // φ(i, j) = Σ x(n − i) x*(n − j) over n = 0..38 of slots offset by
-        // ADJ: entries (0,1), (0,2), (1,2) complex; (1,1), (2,2) real.
-        let x = |n: usize| (f64::from(low[0][n][k]), f64::from(low[1][n][k]));
-        let mut p01 = (0.0, 0.0);
-        let mut p02 = (0.0, 0.0);
-        let mut p12 = (0.0, 0.0);
-        let mut p11 = 0.0;
-        let mut p22 = 0.0;
-        for n in 0..SLOTS + 6 {
-            let a = x(n + ADJ);
-            let b = x(n + ADJ - 1);
-            let c = x(n + ADJ - 2);
-            // a·b*, a·c*, b·c*
-            p01.0 += a.0 * b.0 + a.1 * b.1;
-            p01.1 += a.1 * b.0 - a.0 * b.1;
-            p02.0 += a.0 * c.0 + a.1 * c.1;
-            p02.1 += a.1 * c.0 - a.0 * c.1;
-            p12.0 += b.0 * c.0 + b.1 * c.1;
-            p12.1 += b.1 * c.0 - b.0 * c.1;
-            p11 += b.0 * b.0 + b.1 * b.1;
-            p22 += c.0 * c.0 + c.1 * c.1;
-        }
+        let x = |n: usize| (f64::from(re[n][k]), f64::from(im[n][k]));
+        // L1 = Σ_{m<LAST} x(m+1)x*(m), E = Σ_{m<LAST} |x(m)|².
+        let (x0, x1) = (x(0), x(1));
+        let (xa, xb) = (x(LAST), x(LAST - 1));
+        let p01 = (
+            l1[0][k] - (x1.0 * x0.0 + x1.1 * x0.1),
+            l1[1][k] - (x1.1 * x0.0 - x1.0 * x0.1),
+        );
+        let p12 = (
+            l1[0][k] - (xa.0 * xb.0 + xa.1 * xb.1),
+            l1[1][k] - (xa.1 * xb.0 - xa.0 * xb.1),
+        );
+        let p02 = (l2[0][k], l2[1][k]);
+        let p11 = energy[k] - (x0.0 * x0.0 + x0.1 * x0.1);
+        let p22 = energy[k] - (xb.0 * xb.0 + xb.1 * xb.1);
         let d = p22 * p11 - (p12.0 * p12.0 + p12.1 * p12.1) / (1.0 + 1e-6);
         let mut a1 = (0.0, 0.0);
         if d != 0.0 {
@@ -1207,7 +1242,14 @@ fn predictors(low: &[[[f32; 32]; SPAN]; 2], count: usize) -> [[[f32; 2]; 2]; 32]
 impl Sbr {
     /// The SBR part of one channel's frame: HF generation and adjustment
     /// into `ch.high` over the frame's envelope slots.
-    fn generate(ch: &mut Channel, f: &Frame, levels: &Levels, bands: &Bands, h: &Header) {
+    fn generate(
+        ch: &mut Channel,
+        f: &Frame,
+        levels: &Levels,
+        bands: &Bands,
+        h: &Header,
+        xh: &mut [[[f32; SPAN]; 64]; 2],
+    ) {
         let g = &f.grid;
         let (kx, m) = (bands.kx, bands.m);
         let first = 2 * g.borders[0] + ADJ;
@@ -1222,8 +1264,9 @@ impl Sbr {
         ch.invf_prev = f.invf;
         // HF generation: each patch copies its source subbands up,
         // inverse-filtered with the band's chirp factor.
-        let alpha = predictors(&ch.low, bands.k0.max(kx).min(32));
-        let mut xh = [[[0f32; SPAN]; 64]; 2];
+        // Predictors of the source subbands the patches use.
+        let sources = bands.patches.iter().map(|&(p, w)| p + w).max().unwrap_or(0);
+        let alpha = predictors(&ch.low, sources.min(32));
         let mut k = kx;
         for &(src, width) in &bands.patches {
             for p in src..src + width {
@@ -1575,7 +1618,7 @@ impl Sbr {
             let carried = (2 * ch.end_prev).saturating_sub(SLOTS);
             let (kx, m) = match (&self.bands, &self.header, frames[c], &levels[c]) {
                 (Some(bands), Some(h), Some(f), Some(lv)) => {
-                    Self::generate(ch, &f, lv, bands, h);
+                    Self::generate(ch, &f, lv, bands, h, &mut self.work.xh);
                     ch.previous = Some(f);
                     ch.end_prev = f.grid.borders[f.grid.envelopes];
                     (bands.kx, bands.m)
@@ -1585,7 +1628,7 @@ impl Sbr {
                     (32, 0)
                 }
             };
-            let mut x: Box<Qmf> = Box::new([[[0.0; 64]; SLOTS]; 2]);
+            let Work { x, l, r, .. } = &mut *self.work;
             for j in 0..SLOTS {
                 let (kx, m) = if j < carried {
                     (ch.kx_prev, ch.m_prev)
@@ -1596,6 +1639,7 @@ impl Sbr {
                 for part in 0..2 {
                     x[part][j][..kx].copy_from_slice(&ch.low[part][s][..kx]);
                     x[part][j][kx..kx + m].copy_from_slice(&ch.high[part][s][kx..kx + m]);
+                    x[part][j][kx + m..].fill(0.0);
                 }
             }
             ch.kx_prev = kx;
@@ -1604,33 +1648,31 @@ impl Sbr {
             if ps && channels == 1 {
                 // Parametric stereo: two frames from the mono one, the
                 // right one through the second channel's synthesis.
-                let mut l: Box<Qmf> = Box::new([[[0.0; 64]; SLOTS]; 2]);
-                let mut r: Box<Qmf> = Box::new([[[0.0; 64]; SLOTS]; 2]);
                 // The hybrid filters' look-ahead: the lowest subbands 6
                 // slots on, already in the analysis buffer.
                 let mut ahead = [[[0f32; 2]; SLOTS]; 5];
                 for (q, row) in ahead.iter_mut().enumerate() {
                     for (j, v) in row.iter_mut().enumerate() {
-                        let s = (j + ADJ + 6).min(SPAN - 1);
+                        let s = j + ADJ + 6;
                         *v = [ch.low[0][s][q], ch.low[1][s][q]];
                     }
                 }
-                self.ps.apply(&x, &ahead, &mut l, &mut r);
+                self.ps.apply(x, &ahead, kx + m, l, r);
                 let [c0, c1] = &mut self.ch;
                 if down {
-                    Self::synthesis_ds(c0, &l, out_l, &mut self.lanes);
-                    Self::synthesis_ds(c1, &r, out_r, &mut self.lanes);
+                    Self::synthesis_ds(c0, l, out_l, &mut self.lanes);
+                    Self::synthesis_ds(c1, r, out_r, &mut self.lanes);
                 } else {
-                    Self::synthesis(c0, &l, out_l, &mut self.lanes);
-                    Self::synthesis(c1, &r, out_r, &mut self.lanes);
+                    Self::synthesis(c0, l, out_l, &mut self.lanes);
+                    Self::synthesis(c1, r, out_r, &mut self.lanes);
                 }
                 continue;
             }
             let out = if c == 0 { &mut *out_l } else { &mut *out_r };
             if down {
-                Self::synthesis_ds(ch, &x, out, &mut self.lanes);
+                Self::synthesis_ds(ch, x, out, &mut self.lanes);
             } else {
-                Self::synthesis(ch, &x, out, &mut self.lanes);
+                Self::synthesis(ch, x, out, &mut self.lanes);
             }
         }
     }

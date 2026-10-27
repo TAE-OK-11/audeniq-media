@@ -1,11 +1,20 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
-// WavPack integer lossless decoder. Originally a Rust port of FFmpeg
-// libavcodec/wavpack.c and wavpack.h (Copyright (c) 2006,2011 Konstantin
-// Shishkov; (c) 2020 David Bryant); now an AUDENIQ design: entropy decoding
-// with its state in registers, decorrelation and output as separate passes
-// over a block, branch-free weight steps, and the shared word-refill bit
-// reader. No hybrid/float/DSD/correction/multichannel code; checked reads,
-// strict sample CRCs, all-block format checks, reusable buffers, bounded work.
+//! WavPack 4/5 integer lossless decoder (mono, stereo), written from the
+//! format: David Bryant's WavPack 5 file format description and the
+//! reference library libwavpack (BSD-3-Clause; notice in THIRD_PARTY.md).
+//!
+//! A block is a 32-byte header (`wvpk`, version, index, sample count,
+//! flags, sample CRC) and metadata sub-blocks: the decorrelation terms,
+//! their weights and stored history, the entropy coder's medians, integer
+//! information, the sample bit stream (LSB first), extra bits and, in
+//! WavPack 5, a block checksum. Decoding runs in passes over a block:
+//! entropy decoding with its state in registers, then every
+//! decorrelation term per sample, then joint stereo, the sample CRC,
+//! extra bits, shifts and interleaving.
+//!
+//! No hybrid, float, DSD, correction-file or multichannel streams; reads
+//! are checked, both CRCs and the block checksum are verified, every block
+//! must match the first one's format, buffers are reused and work is
+//! bounded.
 use crate::{bits::Lsb, AudioSpec, Error, Limits, Result};
 use std::{
     fs::File,
@@ -45,18 +54,19 @@ fn le16(b: &[u8]) -> i16 {
 fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[..4].try_into().unwrap())
 }
+/// A stored 16-bit logarithm back to its value: sign, then 2^(|v| / 256)
+/// with the mantissa from [`EXP2`] (|v| / 256 ≥ 32 does not fit).
 fn exp2(v: i16) -> Result<i32> {
-    let v = v as i32;
-    let n = v.unsigned_abs();
-    let shift = n >> 8;
-    if shift > 31 {
+    let n = u32::from(v.unsigned_abs());
+    let (whole, frac) = (n >> 8, n & 255);
+    if whole > 31 {
         return Err(Error::Invalid("WavPack exponent"));
     }
-    let x = (EXP2[(n & 255) as usize] as u32) | 256;
-    let x = if shift > 9 {
-        x.wrapping_shl(shift - 9)
+    let mantissa = u32::from(EXP2[frac as usize]) | 256;
+    let x = if whole > 9 {
+        mantissa.wrapping_shl(whole - 9)
     } else {
-        x >> (9 - shift)
+        mantissa >> (9 - whole)
     } as i32;
     Ok(if v < 0 { x.wrapping_neg() } else { x })
 }
@@ -81,7 +91,7 @@ impl Wavpack {
         }
         let mut data = vec![0; size - 32];
         file.read_exact(&mut data)?;
-        let c = Context::parse(&data, flags)?;
+        let c = Context::parse(&h, &data)?;
         let rate = RATES[((flags >> 23) & 15) as usize];
         let rate = if rate == 0 {
             c.rate.ok_or(Error::Invalid("WavPack custom rate"))?
@@ -156,7 +166,7 @@ impl Wavpack {
         }
         self.packet.resize(size as usize - 32, 0);
         self.file.read_exact(&mut self.packet)?;
-        let mut c = Context::parse(&self.packet, flags)?;
+        let mut c = Context::parse(&h, &self.packet)?;
         let rate = RATES[((flags >> 23) & 15) as usize];
         let rate = if rate == 0 { c.rate.unwrap_or(0) } else { rate };
         let depth = (((flags & 3) + 1) * 8)
@@ -338,8 +348,23 @@ struct Context<'a> {
     post_shift: u32,
     rate: Option<u32>,
 }
+// Metadata sub-block ids (the low six bits; 0x20 marks optional data).
+const ID_TERMS: u8 = 2;
+const ID_WEIGHTS: u8 = 3;
+const ID_HISTORY: u8 = 4;
+const ID_MEDIANS: u8 = 5;
+const ID_INT_INFO: u8 = 9;
+const ID_SAMPLES: u8 = 10;
+const ID_EXTRA_BITS: u8 = 12;
+const ID_RATE: u8 = 0x27;
+const ID_CHECKSUM: u8 = 0x2f;
+/// Block flag: a checksum sub-block covers the block.
+const HAS_CHECKSUM: u32 = 0x1000_0000;
+
 impl<'a> Context<'a> {
-    fn parse(packet: &'a [u8], flags: u32) -> Result<Self> {
+    /// The metadata of one block (`header` and the bytes after it).
+    fn parse(header: &[u8; 32], packet: &'a [u8]) -> Result<Self> {
+        let flags = le32(&header[24..]);
         let stereo = flags & (4 | 0x40000000) == 0;
         let mut c = Self {
             stereo,
@@ -358,11 +383,12 @@ impl<'a> Context<'a> {
         if c.post_shift > 31 {
             return Err(Error::Invalid("WavPack shift"));
         }
-        // Every metadata sub-block once at most (ids below 32), in the
-        // block's order.
+        // Each required sub-block at most once (ids below 32), the terms
+        // before the weights and history that refer to them.
         let mut seen = 0u32;
-        for block in SubBlocks(packet) {
-            let (id, d) = block?;
+        let mut checked = false;
+        for block in SubBlocks::new(packet) {
+            let (start, id, d) = block?;
             if id < 32 {
                 let mask = 1u32 << id;
                 if seen & mask != 0 {
@@ -370,132 +396,74 @@ impl<'a> Context<'a> {
                 }
                 seen |= mask;
             }
+            let needs_terms = matches!(id, ID_WEIGHTS | ID_HISTORY);
+            if needs_terms && seen & (1 << ID_TERMS) == 0 {
+                return Err(Error::Invalid("WavPack metadata before its terms"));
+            }
             match id {
-                2 => {
-                    if d.len() > 16 {
-                        return Err(Error::Invalid("WavPack terms"));
-                    }
-                    for b in d.iter().rev() {
-                        let t = (b & 31) as i32 - 5;
-                        if !(matches!(t,-3..=-1|1..=8|17|18)) || (!stereo && t < 0) {
-                            return Err(Error::Invalid("WavPack decorrelation term"));
-                        }
-                        c.decorr.push(Decorr {
-                            term: t,
-                            delta: (b >> 5) as i32,
-                            ..Default::default()
-                        });
-                    }
-                }
-                3 => {
-                    if seen & (1 << 2) == 0 || !d.len().is_multiple_of(if stereo { 2 } else { 1 }) {
-                        return Err(Error::Invalid("WavPack weights"));
-                    }
-                    let mut i = 0;
-                    for t in c.decorr.iter_mut().rev() {
-                        if i == d.len() {
-                            break;
-                        }
-                        t.wa = weight(d[i]);
-                        i += 1;
-                        if stereo {
-                            t.wb = weight(d[i]);
-                            i += 1;
-                        }
-                    }
-                    if i != d.len() {
-                        return Err(Error::Invalid("too many weights"));
-                    }
-                }
-                4 => {
-                    if seen & (1 << 2) == 0 {
-                        return Err(Error::Invalid("WavPack samples order"));
-                    }
-                    let mut i = 0;
-                    for t in c.decorr.iter_mut().rev() {
-                        if i == d.len() {
-                            break;
-                        }
-                        if t.term > 8 {
-                            t.a[0] = get_exp(d, &mut i)?;
-                            t.a[1] = get_exp(d, &mut i)?;
-                            if stereo {
-                                t.b[0] = get_exp(d, &mut i)?;
-                                t.b[1] = get_exp(d, &mut i)?;
-                            }
-                        } else if t.term < 0 {
-                            t.a[0] = get_exp(d, &mut i)?;
-                            t.b[0] = get_exp(d, &mut i)?;
-                        } else {
-                            for j in 0..t.term as usize {
-                                t.a[j] = get_exp(d, &mut i)?;
-                                if stereo {
-                                    t.b[j] = get_exp(d, &mut i)?;
-                                }
-                            }
-                        }
-                    }
-                    if i != d.len() {
-                        return Err(Error::Invalid("WavPack decorrelation samples"));
-                    }
-                }
-                5 => {
-                    if d.len() != 6 * if stereo { 2 } else { 1 } {
-                        return Err(Error::Invalid("WavPack entropy"));
-                    }
-                    let mut i = 0;
-                    for ch in 0..if stereo { 2 } else { 1 } {
-                        for j in 0..3 {
-                            c.words.median[ch][j] = get_exp(d, &mut i)?;
-                            if c.words.median[ch][j] < 0 {
-                                return Err(Error::Invalid("WavPack negative median"));
-                            }
-                        }
-                    }
-                }
-                9 => {
-                    if d.len() != 4 || d[0] > 30 || d[1..].iter().any(|x| *x > 31) {
-                        return Err(Error::Invalid("WavPack integer info"));
-                    }
-                    c.extra_bits = d[0] as u32;
-                    c.shift = d[1] as u32;
-                    if d[2] != 0 {
-                        c.and = 1;
-                        c.or = 1;
-                        c.shift = d[2] as u32;
-                    }
-                    if d[3] != 0 {
-                        c.and = 1;
-                        c.or = 0;
-                        c.shift = d[3] as u32;
-                    }
-                }
-                10 => c.data = Some(d),
-                12 => {
+                ID_TERMS => c.decorr = terms(d, stereo)?,
+                ID_WEIGHTS => weights(&mut c.decorr, d, stereo)?,
+                ID_HISTORY => history(&mut c.decorr, d, stereo)?,
+                ID_MEDIANS => c.words.median = medians(d, stereo)?,
+                ID_INT_INFO => c.int_info(d)?,
+                ID_SAMPLES => c.data = Some(d),
+                ID_EXTRA_BITS => {
                     if d.len() <= 4 {
                         return Err(Error::Invalid("WavPack extra bits"));
                     }
                     c.extra_crc = Some(le32(d));
                     c.extra = Some(&d[4..]);
                 }
-                0x27 => {
-                    if d.len() != 3 {
+                ID_RATE => {
+                    let &[a, b, x] = d else {
                         return Err(Error::Invalid("WavPack rate metadata"));
-                    }
-                    c.rate = Some(d[0] as u32 | ((d[1] as u32) << 8) | ((d[2] as u32) << 16));
+                    };
+                    c.rate = Some(u32::from_le_bytes([a, b, x, 0]));
                 }
+                ID_CHECKSUM => {
+                    checksum(header, &packet[..start], d)?;
+                    checked = true;
+                }
+                // Padding, encoder information, channel layout (two
+                // channels at most here) and other optional data.
                 0 | 1 | 13 => (),
                 _ if id & 0x20 != 0 => (),
                 _ => return Err(Error::Unsupported("WavPack required metadata")),
             }
         }
-        if seen & 0x43c != 0x43c {
+        let required = [ID_TERMS, ID_WEIGHTS, ID_HISTORY, ID_MEDIANS, ID_SAMPLES];
+        if required.iter().any(|&id| seen & (1 << id) == 0) {
             return Err(Error::Invalid("missing WavPack metadata"));
         }
         if c.extra_bits != 0 && c.extra.is_none() {
             return Err(Error::Invalid("missing extra samples"));
         }
+        if flags & HAS_CHECKSUM != 0 && !checked {
+            return Err(Error::Invalid("missing WavPack block checksum"));
+        }
         Ok(c)
+    }
+    /// Integer information: extra bits sent separately, then a shift that
+    /// fills the low bits with zeros, ones, or copies of the lowest bit
+    /// (the last nonzero one applies).
+    fn int_info(&mut self, d: &[u8]) -> Result<()> {
+        let &[sent, zeros, ones, dups] = d else {
+            return Err(Error::Invalid("WavPack integer info"));
+        };
+        if sent > 30 || zeros > 31 || ones > 31 || dups > 31 {
+            return Err(Error::Invalid("WavPack integer info"));
+        }
+        self.extra_bits = u32::from(sent);
+        // The fill bit of `shifted`: zero (and 0, or 0), one (and 1,
+        // or 1) or the value's own lowest bit (and 1, or 0).
+        (self.shift, self.and, self.or) = (u32::from(zeros), 0, 0);
+        if ones != 0 {
+            (self.shift, self.and, self.or) = (u32::from(ones), 1, 1);
+        }
+        if dups != 0 {
+            (self.shift, self.and, self.or) = (u32::from(dups), 1, 0);
+        }
+        Ok(())
     }
     fn restore(&self, v: i32, extra: &mut Option<Lsb<'_>>, crc: &mut u32) -> Result<i32> {
         let mut v = v as u32;
@@ -638,41 +606,52 @@ impl Words {
     }
 }
 /// The metadata sub-blocks of a WavPack block: a byte id (bit 7: 24-bit
-/// size, bit 6: odd length), a size in 16-bit words and the data. Yields the
-/// id's low six bits and the data without its pad byte.
-struct SubBlocks<'a>(&'a [u8]);
+/// size, bit 6: odd length), a size in 16-bit words and the data. Yields
+/// the sub-block's offset, the id's low six bits and the data without its
+/// pad byte; stops after an error.
+struct SubBlocks<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+impl<'a> SubBlocks<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn read(&self) -> Result<(u8, &'a [u8], usize)> {
+        let rest = &self.bytes[self.pos..];
+        let (id, words, head) = match *rest {
+            [id, a, b, c, ..] if id & 0x80 != 0 => (id, u32::from_le_bytes([a, b, c, 0]), 4),
+            [id, _, ..] if id & 0x80 != 0 => return Err(Error::Invalid("WavPack metadata size")),
+            [id, a, ..] => (id, u32::from(a), 2),
+            _ => return Err(Error::Invalid("WavPack metadata")),
+        };
+        let size = words as usize * 2;
+        let len = size
+            .checked_sub(usize::from(id & 0x40 != 0))
+            .ok_or(Error::Invalid("WavPack odd size"))?;
+        let data = rest[head..]
+            .get(..size)
+            .ok_or(Error::Invalid("WavPack metadata length"))?;
+        Ok((id & 0x3f, &data[..len], head + size))
+    }
+}
 impl<'a> Iterator for SubBlocks<'a> {
-    type Item = Result<(u8, &'a [u8])>;
+    type Item = Result<(usize, u8, &'a [u8])>;
     fn next(&mut self) -> Option<Self::Item> {
-        let rest = self.0;
-        if rest.is_empty() {
+        if self.pos == self.bytes.len() {
             return None;
         }
-        Some(
-            (|| {
-                let [id, low, ..] = *rest else {
-                    return Err(Error::Invalid("WavPack metadata"));
-                };
-                let (words, data) = if id & 0x80 != 0 {
-                    let [_, _, a, b, ..] = *rest else {
-                        return Err(Error::Invalid("WavPack metadata size"));
-                    };
-                    (u32::from_le_bytes([low, a, b, 0]) as usize, &rest[4..])
-                } else {
-                    (low as usize, &rest[2..])
-                };
-                let size = words * 2;
-                let actual = size
-                    .checked_sub((id & 0x40 != 0) as usize)
-                    .ok_or(Error::Invalid("WavPack odd size"))?;
-                if size > data.len() {
-                    return Err(Error::Invalid("WavPack metadata length"));
-                }
-                self.0 = &data[size..];
-                Ok((id & 0x3f, &data[..actual]))
-            })()
-            .inspect_err(|_| self.0 = &[]),
-        )
+        let start = self.pos;
+        Some(match self.read() {
+            Ok((id, data, used)) => {
+                self.pos += used;
+                Ok((start, id, data))
+            }
+            Err(e) => {
+                self.pos = self.bytes.len();
+                Err(e)
+            }
+        })
     }
 }
 
@@ -733,6 +712,143 @@ fn tail(bits: &mut Lsb<'_>, base: u32, add: u32) -> Result<i32> {
     Ok(if bits.read(1)? != 0 { !v } else { v })
 }
 
+/// The decorrelation terms: one byte each (low five bits: term + 5, high
+/// three: the weight step), the last applied first.
+fn terms(d: &[u8], stereo: bool) -> Result<Vec<Decorr>> {
+    if d.len() > 16 {
+        return Err(Error::Invalid("WavPack terms"));
+    }
+    d.iter()
+        .rev()
+        .map(|&b| {
+            let term = i32::from(b & 31) - 5;
+            let valid = matches!(term, 1..=8 | 17 | 18) || (stereo && (-3..=-1).contains(&term));
+            if !valid {
+                return Err(Error::Invalid("WavPack decorrelation term"));
+            }
+            Ok(Decorr {
+                term,
+                delta: i32::from(b >> 5),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Initial weights, one signed byte per channel, for the terms applied
+/// last (terms without one start at zero).
+fn weights(terms: &mut [Decorr], d: &[u8], stereo: bool) -> Result<()> {
+    let per = if stereo { 2 } else { 1 };
+    if !d.len().is_multiple_of(per) || d.len() / per > terms.len() {
+        return Err(Error::Invalid("WavPack weights"));
+    }
+    for (t, w) in terms.iter_mut().rev().zip(d.chunks_exact(per)) {
+        t.wa = weight(w[0]);
+        if stereo {
+            t.wb = weight(w[1]);
+        }
+    }
+    Ok(())
+}
+
+/// Each term's stored history (16-bit logarithmic values), for the terms
+/// applied last: two outputs per channel for 17/18, one per channel for
+/// the cross terms, `term` per channel (interleaved) for 1..=8.
+fn history(terms: &mut [Decorr], d: &[u8], stereo: bool) -> Result<()> {
+    let mut i = 0;
+    for t in terms.iter_mut().rev() {
+        if i == d.len() {
+            break;
+        }
+        let rows = match t.term {
+            17 | 18 => 2,
+            1..=8 => t.term as usize,
+            _ => {
+                t.a[0] = get_exp(d, &mut i)?;
+                t.b[0] = get_exp(d, &mut i)?;
+                continue;
+            }
+        };
+        if t.term > 8 {
+            for j in 0..rows {
+                t.a[j] = get_exp(d, &mut i)?;
+            }
+            if stereo {
+                for j in 0..rows {
+                    t.b[j] = get_exp(d, &mut i)?;
+                }
+            }
+        } else {
+            for j in 0..rows {
+                t.a[j] = get_exp(d, &mut i)?;
+                if stereo {
+                    t.b[j] = get_exp(d, &mut i)?;
+                }
+            }
+        }
+    }
+    if i != d.len() {
+        return Err(Error::Invalid("WavPack decorrelation samples"));
+    }
+    Ok(())
+}
+
+/// The entropy coder's three running medians per channel (logarithmic).
+fn medians(d: &[u8], stereo: bool) -> Result<[[i32; 3]; 2]> {
+    let channels = if stereo { 2 } else { 1 };
+    if d.len() != 6 * channels {
+        return Err(Error::Invalid("WavPack entropy"));
+    }
+    let mut median = [[0; 3]; 2];
+    let mut i = 0;
+    for m in median.iter_mut().take(channels).flatten() {
+        *m = get_exp(d, &mut i)?;
+        if *m < 0 {
+            return Err(Error::Invalid("WavPack negative median"));
+        }
+    }
+    Ok(median)
+}
+
+/// The block checksum (WavPack 5): over the 16-bit little-endian words
+/// from the block header up to the checksum sub-block, s = 3s + w from
+/// s = −1; stored whole (4 bytes) or folded to 16 bits (2 bytes).
+fn checksum(header: &[u8; 32], before: &[u8], stored: &[u8]) -> Result<()> {
+    let mut sum = sum_words(!0, header);
+    sum = sum_words(sum, before);
+    let ok = match *stored {
+        [a, b, c, d] => sum == u32::from_le_bytes([a, b, c, d]),
+        [a, b] => (sum ^ (sum >> 16)) as u16 == u16::from_le_bytes([a, b]),
+        _ => false,
+    };
+    if !ok {
+        return Err(Error::Invalid("WavPack block checksum"));
+    }
+    Ok(())
+}
+
+/// s = 3s + w over the words of `bytes` (an even length). Eight words at a
+/// time: s·3⁸ plus the words weighted by 3⁷ … 1, which keeps the serial
+/// chain to one multiply per eight words.
+fn sum_words(mut sum: u32, bytes: &[u8]) -> u32 {
+    const POW: [u32; 8] = [2187, 729, 243, 81, 27, 9, 3, 1];
+    let (blocks, rest) = bytes.as_chunks::<16>();
+    for b in blocks {
+        let mut t = 0u32;
+        for (k, p) in POW.iter().enumerate() {
+            let w = u32::from(u16::from_le_bytes([b[2 * k], b[2 * k + 1]]));
+            t = t.wrapping_add(w.wrapping_mul(*p));
+        }
+        sum = sum.wrapping_mul(6561).wrapping_add(t);
+    }
+    for w in rest.as_chunks::<2>().0 {
+        sum = sum
+            .wrapping_mul(3)
+            .wrapping_add(u32::from(u16::from_le_bytes(*w)));
+    }
+    sum
+}
+
 fn get_exp(d: &[u8], i: &mut usize) -> Result<i32> {
     if d.len() - *i < 2 {
         return Err(Error::Invalid("WavPack history"));
@@ -741,16 +857,20 @@ fn get_exp(d: &[u8], i: &mut usize) -> Result<i32> {
     *i += 2;
     Ok(v)
 }
+/// A stored weight: a signed byte in units of 8, the positive ones scaled
+/// up by 1/128 so that 127 restores to the full 1024.
 fn weight(v: u8) -> i32 {
-    let w = (v as i8 as i32) * 8;
+    let w = i32::from(v as i8) * 8;
     if w > 0 {
         w + ((w + 64) >> 7)
     } else {
         w
     }
 }
+/// A weight (1024 = 1.0) times a sample, rounded.
+#[inline(always)]
 fn apply(w: i32, v: i32) -> i32 {
-    ((w as i64 * v as i64 + 512) >> 10) as i32
+    ((i64::from(w) * i64::from(v) + 512) >> 10) as i32
 }
 /// The weight after one sample: stepped by delta towards agreement of the
 /// prediction's and the input's signs, unless either is zero. Branch-free:
@@ -829,81 +949,127 @@ fn decode_words_body<const STEREO: bool>(
 }
 
 /// The decorrelation terms over a block, in place (`left`/`right` hold the
-/// entropy-decoded values and receive the output). Positive terms predict
-/// from the channel's own output `term` samples back (1..8, from an
-/// eight-entry history) or extrapolate from the last two outputs (17, 18);
-/// negative terms (stereo only) cross the channels. The arithmetic is the
-/// format's; the weight steps are branch-free (see [`update`]).
+/// entropy-decoded residuals and receive the output):
+///
+/// * 1..=8: the channel's own output `term` samples back (the block's
+///   stored history before that) weighs into each sample;
+/// * 17, 18: a linear (2a − b) or half-slope (a + (a − b)/2) extrapolation
+///   from the term's last two outputs;
+/// * −1, −2, −3 (stereo only): each channel predicted from the other one,
+///   with weights clipped to ±1024.
+///
+/// Each sample passes through every term before the next sample: a term's
+/// chain from one sample to the next is serial, but the chains of
+/// consecutive terms overlap, which a pass per term would give away. The
+/// weight steps are branch-free (see [`update`]). Blocks are independent
+/// (each stores its history), so nothing is kept after the block.
 fn decorrelate(terms: &mut [Decorr], left: &mut [i32], right: &mut [i32], stereo: bool) {
-    let mut pos = 0;
-    for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+    if stereo {
+        decorrelate_rows::<true>(terms, left, right);
+    } else {
+        decorrelate_rows::<false>(terms, left, right);
+    }
+}
+
+fn decorrelate_rows<const S: bool>(terms: &mut [Decorr], left: &mut [i32], right: &mut [i32]) {
+    // Histories of terms 1..=8 are rings of eight outputs: sample i reads
+    // slot i mod 8 (written `term` samples earlier, or stored) and writes
+    // slot (i + term) mod 8.
+    for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
         let (mut x, mut y) = (*l, *r);
+        let slot = i & 7;
         for d in terms.iter_mut() {
-            let t = d.term;
-            if t > 0 {
-                let (a, b, j) = if t > 8 {
-                    let a = if t == 17 {
-                        d.a[0].wrapping_mul(2).wrapping_sub(d.a[1])
-                    } else {
-                        d.a[0].wrapping_mul(3).wrapping_sub(d.a[1]) >> 1
-                    };
-                    let b = if t == 17 {
-                        d.b[0].wrapping_mul(2).wrapping_sub(d.b[1])
-                    } else {
-                        d.b[0].wrapping_mul(3).wrapping_sub(d.b[1]) >> 1
-                    };
-                    d.a[1] = d.a[0];
-                    d.b[1] = d.b[0];
-                    (a, b, 0)
-                } else {
-                    (d.a[pos], d.b[pos], (pos + t as usize) & 7)
-                };
-                let xx = x.wrapping_add(apply(d.wa, a));
-                d.wa = update(d.wa, d.delta, a, x);
-                let yy = if stereo {
-                    let yy = y.wrapping_add(apply(d.wb, b));
-                    d.wb = update(d.wb, d.delta, b, y);
-                    yy
-                } else {
-                    0
-                };
-                x = xx;
-                y = yy;
-                d.a[j] = x;
-                d.b[j] = y;
-            } else if t == -1 {
-                let xx = x.wrapping_add(apply(d.wa, d.a[0]));
-                d.wa = update(d.wa, d.delta, d.a[0], x).clamp(-1024, 1024);
-                x = xx;
-                let yy = y.wrapping_add(apply(d.wb, xx));
-                d.wb = update(d.wb, d.delta, xx, y).clamp(-1024, 1024);
-                y = yy;
-                d.a[0] = y;
-            } else {
-                let yy = y.wrapping_add(apply(d.wb, d.b[0]));
-                d.wb = update(d.wb, d.delta, d.b[0], y).clamp(-1024, 1024);
-                y = yy;
-                let pred = if t == -3 {
-                    let old = d.a[0];
+            let delta = d.delta;
+            match d.term {
+                t @ 1..=8 => {
+                    let next = (slot + t as usize) & 7;
+                    x = predict(&mut d.wa, delta, d.a[slot], x);
+                    d.a[next] = x;
+                    if S {
+                        y = predict(&mut d.wb, delta, d.b[slot], y);
+                        d.b[next] = y;
+                    }
+                }
+                t @ 17..=18 => {
+                    let half = t == 18;
+                    x = predict(&mut d.wa, delta, extrapolate(half, d.a[0], d.a[1]), x);
+                    (d.a[1], d.a[0]) = (d.a[0], x);
+                    if S {
+                        y = predict(&mut d.wb, delta, extrapolate(half, d.b[0], d.b[1]), y);
+                        (d.b[1], d.b[0]) = (d.b[0], y);
+                    }
+                }
+                -1 => {
+                    // Left from the previous right output, then right from
+                    // this left output.
+                    x = predict_clip(&mut d.wa, delta, d.a[0], x);
+                    y = predict_clip(&mut d.wb, delta, x, y);
                     d.a[0] = y;
-                    old
-                } else {
-                    y
-                };
-                let xx = x.wrapping_add(apply(d.wa, pred));
-                d.wa = update(d.wa, d.delta, pred, x).clamp(-1024, 1024);
-                x = xx;
-                d.b[0] = x;
+                }
+                -2 => {
+                    // Right from the previous left output, then left from
+                    // this right output.
+                    y = predict_clip(&mut d.wb, delta, d.b[0], y);
+                    x = predict_clip(&mut d.wa, delta, y, x);
+                    d.b[0] = x;
+                }
+                _ => {
+                    // −3: each channel from the other's previous output.
+                    x = predict_clip(&mut d.wa, delta, d.a[0], x);
+                    y = predict_clip(&mut d.wb, delta, d.b[0], y);
+                    (d.a[0], d.b[0]) = (y, x);
+                }
             }
         }
-        pos = (pos + 1) & 7;
         (*l, *r) = (x, y);
     }
+}
+
+/// Terms 17 (2a − b) and 18 (a + (a − b) / 2) from the last output a and
+/// the one before it b.
+#[inline(always)]
+fn extrapolate(half: bool, a: i32, b: i32) -> i32 {
+    if half {
+        a.wrapping_add(a.wrapping_sub(b) >> 1)
+    } else {
+        a.wrapping_mul(2).wrapping_sub(b)
+    }
+}
+
+/// One sample: the residual plus the weighted prediction, and the weight's
+/// step.
+#[inline(always)]
+fn predict(w: &mut i32, delta: i32, pred: i32, res: i32) -> i32 {
+    let out = res.wrapping_add(apply(*w, pred));
+    *w = update(*w, delta, pred, res);
+    out
+}
+
+/// The same with the weight clipped to ±1024 (the cross-channel terms).
+#[inline(always)]
+fn predict_clip(w: &mut i32, delta: i32, pred: i32, res: i32) -> i32 {
+    let out = res.wrapping_add(apply(*w, pred));
+    *w = update(*w, delta, pred, res).clamp(-1024, 1024);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checksum_words_match_the_serial_definition() {
+        let bytes: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        for len in (0..200).step_by(2).chain([998, 1000]) {
+            let serial = bytes[..len].as_chunks::<2>().0.iter().fold(!0u32, |s, w| {
+                s.wrapping_mul(3)
+                    .wrapping_add(u32::from(w[0]) | u32::from(w[1]) << 8)
+            });
+            assert_eq!(sum_words(!0, &bytes[..len]), serial, "{len}");
+        }
+    }
 
     /// The table as WavPack's format documents it.
     #[test]

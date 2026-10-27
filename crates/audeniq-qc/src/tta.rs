@@ -1,405 +1,414 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
-// TTA decoder. Originally a Rust translation of FFmpeg libavcodec/tta.c,
-// ttadata.c, ttadsp.c (Copyright (c) 2006 Alex Beregszaszi; FFmpeg
-// contributors); now an AUDENIQ design: entropy decoding, filtering and
-// output run as separate passes over a frame, the filter state is local and
-// shifted by value, and the bit reader refills with unaligned word loads.
-// Strict CRCs, checked sizes/bit reads and sample-count validation remain.
+//! TTA (True Audio, format 1) lossless decoder, written from the format's
+//! description:
+//!
+//! - A 22-byte header (`TTA1`, format 1 = integer PCM, channels, bits per
+//!   sample, sample rate, samples per channel, CRC-32), then a table with
+//!   each frame's size and its own CRC-32.
+//! - Frames of `rate · 256 / 245` samples per channel (the last one
+//!   shorter), each an LSB-first bit stream followed by the CRC-32 of its
+//!   bytes. Every frame starts every channel's state afresh.
+//! - Per sample, one residual per channel: an adaptive Rice code with two
+//!   parameters (one for small values, one for the excess of large ones);
+//!   then an eight-tap sign–sign adaptive filter; then a first-order fixed
+//!   predictor `x += prev·(2ᵏ − 1) / 2ᵏ`; then, with more than one channel,
+//!   the inter-channel differences are undone.
+//!
+//! Output samples are left-justified to 32 bits, as the other decoders'.
 use crate::{
     bits::{crc32, Lsb},
     AudioSpec, Error, Limits, Result,
 };
-use std::{fs::File, io::Read};
+use std::fs::File;
+use std::io::Read;
+
+const HEADER: usize = 22;
 
 pub struct Tta {
     file: File,
     pub spec: AudioSpec,
-    sizes: Vec<u32>,
-    index: usize,
-    frame_len: u32,
-    packet: Vec<u8>,
-    planes: [Vec<i32>; 2],
+    /// Byte size of every frame (CRC included), in order.
+    frame_sizes: Vec<u32>,
+    next_frame: usize,
+    /// Samples per channel in a full frame, and still to come.
+    frame_samples: u64,
+    left: u64,
+    bytes: Vec<u8>,
+    states: Vec<Channel>,
+    /// One sample's values across the channels.
+    row: Vec<i32>,
 }
+
+fn u16_le(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+fn u32_le(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
 impl Tta {
     pub fn open(mut file: File, limits: &Limits) -> Result<Self> {
-        let mut h = [0u8; 22];
+        let mut h = [0u8; HEADER];
         file.read_exact(&mut h)?;
-        if &h[..4] != b"TTA1" || le16(&h[4..]) != 1 {
-            return Err(Error::Unsupported("encrypted/nonstandard TTA"));
+        if &h[..4] != b"TTA1" {
+            return Err(Error::Invalid("not a TTA1 file"));
         }
-        if crc32(&h[..18]) != le32(&h[18..]) {
+        if crc32(&h[..18]) != u32_le(&h[18..]) {
             return Err(Error::Invalid("TTA header CRC"));
         }
-        let spec = AudioSpec {
-            container: "tta".into(),
-            codec: "tta".into(),
-            channels: le16(&h[6..]),
-            bits_per_sample: le16(&h[8..]),
-            sample_rate: le32(&h[10..]),
-            frames: Some(le32(&h[14..]) as u64),
-        };
-        spec.validate()?;
-        let frame_len = 256 * spec.sample_rate / 245;
-        let frames = spec.frames.unwrap().div_ceil(frame_len as u64) as usize;
-        if frames > limits.max_chunks || spec.frames.unwrap() > limits.max_frames {
-            return Err(Error::Limit("TTA frame table"));
+        let format = u16_le(&h[4..]);
+        let channels = u16_le(&h[6..]);
+        let bits = u16_le(&h[8..]);
+        let rate = u32_le(&h[10..]);
+        let samples = u64::from(u32_le(&h[14..]));
+        if format != 1 {
+            return Err(Error::Unsupported("TTA format other than integer PCM"));
         }
-        let mut table = vec![0u8; frames * 4 + 4];
+        if channels == 0 || !(8..=24).contains(&bits) || rate == 0 {
+            return Err(Error::Invalid("TTA stream parameters"));
+        }
+        if samples > limits.max_frames {
+            return Err(Error::Limit("decoded frames"));
+        }
+        let frame_samples = u64::from(rate) * 256 / 245;
+        if frame_samples == 0 {
+            return Err(Error::Invalid("TTA sample rate"));
+        }
+        let frames = samples.div_ceil(frame_samples);
+        // The table must fit the file: 4 bytes per frame.
+        let file_len = file.metadata()?.len();
+        if frames.saturating_mul(4) > file_len {
+            return Err(Error::Invalid("TTA seek table larger than the file"));
+        }
+        let mut table = vec![0u8; frames as usize * 4 + 4];
         file.read_exact(&mut table)?;
-        if crc32(&table[..frames * 4]) != le32(&table[frames * 4..]) {
-            return Err(Error::Invalid("TTA seektable CRC"));
+        let (sizes, crc) = table.split_at(frames as usize * 4);
+        if crc32(sizes) != u32_le(crc) {
+            return Err(Error::Invalid("TTA seek table CRC"));
         }
-        let sizes: Vec<_> = table[..frames * 4]
+        let frame_sizes: Vec<u32> = sizes
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|b| le32(b))
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
-        let mut total = 22 + table.len() as u64;
-        for size in &sizes {
-            if *size < 4 || *size as usize > limits.max_packet_bytes {
-                return Err(Error::Limit("TTA packet bytes"));
-            }
-            total += *size as u64;
-        }
-        if total > file.metadata()?.len() {
-            return Err(Error::Invalid("truncated TTA frames"));
+        if frame_sizes
+            .iter()
+            .any(|&s| s < 4 || s as usize > limits.max_packet_bytes)
+        {
+            return Err(Error::Invalid("TTA frame size"));
         }
         Ok(Self {
             file,
-            spec,
-            sizes,
-            index: 0,
-            frame_len,
-            packet: Vec::new(),
-            planes: [Vec::new(), Vec::new()],
+            spec: AudioSpec {
+                container: "tta".into(),
+                codec: "tta".into(),
+                sample_rate: rate,
+                channels,
+                bits_per_sample: bits,
+                frames: Some(samples),
+            },
+            frame_sizes,
+            next_frame: 0,
+            frame_samples,
+            left: samples,
+            bytes: Vec::new(),
+            states: (0..channels).map(|_| Channel::new(bits)).collect(),
+            row: vec![0; usize::from(channels)],
         })
     }
+
+    /// The next frame's samples, interleaved, into `out` (replacing what it
+    /// held); `out` stays empty at the end of the stream.
     pub fn next(&mut self, out: &mut Vec<i32>, limits: &Limits) -> Result<()> {
         out.clear();
-        if self.index == self.sizes.len() {
+        if self.left == 0 {
             return Ok(());
         }
         limits.check()?;
-        let size = self.sizes[self.index] as usize;
-        self.packet.resize(size, 0);
-        self.file.read_exact(&mut self.packet)?;
-        if crc32(&self.packet[..size - 4]) != le32(&self.packet[size - 4..]) {
+        let size = *self
+            .frame_sizes
+            .get(self.next_frame)
+            .ok_or(Error::Invalid("TTA frame missing"))? as usize;
+        self.next_frame += 1;
+        self.bytes.resize(size, 0);
+        self.file.read_exact(&mut self.bytes)?;
+        let (data, crc) = self.bytes.split_at(size - 4);
+        if crc32(data) != u32_le(crc) {
             return Err(Error::Invalid("TTA frame CRC"));
         }
-        let channels = self.spec.channels as usize;
-        let depth = self.spec.bits_per_sample as u32;
-        let frames = (self.spec.frames.unwrap() - self.index as u64 * self.frame_len as u64)
-            .min(self.frame_len as u64) as usize;
-        // 1. Entropy decoding of every residual (the adaptive Rice state does
-        //    not depend on the filters), stopping at the first error.
-        for plane in &mut self.planes[..channels] {
-            plane.resize(frames, 0);
+        let n = self.left.min(self.frame_samples) as usize;
+        self.left -= n as u64;
+        for s in &mut self.states {
+            s.reset();
         }
-        let (rows, failure) = decode_residuals(
-            &self.packet[..size - 4],
-            &mut self.planes[..channels],
-            frames,
-            limits,
-        );
-        // 2. Per channel, the adaptive filter and the fixed first-order
-        //    predictor over the complete rows.
-        let shift = if depth == 16 { 9 } else { 10 };
-        for plane in &mut self.planes[..channels] {
-            restore(&mut plane[..rows], shift);
+        out.resize(n * self.row.len(), 0);
+        let bits = u32::from(self.spec.bits_per_sample);
+        let job = Frame {
+            data,
+            states: &mut self.states,
+            row: &mut self.row,
+            out,
+            bits,
+        };
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernels::bit_ops() {
+            // SAFETY: LZCNT/BMI1/BMI2 were detected at runtime; the body is
+            // the same safe code.
+            return unsafe { job.run_bit_ops() };
         }
-        // 3. Decorrelation, range check, alignment and interleaving. A row
-        //    out of range is reported before a later decoding error, as the
-        //    row-by-row decoder did.
-        let min = -(1i32 << (depth - 1));
-        let max = (1i32 << (depth - 1)) - 1;
-        out.resize(rows * channels, 0);
-        let mut bad = None;
-        if channels == 2 {
-            let [left, right] = &self.planes;
-            for (i, ((row, &a), &b)) in out
-                .as_chunks_mut::<2>()
-                .0
-                .iter_mut()
-                .zip(&left[..rows])
-                .zip(&right[..rows])
-                .enumerate()
-            {
-                let r = b.wrapping_add(a / 2);
-                let l = r.wrapping_sub(a);
-                if bad.is_none() && (l < min || l > max || r < min || r > max) {
-                    bad = Some(i);
-                }
-                *row = [l.wrapping_shl(32 - depth), r.wrapping_shl(32 - depth)];
+        job.run()
+    }
+}
+
+/// One frame's decoding, apart from the reader so it can be compiled twice.
+struct Frame<'a> {
+    data: &'a [u8],
+    states: &'a mut [Channel],
+    row: &'a mut [i32],
+    out: &'a mut [i32],
+    bits: u32,
+}
+
+impl Frame<'_> {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "lzcnt,bmi1,bmi2")]
+    unsafe fn run_bit_ops(self) -> Result<()> {
+        self.run()
+    }
+
+    #[inline(always)]
+    fn run(self) -> Result<()> {
+        match self.states.len() {
+            1 => self.samples::<1>(),
+            2 => self.samples::<2>(),
+            _ => self.samples::<0>(),
+        }
+    }
+
+    /// The samples, with the channel count `C` fixed (0: any).
+    #[inline(always)]
+    fn samples<const C: usize>(self) -> Result<()> {
+        let ch = if C == 0 { self.states.len() } else { C };
+        let (states, row) = (&mut self.states[..ch], &mut self.row[..ch]);
+        let justify = 32 - self.bits;
+        let (lo, hi) = (-(1i32 << (self.bits - 1)), (1i32 << (self.bits - 1)) - 1);
+        let mut reader = Lsb::new(self.data);
+        let mut wide = false;
+        for frame in self.out.chunks_exact_mut(ch) {
+            for (v, s) in row.iter_mut().zip(states.iter_mut()) {
+                let residual = s.rice.decode(&mut reader)?;
+                let filtered = s.filter.decode(residual);
+                *v = s.predict(filtered);
             }
-        } else {
-            for (i, (o, &x)) in out.iter_mut().zip(&self.planes[0][..rows]).enumerate() {
-                if bad.is_none() && (x < min || x > max) {
-                    bad = Some(i);
-                }
-                *o = x.wrapping_shl(32 - depth);
+            undo_differences(row);
+            for (o, &v) in frame.iter_mut().zip(row.iter()) {
+                wide |= v < lo || v > hi;
+                *o = v << justify;
             }
         }
-        if bad.is_some() {
-            return Err(Error::Invalid("TTA sample range"));
+        if wide {
+            return Err(Error::Invalid("TTA sample out of range"));
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        self.index += 1;
         Ok(())
     }
 }
 
-/// Adaptive Rice state of one channel.
+/// The encoder sends, for channels x₀..xₙ₋₁, dᵢ = xᵢ₊₁ − xᵢ (i < n − 1) and
+/// dₙ₋₁ = xₙ₋₁ − dₙ₋₂/2 (C division, toward zero); this undoes it in place.
+fn undo_differences(row: &mut [i32]) {
+    let n = row.len();
+    if n < 2 {
+        return;
+    }
+    row[n - 1] = row[n - 1].wrapping_add(row[n - 2] / 2);
+    for i in (0..n - 1).rev() {
+        row[i] = row[i + 1].wrapping_sub(row[i]);
+    }
+}
+
+/// One channel's decoding state, reset at every frame.
+struct Channel {
+    rice: Rice,
+    filter: Filter,
+    /// Previous output of the fixed predictor, and its order shift.
+    prev: i32,
+    shift: u32,
+}
+
+impl Channel {
+    fn new(bits: u16) -> Self {
+        Self {
+            rice: Rice::new(),
+            filter: Filter::new(bits),
+            prev: 0,
+            // 8-bit streams use x·15/16, wider ones x·31/32.
+            shift: if bits <= 8 { 4 } else { 5 },
+        }
+    }
+
+    fn reset(&mut self) {
+        self.rice = Rice::new();
+        self.filter.reset();
+        self.prev = 0;
+    }
+
+    #[inline(always)]
+    fn predict(&mut self, x: i32) -> i32 {
+        let k = self.shift;
+        let v = x.wrapping_add(self.prev.wrapping_mul((1 << k) - 1) >> k);
+        self.prev = v;
+        v
+    }
+}
+
+/// The two-parameter adaptive Rice code: a run of ones ended by a zero
+/// chooses between `k0` (no ones) and `k1` plus a `2^k0` offset (each
+/// further one adds `2^k1`); each parameter follows a running sum of what
+/// it coded, moving down below `16·2^k` and up above `16·2^(k+1)`.
 #[derive(Clone, Copy)]
 struct Rice {
-    k0: u32,
-    k1: u32,
-    sum0: u32,
-    sum1: u32,
+    k: [u32; 2],
+    sum: [u32; 2],
 }
 
-/// Decode the residuals of `frames` rows (channels interleaved per row) into
-/// `planes`. Returns the number of complete rows and the error that stopped
-/// decoding, if any; errors are checked in the order of the format's
-/// definition, value by value.
-fn decode_residuals(
-    data: &[u8],
-    planes: &mut [Vec<i32>],
-    frames: usize,
-    limits: &Limits,
-) -> (usize, Option<Error>) {
-    #[cfg(target_arch = "x86_64")]
-    if crate::kernels::bit_ops() {
-        // SAFETY: LZCNT/BMI1/BMI2 were detected at runtime; the body is the
-        // same safe Rust (variable shifts become SHLX/SHRX).
-        return unsafe { decode_residuals_bit_ops(data, planes, frames, limits) };
-    }
-    decode_residuals_body(data, planes, frames, limits)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "lzcnt,bmi1,bmi2")]
-unsafe fn decode_residuals_bit_ops(
-    data: &[u8],
-    planes: &mut [Vec<i32>],
-    frames: usize,
-    limits: &Limits,
-) -> (usize, Option<Error>) {
-    decode_residuals_body(data, planes, frames, limits)
-}
-
-#[inline(always)]
-fn decode_residuals_body(
-    data: &[u8],
-    planes: &mut [Vec<i32>],
-    frames: usize,
-    limits: &Limits,
-) -> (usize, Option<Error>) {
-    let mut bits = Lsb::new(data);
-    let start = Rice {
-        k0: 10,
-        k1: 10,
-        sum0: 1 << 14,
-        sum1: 1 << 14,
-    };
-    // The channel count is a constant in each loop, so both channels'
-    // adaptive states stay in registers.
-    if let [left, right] = planes {
-        let (mut a, mut b) = (start, start);
-        for (i, (l, r)) in left[..frames]
-            .iter_mut()
-            .zip(&mut right[..frames])
-            .enumerate()
-        {
-            if i % 4096 == 0 {
-                if let Err(e) = limits.check() {
-                    return (i, Some(e));
-                }
-            }
-            match residual(&mut bits, &mut a) {
-                Ok(v) => *l = v,
-                Err(e) => return (i, Some(e)),
-            }
-            match residual(&mut bits, &mut b) {
-                Ok(v) => *r = v,
-                Err(e) => return (i, Some(e)),
-            }
-        }
-    } else {
-        let mut a = start;
-        for (i, x) in planes[0][..frames].iter_mut().enumerate() {
-            if i % 4096 == 0 {
-                if let Err(e) = limits.check() {
-                    return (i, Some(e));
-                }
-            }
-            match residual(&mut bits, &mut a) {
-                Ok(v) => *x = v,
-                Err(e) => return (i, Some(e)),
-            }
+impl Rice {
+    fn new() -> Self {
+        Self {
+            k: [10; 2],
+            // Each sum starts where its parameter sits: 16·2^k.
+            sum: [16 << 10; 2],
         }
     }
-    (frames, None)
-}
 
-/// One residual: a unary run of ones (n), then k bits, k from the high
-/// state when n > 0. The common case decodes from one refilled cache word
-/// and adapts both states without branches; anything else (a run or code
-/// reaching past the cache, a parameter out of range) takes the checked
-/// path, which reports errors in the format's order.
-#[inline(always)]
-fn residual(bits: &mut Lsb<'_>, state: &mut Rice) -> Result<i32> {
-    if bits.available < 57 {
-        bits.refill();
-    }
-    let n = bits.cache.trailing_ones();
-    let high = n != 0;
-    let k = if high { state.k1 } else { state.k0 };
-    let q = n.wrapping_sub(high as u32);
-    if n + 1 + k > bits.available || k > 31 || q > i32::MAX as u32 >> k || state.k0 > 31 {
-        return residual_checked(bits, state);
-    }
-    let rest = bits.cache >> (n + 1);
-    let mut value = (q << k).wrapping_add((rest & ((1u64 << k) - 1)) as u32);
-    bits.cache = rest >> k;
-    bits.available -= n + 1 + k;
-    let (k1, sum1) = adapted(state.k1, state.sum1, value);
-    if high {
-        (state.k1, state.sum1) = (k1, sum1);
-    }
-    value = value.wrapping_add((high as u32) << state.k0);
-    (state.k0, state.sum0) = adapted(state.k0, state.sum0, value);
-    Ok(1i32.wrapping_add(((value >> 1) as i32) ^ ((value & 1) as i32 - 1)))
-}
-
-/// [`adapt`] as a value, without branches.
-#[inline(always)]
-fn adapted(k: u32, sum: u32, v: u32) -> (u32, u32) {
-    let sum = sum.wrapping_add(v.wrapping_sub(sum >> 4));
-    let down = (k > 0) & (sum < threshold(k));
-    let up = !down & (sum > threshold(k + 1));
-    (k - down as u32 + up as u32, sum)
-}
-
-#[cold]
-fn residual_checked(bits: &mut Lsb<'_>, state: &mut Rice) -> Result<i32> {
-    let unary = bits.ones(1 << 24)?;
-    let high = unary != 0;
-    let k = if high { state.k1 } else { state.k0 };
-    if k > 31 {
-        return Err(Error::Invalid("TTA Rice parameter"));
-    }
-    let q = if high { unary - 1 } else { unary };
-    if q > i32::MAX as u32 >> k {
-        return Err(Error::Invalid("TTA residual overflow"));
-    }
-    let mut value = (q << k).wrapping_add(bits.read(k)?);
-    if high {
-        adapt(&mut state.k1, &mut state.sum1, value);
-        if state.k0 > 31 {
-            return Err(Error::Invalid("TTA parameter"));
+    #[inline(always)]
+    fn adapt(&mut self, i: usize, value: u32) {
+        let s = &mut self.sum[i];
+        *s = s.wrapping_add(value).wrapping_sub(*s >> 4);
+        let k = &mut self.k[i];
+        if *k > 0 && *s < 16 << *k {
+            *k -= 1;
+        } else if *k < 27 && *s > 16 << (*k + 1) {
+            *k += 1;
         }
-        value = value.wrapping_add(1u32 << state.k0);
     }
-    adapt(&mut state.k0, &mut state.sum0, value);
-    Ok(1i32.wrapping_add(((value >> 1) as i32) ^ ((value & 1) as i32 - 1)))
+
+    #[inline(always)]
+    fn decode(&mut self, r: &mut Lsb<'_>) -> Result<i32> {
+        let ones = r.ones(1 << 16)?;
+        let (i, run) = if ones == 0 { (0, 0) } else { (1, ones - 1) };
+        let k = self.k[i];
+        if k > 31 || (run as u64) << k > u64::from(u32::MAX) {
+            return Err(Error::Invalid("TTA residual"));
+        }
+        let mut value = (run << k) | if k > 0 { r.read(k)? } else { 0 };
+        if i == 1 {
+            self.adapt(1, value);
+            value = value.wrapping_add(1 << self.k[0]);
+        }
+        self.adapt(0, value);
+        // Zigzag: odd values are positive.
+        Ok(if value & 1 == 1 {
+            (value >> 1) as i32 + 1
+        } else {
+            -((value >> 1) as i32)
+        })
+    }
 }
 
-/// The eight-tap sign-sign adaptive filter followed by the fixed predictor
-/// x[n] + 31/32 x[n-1], over one channel's residuals in place.
-///
-/// Per sample the format steps the coefficients by the sign of the previous
-/// residual, forms the sum of the delay line times the coefficients, adds
-/// the shifted sum to the residual and pushes the result into the delay
-/// line in place. Written out, the line after sample x is d1..d4,
-/// x - d7 - d6 - d5, x - d7 - d6, x - d7, x (d1..d7 the line before it), so
-/// the next sum is C + x * Q, where C and Q depend only on the line before
-/// x, the next coefficients and the current residual (wrapping i32
-/// arithmetic, so the same sum modulo 2^32). They are formed while x is
-/// still being computed; the serial path from sample to sample is one
-/// multiply, two adds and a shift.
-#[inline(never)]
-fn restore(values: &mut [i32], shift: u32) {
-    let round = 1i32 << (shift - 1);
-    // Coefficients already stepped for the current sample.
-    let mut qm = [0i32; 8];
-    let mut dx = [0i32; 8];
-    // Delay line before the current sample's predecessor `x` was pushed.
-    let mut dl = [0i32; 8];
-    // sum = c + x * q for the current sample; the line starts all zero.
-    let (mut c, mut q, mut x) = (round, 0i32, 0i32);
-    let mut pred = 0i32;
-    for v in values {
-        let e = *v;
-        let sum = c.wrapping_add(x.wrapping_mul(q));
-        // The line before this sample: d = dl with x pushed.
-        let [_, d1, d2, d3, d4, d5, d6, d7] = dl;
-        let line = [
-            d1,
-            d2,
-            d3,
-            d4,
-            x.wrapping_sub(d7).wrapping_sub(d6).wrapping_sub(d5),
-            x.wrapping_sub(d7).wrapping_sub(d6),
-            x.wrapping_sub(d7),
-            x,
-        ];
-        let [_, l1, l2, l3, l4, l5, l6, l7] = line;
-        let next_dx = [
-            dx[1],
-            dx[2],
-            dx[3],
-            dx[4],
-            (l4 >> 30) | 1,
-            ((l5 >> 30) | 2) & !1,
-            ((l6 >> 30) | 2) & !1,
-            ((l7 >> 30) | 4) & !3,
-        ];
-        let sign = e.signum();
-        let mut next = qm;
+/// The eight-tap adaptive filter: the prediction is the dot product of the
+/// last values' history with the weights, rounded and scaled down by
+/// `2^shift`; before each step the weights move by their step sizes in the
+/// direction of the last residual's sign. The step sizes come from the
+/// signs of the newest history entries (±1, ±2, ±2, ±4), the history keeps
+/// the last value and its first and second differences.
+struct Filter {
+    shift: u32,
+    weights: [i32; 8],
+    steps: [i32; 8],
+    history: [i32; 8],
+    last_residual: i32,
+}
+
+impl Filter {
+    fn new(bits: u16) -> Self {
+        Self {
+            // 16-bit streams scale by 2⁹, 8- and 24-bit ones by 2¹⁰.
+            shift: if bits > 8 && bits <= 16 { 9 } else { 10 },
+            weights: [0; 8],
+            steps: [0; 8],
+            history: [0; 8],
+            last_residual: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.weights = [0; 8];
+        self.steps = [0; 8];
+        self.history = [0; 8];
+        self.last_residual = 0;
+    }
+
+    #[inline(always)]
+    fn decode(&mut self, residual: i32) -> i32 {
+        // Branch-free: the weights move by ±steps or not at all.
+        let sign = self.last_residual.signum();
+        let mut sum = 1i32 << (self.shift - 1);
         for i in 0..8 {
-            next[i] = qm[i].wrapping_add(next_dx[i].wrapping_mul(sign));
+            self.weights[i] = self.weights[i].wrapping_add(self.steps[i].wrapping_mul(sign));
+            sum = sum.wrapping_add(self.history[i].wrapping_mul(self.weights[i]));
         }
-        // The next sample's sum is c + new_x * q.
-        let [n0, n1, n2, n3, n4, n5, n6, n7] = next;
-        let n456 = n4.wrapping_add(n5).wrapping_add(n6);
-        let n45 = n4.wrapping_add(n5);
-        c = round
-            .wrapping_add(l1.wrapping_mul(n0))
-            .wrapping_add(l2.wrapping_mul(n1))
-            .wrapping_add(l3.wrapping_mul(n2))
-            .wrapping_add(l4.wrapping_mul(n3))
-            .wrapping_sub(l7.wrapping_mul(n456))
-            .wrapping_sub(l6.wrapping_mul(n45))
-            .wrapping_sub(l5.wrapping_mul(n4));
-        q = n456.wrapping_add(n7);
-        x = e.wrapping_add(sum >> shift);
-        dl = line;
-        dx = next_dx;
-        qm = next;
-        let sample = x.wrapping_add((((pred as i64) * 31) >> 5) as i32);
-        pred = sample;
-        *v = sample;
+        let h = &mut self.history;
+        let s = &mut self.steps;
+        s.copy_within(1..5, 0);
+        h.copy_within(1..5, 0);
+        s[4] = (h[4] >> 30) | 1;
+        s[5] = ((h[5] >> 30) | 2) & !1;
+        s[6] = ((h[6] >> 30) | 2) & !1;
+        s[7] = ((h[7] >> 30) | 4) & !3;
+        self.last_residual = residual;
+        let value = residual.wrapping_add(sum >> self.shift);
+        h[4] = h[5].wrapping_neg();
+        h[5] = h[6].wrapping_neg();
+        h[6] = value.wrapping_sub(h[7]);
+        h[7] = value;
+        h[5] = h[5].wrapping_add(h[6]);
+        h[4] = h[4].wrapping_add(h[5]);
+        value
     }
 }
 
-fn le16(b: &[u8]) -> u16 {
-    u16::from_le_bytes(b[..2].try_into().unwrap())
-}
-fn le32(b: &[u8]) -> u32 {
-    u32::from_le_bytes(b[..4].try_into().unwrap())
-}
-#[inline(always)]
-fn threshold(k: u32) -> u32 {
-    1 << (k + 4).min(31)
-}
-fn adapt(k: &mut u32, sum: &mut u32, v: u32) {
-    *sum = sum.wrapping_add(v.wrapping_sub(*sum >> 4));
-    if *k > 0 && *sum < threshold(*k) {
-        *k -= 1;
-    } else if *sum > threshold(*k + 1) {
-        *k += 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_differences_round_trip() {
+        // The encoder's transform, then ours.
+        for row in [[5, -3], [-7, 2], [100, 101], [-1, -1]] {
+            let mut d = row;
+            d[0] = row[1] - row[0];
+            d[1] = row[1] - d[0] / 2;
+            undo_differences(&mut d);
+            assert_eq!(d, row);
+        }
+        let x = [3, -9, 12, 40];
+        let mut d = [x[1] - x[0], x[2] - x[1], x[3] - x[2], 0];
+        d[3] = x[3] - d[2] / 2;
+        undo_differences(&mut d);
+        assert_eq!(d, x);
+    }
+
+    #[test]
+    fn rice_parameters_adapt_both_ways() {
+        let mut r = Rice::new();
+        for _ in 0..200 {
+            r.adapt(0, 3);
+        }
+        assert!(r.k[0] < 10);
+        for _ in 0..200 {
+            r.adapt(0, 1 << 20);
+        }
+        assert!(r.k[0] > 10);
     }
 }

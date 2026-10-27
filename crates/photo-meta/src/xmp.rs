@@ -1,6 +1,7 @@
-//! XMP: a small namespace-aware XML reader and the RDF walk ExifTool does
-//! (simple, lang-alt, list and flattened-structure properties). No DTD or
-//! external entity is ever processed.
+//! XMP (ISO 16684-1): a small namespace-aware XML reader and an RDF walk
+//! over simple, language-alternative, list and structure properties
+//! (structures flattened into one name, as ExifTool prints them). No DTD
+//! or external entity is ever processed.
 
 use crate::{Metadata, Value, latin1};
 use std::collections::HashMap;
@@ -285,6 +286,9 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Namespace URI → group prefix: the prefixes the namespaces' owners
+/// (Adobe XMP specification, CIPA, IPTC, PLUS, Google) define; otherwise
+/// the document's declared prefix.
 fn group_prefix(ns: &str, declared: &str) -> String {
     let p = match ns {
         "http://purl.org/dc/elements/1.1/" => "dc",

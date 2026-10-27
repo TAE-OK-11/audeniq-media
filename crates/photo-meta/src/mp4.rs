@@ -9,6 +9,8 @@ const XMP_UUID: [u8; 16] = [
     0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
 ];
 
+/// QuickTime / iTunes item-list atom → the item's meaning in CamelCase
+/// (`©day` as ExifTool's `ContentCreateDate`).
 fn item_name(id: &[u8]) -> Option<String> {
     Some(
         match id {

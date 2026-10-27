@@ -1,14 +1,29 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
-//! Spectral Band Replication (ISO/IEC 14496-3 4.6.18), the HE-AAC tool that
-//! rebuilds the upper half of the spectrum from the AAC core and a few
-//! envelope and noise parameters: QMF analysis of the core (32 bands),
-//! high-band generation by patching with inverse filtering, envelope
-//! adjustment with noise and sinusoids, QMF synthesis (64 bands) at twice
-//! the core rate.
+//! Spectral Band Replication (ISO/IEC 14496-3 subclause 4.6.18), the
+//! HE-AAC tool that rebuilds the upper spectrum from the AAC core and a
+//! few envelope and noise parameters, written from the standard's
+//! description:
 //!
-//! The buffers and their timing follow FFmpeg's decoder so the output can
-//! be compared with it sample by sample; the QMF banks are the standard's
-//! complex-exponential matrices. Tables come from FFmpeg (`sbr_tables.rs`).
+//! - the SBR header and the per-frame data: time/frequency grid,
+//!   delta-coded envelope and noise-floor scale factors (Huffman coded),
+//!   inverse-filtering modes and added sinusoids, with stereo coupling;
+//! - the frequency band tables derived from the header (master, high and
+//!   low resolution, noise floor and limiter bands) and the patches that
+//!   copy low QMF subbands up;
+//! - the HF generator: QMF analysis of the core into 32 subbands, a
+//!   second-order complex predictor per subband (covariance method) and
+//!   chirp factors for inverse filtering;
+//! - the HF adjuster: envelope estimation, gains with limiter and
+//!   boost, time smoothing, noise floor and sinusoids;
+//! - QMF synthesis at twice the core rate (or the core rate, downsampled).
+//!
+//! Timing: the QMF analysis keeps 8 slots of the previous frame before
+//! the frame's 32, so buffer slot 8 is the frame's first analysis slot;
+//! the envelope grid is offset by 2 slots into that buffer, and output
+//! slot j is buffer slot j + 2. The grid may end up to 6 slots into the
+//! next frame, whose output then takes those slots from this frame.
+//!
+//! The QMF banks are AUDENIQ's fast forms of the standard's matrices
+//! (see [`Static`]). Tables (`sbr_tables.rs`) are the standard's data.
 use crate::Error;
 use crate::ps::Ps;
 use crate::sbr_tables as tab;
@@ -17,26 +32,42 @@ use media_dsp::{Dct4, Fft, History};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
-/// QMF slots between the HF generator's input and the envelope grid.
-const ENV_OFF: usize = 2;
-const NOISE_FLOOR_OFFSET: i32 = 6;
+/// QMF slots per frame (16 time slots of 2).
+const SLOTS: usize = 32;
+/// Slots of the previous frame kept before the frame's analysis (tHFGen).
+const KEPT: usize = 8;
+/// Offset of the envelope grid into the analysis buffer (tHFAdj).
+const ADJ: usize = 2;
+/// Slots in the analysis and high-band buffers.
+const SPAN: usize = SLOTS + KEPT;
+/// Envelopes per frame at most.
+const MAX_ENV: usize = 5;
+/// Noise-floor bands at most.
+const MAX_NOISE: usize = 5;
 /// Core samples are scaled to ±32768 inside SBR (the envelope scale).
 const SCALE: f32 = 32768.0;
 
+/// Huffman tables (by [`tab::HUFF`] index): envelope 1.5 dB and 3 dB,
+/// their balance forms, noise and noise balance; time (T) and frequency
+/// (F) direction.
+const ENV15_T: usize = 0;
+const ENV15_F: usize = 1;
+const BAL15_T: usize = 2;
+const BAL15_F: usize = 3;
+const ENV30_T: usize = 4;
+const ENV30_F: usize = 5;
+const BAL30_T: usize = 6;
+const BAL30_F: usize = 7;
+const NOISE_T: usize = 8;
+const NOISE_BAL_T: usize = 9;
+
+/// Frame classes of the time grid.
 const FIXFIX: u32 = 0;
+const FIXVAR: u32 = 1;
 const VARFIX: u32 = 2;
 
-/// Huffman tables (by [`tab::HUFF`] index).
-const T_ENV_1_5: usize = 0;
-const F_ENV_1_5: usize = 1;
-const T_ENV_BAL_1_5: usize = 2;
-const F_ENV_BAL_1_5: usize = 3;
-const T_ENV_3_0: usize = 4;
-const F_ENV_3_0: usize = 5;
-const T_ENV_BAL_3_0: usize = 6;
-const F_ENV_BAL_3_0: usize = 7;
-const T_NOISE_3_0: usize = 8;
-const T_NOISE_BAL_3_0: usize = 9;
+/// One QMF frame: real and imaginary parts, 32 slots of 64 subbands.
+pub(crate) type Qmf = [[[f32; 64]; SLOTS]; 2];
 
 /// Complex factors as (re, im) arrays.
 struct Rot {
@@ -114,992 +145,1258 @@ impl Default for Lanes {
     }
 }
 
-/// One channel's SBR data and filter-bank state.
+/// Nearest integer, halves up (the standard's NINT for these positive
+/// values).
+fn nint(x: f64) -> i64 {
+    (x + 0.5).floor() as i64
+}
+
+/// The SBR header fields that shape the decoding (4.5.2.8.2). Fields of
+/// an absent extra part take their defaults.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Header {
+    /// 3 dB envelope steps (else 1.5 dB).
+    amp_res: bool,
+    start: usize,
+    stop: usize,
+    xover: usize,
+    freq_scale: usize,
+    alter_scale: bool,
+    noise_bands: usize,
+    limiter_bands: usize,
+    limiter_gains: usize,
+    interpol_freq: bool,
+    smoothing_mode: bool,
+}
+
+impl Header {
+    fn read(b: &mut Bits) -> Result<Header, Error> {
+        let amp_res = b.get(1)? == 1;
+        let start = b.get(4)? as usize;
+        let stop = b.get(4)? as usize;
+        let xover = b.get(3)? as usize;
+        b.skip(2)?; // reserved
+        let extra_1 = b.get(1)? == 1;
+        let extra_2 = b.get(1)? == 1;
+        let (freq_scale, alter_scale, noise_bands) = if extra_1 {
+            (b.get(2)? as usize, b.get(1)? == 1, b.get(2)? as usize)
+        } else {
+            (2, true, 2)
+        };
+        let (limiter_bands, limiter_gains, interpol_freq, smoothing_mode) = if extra_2 {
+            (
+                b.get(2)? as usize,
+                b.get(2)? as usize,
+                b.get(1)? == 1,
+                b.get(1)? == 1,
+            )
+        } else {
+            (2, 2, true, true)
+        };
+        Ok(Header {
+            amp_res,
+            start,
+            stop,
+            xover,
+            freq_scale,
+            alter_scale,
+            noise_bands,
+            limiter_bands,
+            limiter_gains,
+            interpol_freq,
+            smoothing_mode,
+        })
+    }
+    /// Whether a change to `other` changes the band tables (a reset).
+    fn same_bands(&self, other: &Header) -> bool {
+        (self.start, self.stop, self.xover, self.freq_scale)
+            == (other.start, other.stop, other.xover, other.freq_scale)
+            && (self.alter_scale, self.noise_bands) == (other.alter_scale, other.noise_bands)
+    }
+}
+
+/// The frequency band tables of a header at an SBR rate (4.6.18.3.2), in
+/// QMF subband indices, and the HF generator's patches (4.6.18.6.3).
+struct Bands {
+    /// First and last-plus-one SBR subband.
+    kx: usize,
+    m: usize,
+    /// Start of the master table (the lowest source subband bound).
+    k0: usize,
+    high: Vec<usize>,
+    low: Vec<usize>,
+    noise: Vec<usize>,
+    limiter: Vec<usize>,
+    /// (first source subband, subbands) of each patch; the targets follow
+    /// each other from `kx`.
+    patches: Vec<(usize, usize)>,
+    /// Noise band of each subband from `kx`.
+    noise_of: [u8; 64],
+}
+
+/// Ascending differences between the rounded points of a geometric series
+/// from `a` to `b` in `n` steps.
+fn geometric_steps(a: usize, b: usize, n: usize) -> Vec<usize> {
+    let ratio = b as f64 / a as f64;
+    let point = |k: usize| nint(a as f64 * ratio.powf(k as f64 / n as f64));
+    let mut d: Vec<usize> = (0..n)
+        .map(|k| (point(k + 1) - point(k)).max(0) as usize)
+        .collect();
+    d.sort_unstable();
+    d
+}
+
+fn accumulate(start: usize, steps: &[usize]) -> Vec<usize> {
+    let mut v = Vec::with_capacity(steps.len() + 1);
+    v.push(start);
+    for &d in steps {
+        v.push(v.last().unwrap() + d);
+    }
+    v
+}
+
+impl Bands {
+    fn new(h: &Header, rate: u32) -> Option<Bands> {
+        let fs = f64::from(rate);
+        // k0 from the start frequency: a minimum by rate and an offset.
+        let start_min = if rate < 32000 {
+            3000.0
+        } else if rate < 64000 {
+            4000.0
+        } else {
+            5000.0
+        };
+        let group = match rate {
+            0..=16000 => 0,
+            16001..=22050 => 1,
+            22051..=24000 => 2,
+            24001..=32000 => 3,
+            32001..=64000 => 4,
+            _ => 5,
+        };
+        let k0 = nint(start_min * 128.0 / fs) + i64::from(tab::OFFSET[group][h.start]);
+        // k2 from the stop frequency.
+        let k2 = match h.stop {
+            14 => 2 * k0,
+            15 => 3 * k0,
+            stop => {
+                let stop_min = if rate < 32000 {
+                    6000.0
+                } else if rate < 64000 {
+                    8000.0
+                } else {
+                    10000.0
+                };
+                let base = nint(stop_min * 128.0 / fs);
+                let point =
+                    |i: usize| nint(base as f64 * (64.0 / base as f64).powf(i as f64 / 13.0));
+                let mut d: Vec<i64> = (0..13).map(|i| point(i + 1) - point(i)).collect();
+                d.sort_unstable();
+                base + d[..stop].iter().sum::<i64>()
+            }
+        }
+        .min(64);
+        let limit = if rate <= 32000 {
+            48
+        } else if rate == 44100 {
+            35
+        } else {
+            32
+        };
+        if k0 <= 0 || k2 <= k0 || k2 - k0 > limit {
+            return None;
+        }
+        let (k0, k2) = (k0 as usize, k2 as usize);
+        let master = Self::master(h, k0, k2)?;
+        if h.xover >= master.len() - 1 {
+            return None;
+        }
+        let high = master[h.xover..].to_vec();
+        let n_high = high.len() - 1;
+        let n_low = n_high.div_ceil(2);
+        let odd = n_high % 2;
+        let low: Vec<usize> = (0..=n_low)
+            .map(|i| if i == 0 { high[0] } else { high[2 * i - odd] })
+            .collect();
+        let kx = high[0];
+        let m = high[n_high] - kx;
+        if kx > 32 || kx + m > 64 || m == 0 {
+            return None;
+        }
+        let n_q = if h.noise_bands == 0 {
+            1
+        } else {
+            nint(h.noise_bands as f64 * (k2 as f64 / kx as f64).log2()).max(1) as usize
+        };
+        if n_q > MAX_NOISE {
+            return None;
+        }
+        let mut noise = vec![low[0]];
+        let mut i = 0;
+        for k in 1..=n_q {
+            i += (n_low - i) / (n_q + 1 - k);
+            noise.push(low[i]);
+        }
+        let patches = Self::patches(&master, k0, kx, m, rate)?;
+        let limiter = Self::limiter(h, &low, kx, &patches);
+        let mut noise_of = [0u8; 64];
+        for (g, w) in noise.windows(2).enumerate() {
+            for k in w[0]..w[1] {
+                noise_of[k - kx] = g as u8;
+            }
+        }
+        Some(Bands {
+            kx,
+            m,
+            k0,
+            high,
+            low,
+            noise,
+            limiter,
+            patches,
+            noise_of,
+        })
+    }
+
+    /// The master table: linear steps of 1 or 2 subbands, or 12, 10 or 8
+    /// bands per octave (one region, or two above k1 = 2·k0 when k2/k0 >
+    /// 2.2449, the upper one optionally warped by 1.3).
+    fn master(h: &Header, k0: usize, k2: usize) -> Option<Vec<usize>> {
+        if h.freq_scale == 0 {
+            let dk = if h.alter_scale { 2 } else { 1 };
+            let n = 2 * ((k2 - k0) / (2 * dk));
+            if n == 0 {
+                return None;
+            }
+            let mut steps = vec![dk as i64; n];
+            // Spread the difference to k2 over the steps, from the top
+            // when it is positive and from the bottom otherwise.
+            let mut diff = k2 as i64 - (k0 + n * dk) as i64;
+            let (dir, mut k) = if diff > 0 {
+                (-1i64, n as i64 - 1)
+            } else {
+                (1, 0)
+            };
+            while diff != 0 && (0..n as i64).contains(&k) {
+                steps[k as usize] -= dir;
+                k += dir;
+                diff += dir;
+            }
+            if steps.iter().any(|&s| s <= 0) {
+                return None;
+            }
+            let steps: Vec<usize> = steps.iter().map(|&s| s as usize).collect();
+            return Some(accumulate(k0, &steps));
+        }
+        let per_octave = [12.0, 10.0, 8.0][h.freq_scale - 1];
+        let warp = if h.alter_scale { 1.3 } else { 1.0 };
+        let two_regions = k2 as f64 / k0 as f64 > 2.2449;
+        let k1 = if two_regions { 2 * k0 } else { k2 };
+        let n0 = 2 * nint(per_octave * (k1 as f64 / k0 as f64).log2() / 2.0) as usize;
+        if n0 == 0 {
+            return None;
+        }
+        let low = geometric_steps(k0, k1, n0);
+        if low[0] == 0 {
+            return None;
+        }
+        let mut master = accumulate(k0, &low);
+        if two_regions {
+            let n1 = 2 * nint(per_octave * (k2 as f64 / k1 as f64).log2() / (2.0 * warp)) as usize;
+            if n1 == 0 {
+                return None;
+            }
+            let mut high = geometric_steps(k1, k2, n1);
+            // The upper steps may not be narrower than the lower ones.
+            let widest = *low.last().unwrap();
+            if high[0] < widest {
+                let change = widest - high[0];
+                high[0] += change;
+                high[n1 - 1] = high[n1 - 1].checked_sub(change)?;
+                high.sort_unstable();
+            }
+            if high[0] == 0 {
+                return None;
+            }
+            master.extend(accumulate(k1, &high).into_iter().skip(1));
+        }
+        Some(master)
+    }
+
+    /// The patches: from the goal subband 2.048 MHz / rate down, runs of
+    /// low subbands (ending at an even distance below k0) copied up until
+    /// kx + m is covered; a last patch narrower than 3 subbands is dropped.
+    fn patches(
+        master: &[usize],
+        k0: usize,
+        kx: usize,
+        m: usize,
+        rate: u32,
+    ) -> Option<Vec<(usize, usize)>> {
+        let goal = nint(2.048e6 / f64::from(rate)) as usize;
+        let top = master.len() - 1;
+        let mut k = if goal < kx + m {
+            master.iter().position(|&f| f >= goal).unwrap_or(top)
+        } else {
+            top
+        };
+        let (mut msb, mut usb) = (k0, kx);
+        let mut patches: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..64 {
+            let mut j = k + 1;
+            let (sb, odd) = loop {
+                j -= 1;
+                let sb = master[j];
+                let odd = (sb + k0) % 2; // (sb − 2 + k0) mod 2
+                if sb + odd < k0 + msb || j == 0 {
+                    break (sb, odd);
+                }
+            };
+            let width = sb.saturating_sub(usb);
+            if width > 0 {
+                let first = (k0 - odd).checked_sub(width)?;
+                patches.push((first, width));
+                usb = sb;
+                msb = sb;
+            } else {
+                msb = kx;
+            }
+            if master[k] - sb < 3 {
+                k = top;
+            }
+            if sb == kx + m {
+                if patches.len() > 1 && patches.last()?.1 < 3 {
+                    patches.pop();
+                }
+                return (1..=5).contains(&patches.len()).then_some(patches);
+            }
+        }
+        None
+    }
+
+    /// The limiter bands: none (one band over the SBR range) or 1.2, 2 or
+    /// 3 per octave, from the low-resolution table and the patch borders,
+    /// merging bands narrower than 0.49 of a limiter band (patch borders
+    /// are kept where possible).
+    fn limiter(h: &Header, low: &[usize], kx: usize, patches: &[(usize, usize)]) -> Vec<usize> {
+        if h.limiter_bands == 0 {
+            return vec![low[0], *low.last().unwrap()];
+        }
+        let per_octave = [1.2, 2.0, 3.0][h.limiter_bands - 1];
+        let mut borders = vec![kx];
+        for &(_, w) in patches {
+            borders.push(borders.last().unwrap() + w);
+        }
+        let mut table: Vec<usize> = low.to_vec();
+        table.extend_from_slice(&borders[1..borders.len() - 1]);
+        table.sort_unstable();
+        let is_border = |k: usize| borders.contains(&k);
+        let mut k = 1;
+        while k < table.len() {
+            let octaves = (table[k] as f64 / table[k - 1] as f64).log2();
+            if octaves * per_octave < 0.49 {
+                if table[k] == table[k - 1] || !is_border(table[k]) {
+                    table.remove(k);
+                    continue;
+                }
+                if !is_border(table[k - 1]) {
+                    table.remove(k - 1);
+                    continue;
+                }
+            }
+            k += 1;
+        }
+        table
+    }
+}
+
+/// A frame's time grid (4.6.18.3.3): envelope borders in time slots (2 QMF
+/// slots each), each envelope's frequency resolution, the noise-floor
+/// borders and the transient envelope.
+#[derive(Clone, Copy, Default)]
+struct Grid {
+    class: u32,
+    envelopes: usize,
+    borders: [usize; MAX_ENV + 1],
+    /// High frequency resolution per envelope.
+    high: [bool; MAX_ENV],
+    noises: usize,
+    noise_borders: [usize; 3],
+    /// The envelope a transient starts (`lA`), none when negative; the
+    /// envelope count when it starts at the frame's end.
+    transient: i32,
+}
+
+impl Grid {
+    fn read(b: &mut Bits) -> Result<Grid, Error> {
+        let class = b.get(2)?;
+        let mut g = Grid {
+            class,
+            ..Grid::default()
+        };
+        let rel = |b: &mut Bits, n: u32| -> Result<Vec<usize>, Error> {
+            (0..n).map(|_| Ok(2 * b.get(2)? as usize + 2)).collect()
+        };
+        let pointer_bits = |n: usize| usize::BITS - n.leading_zeros(); // ⌈log2(n + 1)⌉
+        let (lead, trail, rel_lead, rel_trail, pointer);
+        match class {
+            FIXFIX => {
+                let n = 1usize << b.get(2)?;
+                if n > 4 {
+                    return Err(Error::Invalid("SBR envelopes"));
+                }
+                let high = b.get(1)? == 1;
+                g.envelopes = n;
+                g.high = [high; MAX_ENV];
+                for l in 0..=n {
+                    g.borders[l] = 16 * l / n;
+                }
+                g.transient = -1;
+                g.set_noise(n / 2);
+                return Ok(g);
+            }
+            FIXVAR => {
+                lead = 0;
+                trail = b.get(2)? as usize + 16;
+                let n1 = b.get(2)?;
+                rel_lead = Vec::new();
+                rel_trail = rel(b, n1)?;
+                g.envelopes = n1 as usize + 1;
+                pointer = b.get(pointer_bits(g.envelopes))? as usize;
+                for l in (0..g.envelopes).rev() {
+                    g.high[l] = b.get(1)? == 1;
+                }
+            }
+            VARFIX => {
+                lead = b.get(2)? as usize;
+                trail = 16;
+                let n0 = b.get(2)?;
+                rel_lead = rel(b, n0)?;
+                rel_trail = Vec::new();
+                g.envelopes = n0 as usize + 1;
+                pointer = b.get(pointer_bits(g.envelopes))? as usize;
+                for l in 0..g.envelopes {
+                    g.high[l] = b.get(1)? == 1;
+                }
+            }
+            _ => {
+                lead = b.get(2)? as usize;
+                trail = b.get(2)? as usize + 16;
+                let n0 = b.get(2)?;
+                let n1 = b.get(2)?;
+                rel_lead = rel(b, n0)?;
+                rel_trail = rel(b, n1)?;
+                g.envelopes = (n0 + n1) as usize + 1;
+                if g.envelopes > MAX_ENV {
+                    return Err(Error::Invalid("SBR envelopes"));
+                }
+                pointer = b.get(pointer_bits(g.envelopes))? as usize;
+                for l in 0..g.envelopes {
+                    g.high[l] = b.get(1)? == 1;
+                }
+            }
+        }
+        let n = g.envelopes;
+        if pointer > n + 1 {
+            return Err(Error::Invalid("SBR pointer"));
+        }
+        g.borders[0] = lead;
+        g.borders[n] = trail;
+        for (l, &r) in rel_lead.iter().enumerate() {
+            g.borders[l + 1] = g.borders[l] + r;
+        }
+        for (i, &r) in rel_trail.iter().enumerate() {
+            g.borders[n - 1 - i] = g.borders[n - i]
+                .checked_sub(r)
+                .ok_or(Error::Invalid("SBR borders"))?;
+        }
+        if g.borders[..=n].windows(2).any(|w| w[0] >= w[1]) {
+            return Err(Error::Invalid("SBR borders"));
+        }
+        let (transient, middle) = if class == VARFIX {
+            (
+                if pointer > 1 { pointer as i32 - 1 } else { -1 },
+                match pointer {
+                    0 => 1,
+                    1 => n - 1,
+                    p => p - 1,
+                },
+            )
+        } else {
+            (
+                if pointer > 0 {
+                    (n + 1 - pointer) as i32
+                } else {
+                    -1
+                },
+                if pointer > 1 { n + 1 - pointer } else { n - 1 },
+            )
+        };
+        g.transient = transient;
+        g.set_noise(middle);
+        Ok(g)
+    }
+
+    /// One noise floor for one envelope, else two split at envelope border
+    /// `middle`.
+    fn set_noise(&mut self, middle: usize) {
+        let n = self.envelopes;
+        self.noises = if n > 1 { 2 } else { 1 };
+        self.noise_borders = [
+            self.borders[0],
+            self.borders[middle.min(n)],
+            self.borders[n],
+        ];
+        if self.noises == 1 {
+            self.noise_borders[1] = self.borders[n];
+        }
+    }
+
+    /// The noise floor that covers envelope `l`.
+    fn noise_of(&self, l: usize) -> usize {
+        usize::from(self.noises == 2 && self.borders[l] >= self.noise_borders[1])
+    }
+}
+
+/// One channel's data of one frame, as coded (scale factors as indices).
+#[derive(Clone, Copy)]
+struct Frame {
+    grid: Grid,
+    /// 3 dB envelope steps in this frame.
+    amp_res: bool,
+    invf: [u8; MAX_NOISE],
+    envelope: [[i32; 64]; MAX_ENV],
+    noise: [[i32; MAX_NOISE]; 2],
+    /// Added sinusoids per high-resolution band.
+    sines: [bool; 64],
+}
+
+impl Default for Frame {
+    fn default() -> Frame {
+        Frame {
+            grid: Grid::default(),
+            amp_res: false,
+            invf: [0; MAX_NOISE],
+            envelope: [[0; 64]; MAX_ENV],
+            noise: [[0; MAX_NOISE]; 2],
+            sines: [false; 64],
+        }
+    }
+}
+
+/// The scale factors a channel's next frame is delta-coded against: its
+/// last envelope (with its resolution) and last noise floor.
+#[derive(Clone, Copy)]
+struct Last {
+    envelope: [i32; 64],
+    high: bool,
+    noise: [i32; MAX_NOISE],
+}
+
+impl Default for Last {
+    fn default() -> Last {
+        Last {
+            envelope: [0; 64],
+            high: true,
+            noise: [0; MAX_NOISE],
+        }
+    }
+}
+
+/// The delta directions of a frame (bs_df_env, bs_df_noise; true = time).
+#[derive(Clone, Copy, Default)]
+struct Directions {
+    envelope: [bool; MAX_ENV],
+    noise: [bool; 2],
+}
+
+impl Directions {
+    fn read(b: &mut Bits, g: &Grid) -> Result<Directions, Error> {
+        let mut d = Directions::default();
+        for v in &mut d.envelope[..g.envelopes] {
+            *v = b.get(1)? == 1;
+        }
+        for v in &mut d.noise[..g.noises] {
+            *v = b.get(1)? == 1;
+        }
+        Ok(d)
+    }
+}
+
+/// The band count of a resolution.
+fn band_count(bands: &Bands, high: bool) -> usize {
+    if high {
+        bands.high.len() - 1
+    } else {
+        bands.low.len() - 1
+    }
+}
+
+/// Envelope scale factors (4.6.18.3.4): per envelope a start value and
+/// frequency deltas, or time deltas against the previous envelope (mapped
+/// between resolutions). The balance channel of a coupled pair has its
+/// own tables and steps of 2.
+fn read_envelope(
+    b: &mut Bits,
+    bands: &Bands,
+    f: &mut Frame,
+    dir: &Directions,
+    last: &mut Last,
+    balance: bool,
+) -> Result<(), Error> {
+    let g = &f.grid;
+    let fine = !f.amp_res;
+    let (t_table, f_table, start_bits) = match (balance, fine) {
+        (false, true) => (ENV15_T, ENV15_F, 7),
+        (false, false) => (ENV30_T, ENV30_F, 6),
+        (true, true) => (BAL15_T, BAL15_F, 6),
+        (true, false) => (BAL30_T, BAL30_F, 5),
+    };
+    let step = if balance { 2 } else { 1 };
+    for l in 0..g.envelopes {
+        let high = g.high[l];
+        let n = band_count(bands, high);
+        let env = &mut f.envelope[l];
+        if dir.envelope[l] {
+            for k in 0..n {
+                // The band of the previous envelope at the same place.
+                let p = match (high, last.high) {
+                    (a, b) if a == b => k,
+                    (true, false) => {
+                        let f0 = bands.high[k];
+                        bands
+                            .low
+                            .windows(2)
+                            .position(|w| w[0] <= f0 && f0 < w[1])
+                            .unwrap_or(0)
+                    }
+                    _ => {
+                        let f0 = bands.low[k];
+                        bands.high.iter().position(|&h| h == f0).unwrap_or(0)
+                    }
+                };
+                env[k] = last.envelope[p] + step * huff(b, t_table)?;
+            }
+        } else {
+            env[0] = step * b.get(start_bits)? as i32;
+            for k in 1..n {
+                env[k] = env[k - 1] + step * huff(b, f_table)?;
+            }
+        }
+        last.envelope = *env;
+        last.high = high;
+    }
+    Ok(())
+}
+
+/// Noise-floor scale factors, coded like the envelopes (5-bit start, the
+/// 3 dB frequency tables, own time tables).
+fn read_noise(
+    b: &mut Bits,
+    bands: &Bands,
+    f: &mut Frame,
+    dir: &Directions,
+    last: &mut Last,
+    balance: bool,
+) -> Result<(), Error> {
+    let n = bands.noise.len() - 1;
+    let (t_table, f_table) = if balance {
+        (NOISE_BAL_T, BAL30_F)
+    } else {
+        (NOISE_T, ENV30_F)
+    };
+    let step = if balance { 2 } else { 1 };
+    for q in 0..f.grid.noises {
+        let noise = &mut f.noise[q];
+        if dir.noise[q] {
+            for k in 0..n {
+                noise[k] = last.noise[k] + step * huff(b, t_table)?;
+            }
+        } else {
+            noise[0] = step * b.get(5)? as i32;
+            for k in 1..n {
+                noise[k] = noise[k - 1] + step * huff(b, f_table)?;
+            }
+        }
+        last.noise = *noise;
+    }
+    Ok(())
+}
+
+/// One channel's coded state between frames and its filter-bank buffers.
 struct Channel {
-    frame_class: u32,
-    add_harmonic_flag: bool,
-    num_env: usize,
-    freq_res: [u8; 7],
-    num_noise: usize,
-    df_env: [u8; 5],
-    df_noise: [u8; 2],
-    invf_mode: [[u8; 5]; 2],
-    add_harmonic: [u8; 48],
-    amp_res: u8,
-    /// Synthesis v (newest first) and analysis input (oldest first).
-    v: History,
+    /// This frame's data, if any arrived.
+    frame: Option<Frame>,
+    /// The last frame's data (repeated when a frame brings none).
+    previous: Option<Frame>,
+    last: Last,
+    /// Inverse-filtering modes and chirp factors of the last frame.
+    invf_prev: [u8; MAX_NOISE],
+    chirp_prev: [f32; MAX_NOISE],
+    /// Subbands (from `kx`) with a sinusoid in the last envelope.
+    sines_prev: [bool; 64],
+    /// The last frame's transient was at its end (`lA = L_E`).
+    transient_at_end: bool,
+    /// The last frame's final border (time slots) and band range.
+    end_prev: usize,
+    kx_prev: usize,
+    m_prev: usize,
+    /// Gain and noise histories for smoothing (newest at `hist`), and
+    /// whether they still need filling.
+    gains: [[f32; 64]; 5],
+    noises: [[f32; 64]; 5],
+    hist: usize,
+    hist_fresh: bool,
+    noise_index: usize,
+    sine_index: usize,
+    /// QMF analysis input (the core, newest last).
     x: Vec<f32>,
-    e_a: [i32; 2],
-    bw: [f32; 5],
-    /// Analysis output of the last two frames: [buffer][slot][band].
-    w: Box<[[[[f32; 2]; 32]; 32]; 2]>,
-    ypos: usize,
-    /// HF adjuster output of the last two frames: [buffer][slot][band].
-    y: Box<[[[[f32; 2]; 64]; 38]; 2]>,
-    g_temp: Box<[[f32; 48]; 42]>,
-    q_temp: Box<[[f32; 48]; 42]>,
-    s_indexmapped: [[u8; 48]; 8],
-    env_facs_q: [[i32; 48]; 6],
-    env_facs: [[f32; 48]; 6],
-    noise_facs_q: [[i32; 5]; 3],
-    noise_facs: [[f32; 5]; 3],
-    t_env: [usize; 8],
-    t_env_num_env_old: usize,
-    t_q: [usize; 3],
-    f_indexnoise: usize,
-    f_indexsine: usize,
+    /// Analysis output: [re/im][slot][subband], slot 8 the frame's first.
+    low: [[[f32; 32]; SPAN]; 2],
+    /// Adjusted high band, same slots; the part past the frame carries on.
+    high: [[[f32; 64]; SPAN]; 2],
+    v: History,
 }
 
 impl Channel {
     fn new() -> Channel {
         Channel {
-            frame_class: 0,
-            add_harmonic_flag: false,
-            num_env: 0,
-            freq_res: [0; 7],
-            num_noise: 0,
-            df_env: [0; 5],
-            df_noise: [0; 2],
-            invf_mode: [[0; 5]; 2],
-            add_harmonic: [0; 48],
-            amp_res: 0,
-            v: History::new(1280),
+            frame: None,
+            previous: None,
+            last: Last::default(),
+            invf_prev: [0; MAX_NOISE],
+            chirp_prev: [0.0; MAX_NOISE],
+            sines_prev: [false; 64],
+            transient_at_end: false,
+            end_prev: 16,
+            kx_prev: 32,
+            m_prev: 0,
+            gains: [[0.0; 64]; 5],
+            noises: [[0.0; 64]; 5],
+            hist: 0,
+            hist_fresh: true,
+            noise_index: 0,
+            sine_index: 0,
             x: vec![0.0; 1312],
-            e_a: [0, -1],
-            bw: [0.0; 5],
-            w: Box::new([[[[0.0; 2]; 32]; 32]; 2]),
-            ypos: 0,
-            y: Box::new([[[[0.0; 2]; 64]; 38]; 2]),
-            g_temp: Box::new([[0.0; 48]; 42]),
-            q_temp: Box::new([[0.0; 48]; 42]),
-            s_indexmapped: [[0; 48]; 8],
-            env_facs_q: [[0; 48]; 6],
-            env_facs: [[0.0; 48]; 6],
-            noise_facs_q: [[0; 5]; 3],
-            noise_facs: [[0.0; 5]; 3],
-            t_env: [0; 8],
-            t_env_num_env_old: 0,
-            t_q: [0; 3],
-            f_indexnoise: 0,
-            f_indexsine: 0,
+            low: [[[0.0; 32]; SPAN]; 2],
+            high: [[[0.0; 64]; SPAN]; 2],
+            v: History::new(1280),
         }
     }
-}
 
-/// Frequency-band parameters of the SBR header: start, stop, crossover,
-/// scale, alter scale, noise bands (−1 before the first header).
-type Spectrum = [i32; 6];
-
-/// SBR of one channel element.
-pub(crate) struct Sbr {
-    /// SBR (output) sample rate: twice the core's.
-    sample_rate: u32,
-    start: bool,
-    ready: bool,
-    /// Element type of the data read (0 SCE, 1 CPE).
-    id: u32,
-    reset: bool,
-    spectrum: Spectrum,
-    amp_res_header: u8,
-    limiter_bands: usize,
-    limiter_gains: usize,
-    interpol_freq: bool,
-    smoothing_mode: bool,
-    coupling: bool,
-    k: [usize; 3],
-    kx: [usize; 2],
-    m: [usize; 2],
-    kx_and_m_pushed: bool,
-    n_master: usize,
-    ch: [Channel; 2],
-    n: [usize; 2],
-    n_q: usize,
-    n_lim: usize,
-    f_master: [usize; 49],
-    f_tablelow: [usize; 25],
-    f_tablehigh: [usize; 49],
-    f_tablenoise: [usize; 6],
-    f_tablelim: [usize; 30],
-    num_patches: usize,
-    patch_num_subbands: [usize; 6],
-    patch_start_subband: [usize; 6],
-    x_low: Box<[[[f32; 2]; 40]; 32]>,
-    lanes: Lanes,
-    x_high: Box<[[[f32; 2]; 40]; 64]>,
-    /// Reconstructed QMF signal per channel: [re/im][slot][band].
-    x: Box<[[[[f32; 64]; 38]; 2]; 2]>,
-    alpha0: [[f32; 2]; 64],
-    alpha1: [[f32; 2]; 64],
-    e_origmapped: [[f32; 48]; 7],
-    q_mapped: [[f32; 48]; 7],
-    s_mapped: [[u8; 48]; 7],
-    e_curr: [[f32; 48]; 7],
-    q_m: [[f32; 48]; 7],
-    s_m: [[f32; 48]; 7],
-    gain: [[f32; 48]; 7],
-    pub(crate) ps: Ps,
-}
-
-/// `num_bands` band widths from `start` to `stop` on a log scale.
-fn make_bands(start: usize, stop: usize, num_bands: usize) -> Vec<i32> {
-    let base = (stop as f32 / start as f32).powf(1.0 / num_bands as f32);
-    let mut prod = start as f32;
-    let mut previous = start as i32;
-    let mut bands = Vec::with_capacity(num_bands);
-    for _ in 0..num_bands.saturating_sub(1) {
-        prod *= base;
-        let present = prod.round_ties_even() as i32;
-        bands.push(present - previous);
-        previous = present;
+    /// Forget everything that depends on the band tables.
+    fn reset(&mut self) {
+        self.frame = None;
+        self.previous = None;
+        self.last = Last::default();
+        self.invf_prev = [0; MAX_NOISE];
+        self.chirp_prev = [0.0; MAX_NOISE];
+        self.sines_prev = [false; 64];
+        self.transient_at_end = false;
+        self.hist_fresh = true;
     }
-    bands.push(stop as i32 - previous);
-    bands
+}
+
+/// The SBR decoder of one AAC element (one or two channels).
+pub(crate) struct Sbr {
+    /// SBR sampling rate (twice the core's).
+    rate: u32,
+    header: Option<Header>,
+    bands: Option<Bands>,
+    coupling: bool,
+    ch: [Channel; 2],
+    pub(crate) ps: Ps,
+    lanes: Lanes,
 }
 
 impl Sbr {
     pub(crate) fn new(core_rate: u32) -> Sbr {
-        let mut s = Sbr {
-            sample_rate: 2 * core_rate,
-            start: false,
-            ready: false,
-            id: 0,
-            reset: false,
-            spectrum: [-1; 6],
-            amp_res_header: 0,
-            limiter_bands: 0,
-            limiter_gains: 0,
-            interpol_freq: false,
-            smoothing_mode: false,
+        Sbr {
+            rate: 2 * core_rate,
+            header: None,
+            bands: None,
             coupling: false,
-            k: [0; 3],
-            kx: [32, 32],
-            m: [0; 2],
-            kx_and_m_pushed: false,
-            n_master: 0,
             ch: [Channel::new(), Channel::new()],
-            n: [0; 2],
-            n_q: 0,
-            n_lim: 0,
-            f_master: [0; 49],
-            f_tablelow: [0; 25],
-            f_tablehigh: [0; 49],
-            f_tablenoise: [0; 6],
-            f_tablelim: [0; 30],
-            num_patches: 0,
-            patch_num_subbands: [0; 6],
-            patch_start_subband: [0; 6],
-            x_low: Box::new([[[0.0; 2]; 40]; 32]),
-            lanes: Lanes::default(),
-            x_high: Box::new([[[0.0; 2]; 40]; 64]),
-            x: Box::new([[[[0.0; 64]; 38]; 2]; 2]),
-            alpha0: [[0.0; 2]; 64],
-            alpha1: [[0.0; 2]; 64],
-            e_origmapped: [[0.0; 48]; 7],
-            q_mapped: [[0.0; 48]; 7],
-            s_mapped: [[0; 48]; 7],
-            e_curr: [[0.0; 48]; 7],
-            q_m: [[0.0; 48]; 7],
-            s_m: [[0.0; 48]; 7],
-            gain: [[0.0; 48]; 7],
             ps: Ps::new(),
-        };
-        s.turn_off();
-        s
+            lanes: Lanes::default(),
+        }
     }
 
-    #[cfg(test)]
+    /// Whether a usable header has arrived.
     pub(crate) fn started(&self) -> bool {
-        self.start
+        self.bands.is_some()
     }
 
-    /// Pure upsampling until the next good header.
-    fn turn_off(&mut self) {
-        self.start = false;
-        self.ready = false;
-        self.kx[1] = 32;
-        self.m[1] = 0;
-        self.ch[0].e_a[1] = -1;
-        self.ch[1].e_a[1] = -1;
-        self.spectrum = [-1; 6];
-    }
-
-    /// Limiter band table (4.6.18.3.2.3).
-    fn make_f_tablelim(&mut self) {
-        if self.limiter_bands > 0 {
-            const WARPED: [f32; 3] = [1.327_151_8, 1.185_092_8, 1.119_871_6];
-            let warp = WARPED[self.limiter_bands - 1];
-            let mut patch_borders = [0usize; 7];
-            patch_borders[0] = self.kx[1];
-            for k in 1..=self.num_patches {
-                patch_borders[k] = patch_borders[k - 1] + self.patch_num_subbands[k - 1];
+    /// The SBR extension payload of a fill element (4.5.2.8.1) for the
+    /// element `id` before it: CRC bits, an optional header, the frame
+    /// data. A damaged payload leaves the frame without data.
+    pub(crate) fn read(&mut self, b: &mut Bits, crc: bool, id: u32, ps_allowed: bool) {
+        for ch in &mut self.ch {
+            ch.frame = None;
+        }
+        if self.read_payload(b, crc, id, ps_allowed).is_err() {
+            for ch in &mut self.ch {
+                ch.frame = None;
             }
-            let n0 = self.n[0];
-            let mut lim: Vec<usize> = self.f_tablelow[..=n0].to_vec();
-            if self.num_patches > 1 {
-                lim.extend_from_slice(&patch_borders[1..self.num_patches]);
-            }
-            lim.sort_unstable();
-            let is_border = |v: usize| patch_borders[..=self.num_patches].contains(&v);
-            let mut n_lim = n0 + self.num_patches - 1;
-            let (mut out, mut inp) = (0usize, 1usize);
-            while out < n_lim {
-                if lim[inp] as f32 >= lim[out] as f32 * warp {
-                    out += 1;
-                    lim[out] = lim[inp];
-                    inp += 1;
-                } else if lim[inp] == lim[out] || !is_border(lim[inp]) {
-                    inp += 1;
-                    n_lim -= 1;
-                } else if !is_border(lim[out]) {
-                    lim[out] = lim[inp];
-                    inp += 1;
-                    n_lim -= 1;
-                } else {
-                    out += 1;
-                    lim[out] = lim[inp];
-                    inp += 1;
-                }
-            }
-            self.n_lim = n_lim;
-            for (d, &v) in self.f_tablelim.iter_mut().zip(&lim[..=n_lim]) {
-                *d = v;
-            }
-        } else {
-            self.f_tablelim[0] = self.f_tablelow[0];
-            self.f_tablelim[1] = self.f_tablelow[self.n[0]];
-            self.n_lim = 1;
         }
     }
 
-    fn read_header(&mut self, b: &mut Bits) -> Result<(), Error> {
-        let old_limiter = self.limiter_bands;
-        let old = self.spectrum;
-        self.start = true;
-        self.ready = false;
-        self.amp_res_header = b.get(1)? as u8;
-        self.spectrum[0] = b.get(4)? as i32;
-        self.spectrum[1] = b.get(4)? as i32;
-        self.spectrum[2] = b.get(3)? as i32;
-        b.get(2)?;
-        let extra1 = b.get(1)? == 1;
-        let extra2 = b.get(1)? == 1;
-        if extra1 {
-            self.spectrum[3] = b.get(2)? as i32;
-            self.spectrum[4] = b.get(1)? as i32;
-            self.spectrum[5] = b.get(2)? as i32;
-        } else {
-            self.spectrum[3] = 2;
-            self.spectrum[4] = 1;
-            self.spectrum[5] = 2;
+    fn read_payload(
+        &mut self,
+        b: &mut Bits,
+        crc: bool,
+        id: u32,
+        ps_allowed: bool,
+    ) -> Result<(), Error> {
+        if crc {
+            b.skip(10)?;
         }
-        if self.spectrum != old {
-            self.reset = true;
-        }
-        if extra2 {
-            self.limiter_bands = b.get(2)? as usize;
-            self.limiter_gains = b.get(2)? as usize;
-            self.interpol_freq = b.get(1)? == 1;
-            self.smoothing_mode = b.get(1)? == 1;
-        } else {
-            self.limiter_bands = 2;
-            self.limiter_gains = 2;
-            self.interpol_freq = true;
-            self.smoothing_mode = true;
-        }
-        if self.limiter_bands != old_limiter && !self.reset {
-            self.make_f_tablelim();
-        }
-        Ok(())
-    }
-
-    /// Master frequency band table (4.6.18.3.2.1).
-    fn make_f_master(&mut self) -> Option<()> {
-        let sp = self.spectrum;
-        let offsets = match self.sample_rate {
-            16000 => &tab::OFFSET[0],
-            22050 => &tab::OFFSET[1],
-            24000 => &tab::OFFSET[2],
-            32000 => &tab::OFFSET[3],
-            44100 | 48000 | 64000 => &tab::OFFSET[4],
-            88200 | 96000 | 128000 | 176400 | 192000 => &tab::OFFSET[5],
-            _ => return None,
-        };
-        let sr = self.sample_rate;
-        let temp: u32 = if sr < 32000 {
-            3000
-        } else if sr < 64000 {
-            4000
-        } else {
-            5000
-        };
-        let start_min = ((temp << 7) + (sr >> 1)) / sr;
-        let stop_min = ((temp << 8) + (sr >> 1)) / sr;
-        let k0 = start_min as i32 + i32::from(offsets[usize::try_from(sp[0]).ok()?]);
-        let mut k2 = match sp[1] {
-            0..=13 => {
-                let mut dk = make_bands(stop_min as usize, 64, 13);
-                dk.sort_unstable();
-                stop_min as i32 + dk[..sp[1] as usize].iter().sum::<i32>()
-            }
-            14 => 2 * k0,
-            15 => 3 * k0,
-            _ => return None,
-        };
-        k2 = k2.min(64);
-        let max_qmf = if sr <= 32000 {
-            48
-        } else if sr == 44100 {
-            35
-        } else {
-            32
-        };
-        if k0 <= 0 || k2 - k0 > max_qmf || k2 <= k0 {
-            return None;
-        }
-        let (k0, k2) = (k0 as usize, k2 as usize);
-        self.k[0] = k0;
-        self.k[2] = k2;
-        let xover = sp[2] as usize;
-        if sp[3] == 0 {
-            let dk = sp[4] as usize + 1;
-            self.n_master = ((k2 - k0 + (dk & 2)) >> dk) << 1;
-            if self.n_master == 0 || xover >= self.n_master {
-                return None;
-            }
-            let mut f = [0i32; 49];
-            for v in f.iter_mut().take(self.n_master + 1).skip(1) {
-                *v = dk as i32;
-            }
-            let k2diff = k2 as i32 - k0 as i32 - (self.n_master * dk) as i32;
-            if k2diff < 0 {
-                f[1] -= 1;
-                f[2] -= i32::from(k2diff < -1);
-            } else if k2diff != 0 {
-                f[self.n_master] += 1;
-            }
-            f[0] = k0 as i32;
-            for k in 1..=self.n_master {
-                f[k] += f[k - 1];
-            }
-            for (d, &v) in self.f_master.iter_mut().zip(&f) {
-                *d = usize::try_from(v).ok()?;
-            }
-        } else {
-            let half_bands = 7 - sp[3] as usize;
-            let two_regions = 49 * k2 > 110 * k0;
-            let k1 = if two_regions { 2 * k0 } else { k2 };
-            self.k[1] = k1;
-            let num0 =
-                (half_bands as f32 * (k1 as f32 / k0 as f32).log2()).round_ties_even() as i32 * 2;
-            if num0 <= 0 {
-                return None;
-            }
-            let num0 = num0 as usize;
-            let mut vk0 = make_bands(k0, k1, num0);
-            vk0.sort_unstable();
-            let vdk0_max = vk0[num0 - 1];
-            let mut f0 = vec![k0 as i32];
-            for &d in &vk0 {
-                if d <= 0 {
-                    return None;
-                }
-                f0.push(f0.last()? + d);
-            }
-            let mut all = f0;
-            if two_regions {
-                let invwarp = if sp[4] != 0 { 0.769_230_8 } else { 1.0f32 };
-                let num1 = (half_bands as f32 * invwarp * (k2 as f32 / k1 as f32).log2())
-                    .round_ties_even() as i32
-                    * 2;
-                if num1 <= 0 {
-                    return None;
-                }
-                let num1 = num1 as usize;
-                let mut vk1 = make_bands(k1, k2, num1);
-                let vdk1_min = *vk1.iter().min()?;
-                if vdk1_min < vdk0_max {
-                    vk1.sort_unstable();
-                    let change = (vdk0_max - vk1[0]).min((vk1[num1 - 1] - vk1[0]) >> 1);
-                    vk1[0] += change;
-                    vk1[num1 - 1] -= change;
-                }
-                vk1.sort_unstable();
-                let mut at = k1 as i32;
-                for &d in &vk1 {
-                    if d <= 0 {
-                        return None;
-                    }
-                    at += d;
-                    all.push(at);
-                }
-                self.n_master = num0 + num1;
-            } else {
-                self.n_master = num0;
-            }
-            if self.n_master == 0 || xover >= self.n_master || all.len() > 49 {
-                return None;
-            }
-            for (d, &v) in self.f_master.iter_mut().zip(&all) {
-                *d = usize::try_from(v).ok()?;
-            }
-        }
-        Some(())
-    }
-
-    /// Patch construction (4.6.18.6.3).
-    fn calc_patches(&mut self) -> Option<()> {
-        let mut last_k: i32 = -1;
-        let mut last_msb: i32 = -1;
-        let mut sb = 0usize;
-        let mut msb = self.k[0];
-        let mut usb = self.kx[1];
-        let goal_sb = (((1000u32 << 11) + (self.sample_rate >> 1)) / self.sample_rate) as usize;
-        self.num_patches = 0;
-        let mut k = if goal_sb < self.kx[1] + self.m[1] {
-            let mut k = 0;
-            while self.f_master[k] < goal_sb {
-                k += 1;
-            }
-            k
-        } else {
-            self.n_master
-        };
-        loop {
-            let mut odd = 0;
-            if k as i32 == last_k && msb as i32 == last_msb {
-                return None;
-            }
-            last_k = k as i32;
-            last_msb = msb as i32;
-            let mut i = k as i32;
-            loop {
-                if !(i == k as i32 || sb > (self.k[0] - 1 + msb).saturating_sub(odd)) {
-                    break;
-                }
-                if i < 0 {
-                    return None;
-                }
-                sb = self.f_master[i as usize];
-                odd = (sb + self.k[0]) & 1;
-                i -= 1;
-            }
-            if self.num_patches > 5 {
-                return None;
-            }
-            let n = sb.saturating_sub(usb);
-            self.patch_num_subbands[self.num_patches] = n;
-            self.patch_start_subband[self.num_patches] = (self.k[0] - odd).checked_sub(n)?;
-            if n > 0 {
-                usb = sb;
-                msb = sb;
-                self.num_patches += 1;
-            } else {
-                msb = self.kx[1];
-            }
-            if self.f_master[k] < sb + 3 {
-                k = self.n_master;
-            }
-            if sb == self.kx[1] + self.m[1] {
-                break;
-            }
-        }
-        if self.num_patches > 1 && self.patch_num_subbands[self.num_patches - 1] < 3 {
-            self.num_patches -= 1;
-        }
-        Some(())
-    }
-
-    /// Derived frequency tables (4.6.18.3.2.2).
-    fn make_f_derived(&mut self) -> Option<()> {
-        let xover = self.spectrum[2] as usize;
-        self.n[1] = self.n_master - xover;
-        self.n[0] = (self.n[1] + 1) >> 1;
-        self.f_tablehigh[..=self.n[1]].copy_from_slice(&self.f_master[xover..=self.n_master]);
-        self.m[1] = self.f_tablehigh[self.n[1]] - self.f_tablehigh[0];
-        self.kx[1] = self.f_tablehigh[0];
-        if self.kx[1] + self.m[1] > 64 || self.kx[1] > 32 {
-            return None;
-        }
-        self.f_tablelow[0] = self.f_tablehigh[0];
-        let odd = self.n[1] & 1;
-        for k in 1..=self.n[0] {
-            self.f_tablelow[k] = self.f_tablehigh[2 * k - odd];
-        }
-        let nq = (self.spectrum[5] as f32 * (self.k[2] as f32 / self.kx[1] as f32).log2())
-            .round_ties_even() as i32;
-        self.n_q = nq.max(1) as usize;
-        if self.n_q > 5 {
-            return None;
-        }
-        self.f_tablenoise[0] = self.f_tablelow[0];
-        let mut temp = 0usize;
-        for k in 1..=self.n_q {
-            temp += (self.n[0] - temp) / (self.n_q + 1 - k);
-            self.f_tablenoise[k] = self.f_tablelow[temp];
-        }
-        self.calc_patches()?;
-        self.make_f_tablelim();
-        self.ch[0].f_indexnoise = 0;
-        self.ch[1].f_indexnoise = 0;
-        Some(())
-    }
-
-    fn do_reset(&mut self) {
-        if self
-            .make_f_master()
-            .and_then(|()| self.make_f_derived())
-            .is_none()
-        {
-            self.turn_off();
-        }
-    }
-
-    fn read_grid(&mut self, b: &mut Bits, c: usize) -> Result<bool, Error> {
-        let ch = &mut self.ch[c];
-        let mut pointer = 0usize;
-        let mut abs_bord_trail = 16usize;
-        let num_env_old = ch.num_env;
-        ch.freq_res[0] = ch.freq_res[ch.num_env];
-        ch.amp_res = self.amp_res_header;
-        ch.t_env_num_env_old = ch.t_env[num_env_old];
-        const CEIL_LOG2: [u32; 6] = [0, 1, 2, 2, 3, 3];
-        let class = b.get(2)?;
-        match class {
-            0 => {
-                let n = 1usize << b.get(2)?;
-                if n > 4 {
-                    return Ok(false);
-                }
-                ch.num_env = n;
-                if n == 1 {
-                    ch.amp_res = 0;
-                }
-                ch.t_env[0] = 0;
-                ch.t_env[n] = abs_bord_trail;
-                abs_bord_trail = (abs_bord_trail + (n >> 1)) / n;
-                for i in 0..n - 1 {
-                    ch.t_env[i + 1] = ch.t_env[i] + abs_bord_trail;
-                }
-                ch.freq_res[1] = b.get(1)? as u8;
-                for i in 1..n {
-                    ch.freq_res[i + 1] = ch.freq_res[1];
-                }
-            }
-            1 => {
-                abs_bord_trail += b.get(2)? as usize;
-                let rel = b.get(2)? as usize;
-                let n = rel + 1;
-                ch.num_env = n;
-                ch.t_env[0] = 0;
-                ch.t_env[n] = abs_bord_trail;
-                for i in 0..rel {
-                    let d = 2 * b.get(2)? as usize + 2;
-                    ch.t_env[n - 1 - i] = ch.t_env[n - i].saturating_sub(d);
-                }
-                pointer = b.get(CEIL_LOG2[n])? as usize;
-                for i in 0..n {
-                    ch.freq_res[n - i] = b.get(1)? as u8;
-                }
-            }
-            2 => {
-                ch.t_env[0] = b.get(2)? as usize;
-                let rel = b.get(2)? as usize;
-                let n = rel + 1;
-                ch.num_env = n;
-                ch.t_env[n] = abs_bord_trail;
-                for i in 0..rel {
-                    ch.t_env[i + 1] = ch.t_env[i] + 2 * b.get(2)? as usize + 2;
-                }
-                pointer = b.get(CEIL_LOG2[n])? as usize;
-                for i in 0..n {
-                    ch.freq_res[i + 1] = b.get(1)? as u8;
-                }
-            }
-            _ => {
-                ch.t_env[0] = b.get(2)? as usize;
-                abs_bord_trail += b.get(2)? as usize;
-                let lead = b.get(2)? as usize;
-                let trail = b.get(2)? as usize;
-                let n = lead + trail + 1;
-                if n > 5 {
-                    return Ok(false);
-                }
-                ch.num_env = n;
-                ch.t_env[n] = abs_bord_trail;
-                for i in 0..lead {
-                    ch.t_env[i + 1] = ch.t_env[i] + 2 * b.get(2)? as usize + 2;
-                }
-                for i in 0..trail {
-                    let d = 2 * b.get(2)? as usize + 2;
-                    ch.t_env[n - 1 - i] = ch.t_env[n - i].saturating_sub(d);
-                }
-                pointer = b.get(CEIL_LOG2[n])? as usize;
-                for i in 0..n {
-                    ch.freq_res[i + 1] = b.get(1)? as u8;
+        if b.get(1)? == 1 {
+            let h = Header::read(b)?;
+            let reset = self.header.is_none_or(|old| !old.same_bands(&h));
+            self.header = Some(h);
+            if reset {
+                self.bands = Bands::new(&h, self.rate);
+                for ch in &mut self.ch {
+                    ch.reset();
                 }
             }
         }
-        ch.frame_class = class;
-        let n = ch.num_env;
-        if pointer > n + 1 {
-            return Ok(false);
-        }
-        for i in 1..=n {
-            if ch.t_env[i - 1] >= ch.t_env[i] {
-                return Ok(false);
-            }
-        }
-        ch.num_noise = usize::from(n > 1) + 1;
-        ch.t_q[0] = ch.t_env[0];
-        ch.t_q[ch.num_noise] = ch.t_env[n];
-        if ch.num_noise > 1 {
-            let idx = if class == FIXFIX {
-                n >> 1
-            } else if class & 1 == 1 {
-                n - (pointer.saturating_sub(1)).max(1)
-            } else if pointer == 0 {
-                1
-            } else if pointer == 1 {
-                n - 1
-            } else {
-                pointer - 1
-            };
-            ch.t_q[1] = ch.t_env[idx];
-        }
-        ch.e_a[0] = -i32::from(ch.e_a[1] != num_env_old as i32);
-        ch.e_a[1] = -1;
-        if class & 1 == 1 && pointer != 0 {
-            ch.e_a[1] = (n + 1 - pointer) as i32;
-        } else if class == VARFIX && pointer > 1 {
-            ch.e_a[1] = pointer as i32 - 1;
-        }
-        Ok(true)
-    }
-
-    /// Channel 1's grid copied from channel 0 (coupled stereo).
-    fn copy_grid(&mut self) {
-        let [src, dst] = &mut self.ch;
-        dst.freq_res[0] = dst.freq_res[dst.num_env];
-        dst.t_env_num_env_old = dst.t_env[dst.num_env];
-        dst.e_a[0] = -i32::from(dst.e_a[1] != dst.num_env as i32);
-        dst.freq_res[1..].copy_from_slice(&src.freq_res[1..]);
-        dst.t_env = src.t_env;
-        dst.t_q = src.t_q;
-        dst.num_env = src.num_env;
-        dst.amp_res = src.amp_res;
-        dst.num_noise = src.num_noise;
-        dst.frame_class = src.frame_class;
-        dst.e_a[1] = src.e_a[1];
-    }
-
-    fn read_dtdf(&mut self, b: &mut Bits, c: usize) -> Result<(), Error> {
-        let ch = &mut self.ch[c];
-        for i in 0..ch.num_env {
-            ch.df_env[i] = b.get(1)? as u8;
-        }
-        for i in 0..ch.num_noise {
-            ch.df_noise[i] = b.get(1)? as u8;
-        }
-        Ok(())
-    }
-
-    fn read_invf(&mut self, b: &mut Bits, c: usize) -> Result<(), Error> {
-        let n_q = self.n_q;
-        let ch = &mut self.ch[c];
-        ch.invf_mode[1] = ch.invf_mode[0];
-        for i in 0..n_q {
-            ch.invf_mode[0][i] = b.get(2)? as u8;
-        }
-        Ok(())
-    }
-
-    fn read_envelope(&mut self, b: &mut Bits, c: usize) -> Result<bool, Error> {
-        let coupled = self.coupling && c == 1;
-        let delta = if coupled { 2 } else { 1 };
-        let odd = self.n[1] & 1;
-        let n = self.n;
-        let ch = &mut self.ch[c];
-        let (bits, t, f) = match (coupled, ch.amp_res) {
-            (true, 1) => (5, T_ENV_BAL_3_0, F_ENV_BAL_3_0),
-            (true, _) => (6, T_ENV_BAL_1_5, F_ENV_BAL_1_5),
-            (false, 1) => (6, T_ENV_3_0, F_ENV_3_0),
-            (false, _) => (7, T_ENV_1_5, F_ENV_1_5),
-        };
-        for i in 0..ch.num_env {
-            let res = usize::from(ch.freq_res[i + 1]);
-            if ch.df_env[i] != 0 {
-                for j in 0..n[res] {
-                    let k = if ch.freq_res[i + 1] == ch.freq_res[i] {
-                        j
-                    } else if res == 1 {
-                        (j + odd) >> 1
-                    } else if j == 0 {
-                        0
-                    } else {
-                        2 * j - odd
-                    };
-                    let v = ch.env_facs_q[i][k] + delta * huff(b, t)?;
-                    if !(0..=127).contains(&v) {
-                        return Ok(false);
-                    }
-                    ch.env_facs_q[i + 1][j] = v;
-                }
-            } else {
-                ch.env_facs_q[i + 1][0] = delta * b.get(bits)? as i32;
-                for j in 1..n[res] {
-                    let v = ch.env_facs_q[i + 1][j - 1] + delta * huff(b, f)?;
-                    if !(0..=127).contains(&v) {
-                        return Ok(false);
-                    }
-                    ch.env_facs_q[i + 1][j] = v;
-                }
-            }
-        }
-        ch.env_facs_q[0] = ch.env_facs_q[ch.num_env];
-        Ok(true)
-    }
-
-    fn read_noise(&mut self, b: &mut Bits, c: usize) -> Result<bool, Error> {
-        let coupled = self.coupling && c == 1;
-        let delta = if coupled { 2 } else { 1 };
-        let (t, f) = if coupled {
-            (T_NOISE_BAL_3_0, F_ENV_BAL_3_0)
-        } else {
-            (T_NOISE_3_0, F_ENV_3_0)
-        };
-        let n_q = self.n_q;
-        let ch = &mut self.ch[c];
-        for i in 0..ch.num_noise {
-            if ch.df_noise[i] != 0 {
-                for j in 0..n_q {
-                    let v = ch.noise_facs_q[i][j] + delta * huff(b, t)?;
-                    if !(0..=30).contains(&v) {
-                        return Ok(false);
-                    }
-                    ch.noise_facs_q[i + 1][j] = v;
-                }
-            } else {
-                ch.noise_facs_q[i + 1][0] = delta * b.get(5)? as i32;
-                for j in 1..n_q {
-                    let v = ch.noise_facs_q[i + 1][j - 1] + delta * huff(b, f)?;
-                    if !(0..=30).contains(&v) {
-                        return Ok(false);
-                    }
-                    ch.noise_facs_q[i + 1][j] = v;
-                }
-            }
-        }
-        ch.noise_facs_q[0] = ch.noise_facs_q[ch.num_noise];
-        Ok(true)
-    }
-
-    fn read_harmonics(&mut self, b: &mut Bits, c: usize) -> Result<(), Error> {
-        let n1 = self.n[1];
-        let ch = &mut self.ch[c];
-        ch.add_harmonic_flag = b.get(1)? == 1;
-        if ch.add_harmonic_flag {
-            for i in 0..n1 {
-                ch.add_harmonic[i] = b.get(1)? as u8;
-            }
-        }
-        Ok(())
-    }
-
-    /// `sbr_single_channel_element` / `sbr_channel_pair_element`; `false`
-    /// for invalid data.
-    fn read_element(&mut self, b: &mut Bits, id: u32) -> Result<bool, Error> {
-        if id == 0 {
-            if b.get(1)? == 1 {
-                b.get(4)?;
-            }
-            if !self.read_grid(b, 0)? {
-                return Ok(false);
-            }
-            self.read_dtdf(b, 0)?;
-            self.read_invf(b, 0)?;
-            if !self.read_envelope(b, 0)? || !self.read_noise(b, 0)? {
-                return Ok(false);
-            }
-            self.read_harmonics(b, 0)?;
-        } else {
-            if b.get(1)? == 1 {
-                b.get(8)?;
-            }
-            self.coupling = b.get(1)? == 1;
-            if self.coupling {
-                if !self.read_grid(b, 0)? {
-                    return Ok(false);
-                }
-                self.copy_grid();
-                self.read_dtdf(b, 0)?;
-                self.read_dtdf(b, 1)?;
-                self.read_invf(b, 0)?;
-                self.ch[1].invf_mode[1] = self.ch[1].invf_mode[0];
-                self.ch[1].invf_mode[0] = self.ch[0].invf_mode[0];
-                if !self.read_envelope(b, 0)?
-                    || !self.read_noise(b, 0)?
-                    || !self.read_envelope(b, 1)?
-                    || !self.read_noise(b, 1)?
-                {
-                    return Ok(false);
-                }
-            } else {
-                if !self.read_grid(b, 0)? || !self.read_grid(b, 1)? {
-                    return Ok(false);
-                }
-                self.read_dtdf(b, 0)?;
-                self.read_dtdf(b, 1)?;
-                self.read_invf(b, 0)?;
-                self.read_invf(b, 1)?;
-                if !self.read_envelope(b, 0)?
-                    || !self.read_envelope(b, 1)?
-                    || !self.read_noise(b, 0)?
-                    || !self.read_noise(b, 1)?
-                {
-                    return Ok(false);
-                }
-            }
-            self.read_harmonics(b, 0)?;
-            self.read_harmonics(b, 1)?;
-        }
-        Ok(true)
-    }
-
-    fn read_data(&mut self, b: &mut Bits, id: u32, ps_allowed: bool) -> Result<(), Error> {
-        self.id = id;
-        self.ready = true;
-        if id > 1 || !self.read_element(b, id)? {
-            self.turn_off();
+        let (Some(h), Some(bands)) = (self.header, self.bands.as_ref()) else {
             return Ok(());
+        };
+        let mut frames = [Frame::default(); 2];
+        let mut lasts = [self.ch[0].last, self.ch[1].last];
+        if id == 1 {
+            if b.get(1)? == 1 {
+                b.skip(8)?; // reserved
+            }
+            let coupling = b.get(1)? == 1;
+            frames[0].grid = Grid::read(b)?;
+            frames[1].grid = if coupling {
+                frames[0].grid
+            } else {
+                Grid::read(b)?
+            };
+            let d0 = Directions::read(b, &frames[0].grid)?;
+            let d1 = Directions::read(b, &frames[1].grid)?;
+            for f in &mut frames {
+                f.amp_res = amp_res(&h, &f.grid);
+            }
+            let n_q = bands.noise.len() - 1;
+            for i in 0..n_q {
+                frames[0].invf[i] = b.get(2)? as u8;
+            }
+            if coupling {
+                frames[1].invf = frames[0].invf;
+                let [f0, f1] = &mut frames;
+                let [l0, l1] = &mut lasts;
+                read_envelope(b, bands, f0, &d0, l0, false)?;
+                read_noise(b, bands, f0, &d0, l0, false)?;
+                read_envelope(b, bands, f1, &d1, l1, true)?;
+                read_noise(b, bands, f1, &d1, l1, true)?;
+            } else {
+                for i in 0..n_q {
+                    frames[1].invf[i] = b.get(2)? as u8;
+                }
+                let [f0, f1] = &mut frames;
+                let [l0, l1] = &mut lasts;
+                read_envelope(b, bands, f0, &d0, l0, false)?;
+                read_envelope(b, bands, f1, &d1, l1, false)?;
+                read_noise(b, bands, f0, &d0, l0, false)?;
+                read_noise(b, bands, f1, &d1, l1, false)?;
+            }
+            for f in &mut frames {
+                read_sines(b, bands, f)?;
+            }
+            self.coupling = coupling;
+        } else {
+            if b.get(1)? == 1 {
+                b.skip(4)?; // reserved
+            }
+            let f = &mut frames[0];
+            f.grid = Grid::read(b)?;
+            let d = Directions::read(b, &f.grid)?;
+            f.amp_res = amp_res(&h, &f.grid);
+            for i in 0..bands.noise.len() - 1 {
+                f.invf[i] = b.get(2)? as u8;
+            }
+            read_envelope(b, bands, f, &d, &mut lasts[0], false)?;
+            read_noise(b, bands, f, &d, &mut lasts[0], false)?;
+            read_sines(b, bands, f)?;
+            self.coupling = false;
         }
+        let channels = if id == 1 { 2 } else { 1 };
+        for c in 0..channels {
+            self.ch[c].frame = Some(frames[c]);
+            self.ch[c].last = lasts[c];
+        }
+        // Extensions: parametric stereo (id 2) for a single channel.
         if b.get(1)? == 1 {
             let mut size = b.get(4)? as usize;
             if size == 15 {
                 size += b.get(8)? as usize;
             }
-            let mut left = size as i64 * 8;
+            let mut left = 8 * size;
             while left > 7 {
-                left -= 2;
                 let ext = b.get(2)?;
-                if ext == 2 && ps_allowed {
-                    let used = self.ps.read(b, left as usize);
-                    b.skip(used)?;
-                    left -= used as i64;
+                left -= 2;
+                if ext == 2 && id == 0 && ps_allowed {
+                    let used = self.ps.read(b, left);
+                    left = left.saturating_sub(used);
                 } else {
-                    b.skip(left as usize)?;
+                    b.skip(left)?;
                     left = 0;
                 }
             }
-            if left > 0 {
-                b.skip(left as usize)?;
-            }
+            b.skip(left)?;
         }
         Ok(())
     }
+}
 
-    /// `sbr_extension_data` of a fill element (its `cnt` bytes after the
-    /// 4-bit extension type) for element type `id` (0 SCE, 1 CPE).
-    pub(crate) fn read(&mut self, b: &mut Bits, crc: bool, id: u32, ps_allowed: bool) {
-        self.reset = false;
-        self.kx[0] = self.kx[1];
-        self.m[0] = self.m[1];
-        self.kx_and_m_pushed = true;
-        let r = (|| -> Result<(), Error> {
-            if crc {
-                b.get(10)?;
-            }
-            if b.get(1)? == 1 {
-                self.read_header(b)?;
-            }
-            if self.reset {
-                self.do_reset();
-            }
-            if self.start {
-                self.read_data(b, id, ps_allowed)?;
-            }
-            Ok(())
-        })();
-        if r.is_err() {
-            // Read past the element: the frame's SBR is unusable.
-            self.turn_off();
+/// 1.5 dB steps are used for a single FIXFIX envelope whatever the header
+/// says.
+fn amp_res(h: &Header, g: &Grid) -> bool {
+    h.amp_res && !(g.class == FIXFIX && g.envelopes == 1)
+}
+
+fn read_sines(b: &mut Bits, bands: &Bands, f: &mut Frame) -> Result<(), Error> {
+    if b.get(1)? == 1 {
+        for s in &mut f.sines[..bands.high.len() - 1] {
+            *s = b.get(1)? == 1;
         }
     }
+    Ok(())
+}
 
-    /// Dequantization and coupled-stereo decoding (4.6.18.3.5).
-    fn dequant(&mut self, cpe: bool) {
-        let exp2 = |q: i32| -> f32 { (q as f32).exp2() };
-        let half = |q: i32| -> f32 {
-            ((q >> 1) as f32).exp2()
-                * if q & 1 == 1 {
-                    std::f32::consts::SQRT_2
+/// Smoothing filter of the gains and noise levels over 5 slots (newest
+/// first), 4.6.18.7.5.
+const SMOOTH: [f32; 5] = [
+    0.333_333_33,
+    0.301_502_83,
+    0.218_169_5,
+    0.115_163_83,
+    0.031_830_5,
+];
+
+/// Limiter gains (amplitude): −3, 0, +3 dB and none.
+const LIMITER_GAIN: [f32; 4] = [0.707_945_8, 1.0, 1.412_537_5, 1e10];
+
+/// Dequantized scale factors of one channel's frame (4.6.18.3.5):
+/// envelope energies per band and noise-floor ratios.
+struct Levels {
+    envelope: [[f32; 64]; MAX_ENV],
+    noise: [[f32; MAX_NOISE]; 2],
+}
+
+fn dequantize(f: &Frame, bands: &Bands) -> Levels {
+    let a = if f.amp_res { 1.0 } else { 0.5 };
+    let mut out = Levels {
+        envelope: [[0.0; 64]; MAX_ENV],
+        noise: [[0.0; MAX_NOISE]; 2],
+    };
+    for l in 0..f.grid.envelopes {
+        for k in 0..band_count(bands, f.grid.high[l]) {
+            out.envelope[l][k] = (f.envelope[l][k] as f32 * a + 6.0).exp2();
+        }
+    }
+    for q in 0..f.grid.noises {
+        for k in 0..bands.noise.len() - 1 {
+            out.noise[q][k] = (6.0 - f.noise[q][k] as f32).exp2();
+        }
+    }
+    out
+}
+
+/// A coupled pair: level from the first channel, balance from the second.
+fn dequantize_coupled(f0: &Frame, f1: &Frame, bands: &Bands) -> [Levels; 2] {
+    let a = if f0.amp_res { 1.0 } else { 0.5 };
+    let pan = if f0.amp_res { 12.0 } else { 24.0 };
+    let mut out = [dequantize(f0, bands), dequantize(f0, bands)];
+    for l in 0..f0.grid.envelopes {
+        for k in 0..band_count(bands, f0.grid.high[l]) {
+            let level = (f0.envelope[l][k] as f32 * a + 7.0).exp2();
+            let balance = f1.envelope[l][k] as f32;
+            out[0].envelope[l][k] = level / (1.0 + ((pan - balance) * a).exp2());
+            out[1].envelope[l][k] = level / (1.0 + ((balance - pan) * a).exp2());
+        }
+    }
+    for q in 0..f0.grid.noises {
+        for k in 0..bands.noise.len() - 1 {
+            let level = (7.0 - f0.noise[q][k] as f32).exp2();
+            let balance = f1.noise[q][k] as f32;
+            out[0].noise[q][k] = level / (1.0 + (12.0 - balance).exp2());
+            out[1].noise[q][k] = level / (1.0 + (balance - 12.0).exp2());
+        }
+    }
+    out
+}
+
+/// The chirp factor of a noise band from its inverse-filtering mode, the
+/// last frame's mode and factor (4.6.18.6.2).
+fn chirp(mode: u8, prev_mode: u8, prev: f32) -> f32 {
+    let target = match (mode, prev_mode) {
+        (0, 1) => 0.6,
+        (0, _) => 0.0,
+        (1, 0) => 0.6,
+        (1, _) => 0.75,
+        (2, _) => 0.9,
+        _ => 0.98,
+    };
+    let c = if target < prev {
+        0.75 * target + 0.25 * prev
+    } else {
+        0.90625 * target + 0.09375 * prev
+    };
+    if c < 0.015625 { 0.0 } else { c }
+}
+
+/// Second-order complex predictor of each low subband from the analysis
+/// buffer (covariance method, 4.6.18.6.2): (α0, α1) as (re, im) pairs,
+/// zero when unstable or degenerate.
+fn predictors(low: &[[[f32; 32]; SPAN]; 2], count: usize) -> [[[f32; 2]; 2]; 32] {
+    let mut out = [[[0.0; 2]; 2]; 32];
+    for (k, o) in out.iter_mut().enumerate().take(count) {
+        // φ(i, j) = Σ x(n − i) x*(n − j) over n = 0..38 of slots offset by
+        // ADJ: entries (0,1), (0,2), (1,2) complex; (1,1), (2,2) real.
+        let x = |n: usize| (f64::from(low[0][n][k]), f64::from(low[1][n][k]));
+        let mut p01 = (0.0, 0.0);
+        let mut p02 = (0.0, 0.0);
+        let mut p12 = (0.0, 0.0);
+        let mut p11 = 0.0;
+        let mut p22 = 0.0;
+        for n in 0..SLOTS + 6 {
+            let a = x(n + ADJ);
+            let b = x(n + ADJ - 1);
+            let c = x(n + ADJ - 2);
+            // a·b*, a·c*, b·c*
+            p01.0 += a.0 * b.0 + a.1 * b.1;
+            p01.1 += a.1 * b.0 - a.0 * b.1;
+            p02.0 += a.0 * c.0 + a.1 * c.1;
+            p02.1 += a.1 * c.0 - a.0 * c.1;
+            p12.0 += b.0 * c.0 + b.1 * c.1;
+            p12.1 += b.1 * c.0 - b.0 * c.1;
+            p11 += b.0 * b.0 + b.1 * b.1;
+            p22 += c.0 * c.0 + c.1 * c.1;
+        }
+        let d = p22 * p11 - (p12.0 * p12.0 + p12.1 * p12.1) / (1.0 + 1e-6);
+        let mut a1 = (0.0, 0.0);
+        if d != 0.0 {
+            // (φ01 φ12 − φ02 φ11) / d
+            a1.0 = (p01.0 * p12.0 - p01.1 * p12.1 - p02.0 * p11) / d;
+            a1.1 = (p01.0 * p12.1 + p01.1 * p12.0 - p02.1 * p11) / d;
+        }
+        let mut a0 = (0.0, 0.0);
+        if p11 != 0.0 {
+            // −(φ01 + α1 φ12*) / φ11
+            a0.0 = -(p01.0 + a1.0 * p12.0 + a1.1 * p12.1) / p11;
+            a0.1 = -(p01.1 + a1.1 * p12.0 - a1.0 * p12.1) / p11;
+        }
+        let big = |v: (f64, f64)| v.0 * v.0 + v.1 * v.1 >= 16.0;
+        if big(a0) || big(a1) {
+            continue;
+        }
+        *o = [[a0.0 as f32, a0.1 as f32], [a1.0 as f32, a1.1 as f32]];
+    }
+    out
+}
+
+impl Sbr {
+    /// The SBR part of one channel's frame: HF generation and adjustment
+    /// into `ch.high` over the frame's envelope slots.
+    fn generate(ch: &mut Channel, f: &Frame, levels: &Levels, bands: &Bands, h: &Header) {
+        let g = &f.grid;
+        let (kx, m) = (bands.kx, bands.m);
+        let first = 2 * g.borders[0] + ADJ;
+        let end = 2 * g.borders[g.envelopes] + ADJ;
+        // Chirp factors per noise band.
+        let n_q = bands.noise.len() - 1;
+        let mut chirps = [0f32; MAX_NOISE];
+        for i in 0..n_q {
+            chirps[i] = chirp(f.invf[i], ch.invf_prev[i], ch.chirp_prev[i]);
+        }
+        ch.chirp_prev = chirps;
+        ch.invf_prev = f.invf;
+        // HF generation: each patch copies its source subbands up,
+        // inverse-filtered with the band's chirp factor.
+        let alpha = predictors(&ch.low, bands.k0.max(kx).min(32));
+        let mut xh = [[[0f32; SPAN]; 64]; 2];
+        let mut k = kx;
+        for &(src, width) in &bands.patches {
+            for p in src..src + width {
+                let bw = chirps[bands.noise_of[k - kx] as usize];
+                let [a0, a1] = alpha[p];
+                let (c0, c1) = ([bw * a0[0], bw * a0[1]], [bw * bw * a1[0], bw * bw * a1[1]]);
+                let (lr, li) = (&ch.low[0], &ch.low[1]);
+                for i in first..end {
+                    let (r0, i0) = (lr[i][p], li[i][p]);
+                    let (r1, i1) = (lr[i - 1][p], li[i - 1][p]);
+                    let (r2, i2) = (lr[i - 2][p], li[i - 2][p]);
+                    xh[0][k][i] = r0 + c0[0] * r1 - c0[1] * i1 + c1[0] * r2 - c1[1] * i2;
+                    xh[1][k][i] = i0 + c0[0] * i1 + c0[1] * r1 + c1[0] * i2 + c1[1] * r2;
+                }
+                k += 1;
+            }
+        }
+        // Sinusoid placement: the middle subband of each high-resolution
+        // band, from the transient envelope on (or at once when the last
+        // frame already had it).
+        let mut sine_at = [false; 64];
+        for i in 0..bands.high.len() - 1 {
+            if f.sines[i] {
+                sine_at[(bands.high[i] + bands.high[i + 1]) / 2 - kx] = true;
+            }
+        }
+        let transient_prev = ch.transient_at_end;
+        let smoothing = !h.smoothing_mode;
+        let limiter_gain = LIMITER_GAIN[h.limiter_gains];
+        let mut noise_index = ch.noise_index;
+        let mut sine_index = ch.sine_index;
+        let mut sines_now = [false; 64];
+        for l in 0..g.envelopes {
+            let table = if g.high[l] { &bands.high } else { &bands.low };
+            let (s0, s1) = (2 * g.borders[l] + ADJ, 2 * g.borders[l + 1] + ADJ);
+            let slots = (s1 - s0) as f32;
+            let q_env = g.noise_of(l);
+            let transient = l as i32 == g.transient || (l == 0 && transient_prev);
+            // Per subband: original energy, noise ratio, sinusoid flags,
+            // current energy.
+            let mut e_orig = [0f32; 64];
+            let mut q_orig = [0f32; 64];
+            let mut sine = [false; 64];
+            let mut sine_band = [false; 64];
+            let mut e_curr = [0f32; 64];
+            for (b, w) in table.windows(2).enumerate() {
+                let mut any = false;
+                for k in w[0]..w[1] {
+                    let j = k - kx;
+                    sine[j] = sine_at[j] && (l as i32 >= g.transient || ch.sines_prev[j]);
+                    any |= sine[j];
+                }
+                let mut band_energy = 0f32;
+                for k in w[0]..w[1] {
+                    let j = k - kx;
+                    e_orig[j] = levels.envelope[l][b];
+                    q_orig[j] = levels.noise[q_env][bands.noise_of[j] as usize];
+                    sine_band[j] = any;
+                    let mut e = 0f32;
+                    for i in s0..s1 {
+                        e += xh[0][k][i] * xh[0][k][i] + xh[1][k][i] * xh[1][k][i];
+                    }
+                    e_curr[j] = e / slots;
+                    band_energy += e;
+                }
+                if !h.interpol_freq {
+                    let mean = band_energy / (slots * (w[1] - w[0]) as f32);
+                    e_curr[w[0] - kx..w[1] - kx].fill(mean);
+                }
+            }
+            if l == g.envelopes - 1 {
+                sines_now = sine;
+            }
+            // Gains (energies), then limited and boosted per limiter band.
+            let mut gain = [0f32; 64];
+            let mut noise = [0f32; 64];
+            let mut sinus = [0f32; 64];
+            for j in 0..m {
+                let (e, q) = (e_orig[j], q_orig[j]);
+                noise[j] = e * q / (1.0 + q);
+                sinus[j] = if sine[j] { e / (1.0 + q) } else { 0.0 };
+                gain[j] = if !sine_band[j] {
+                    let added = if transient { 0.0 } else { q };
+                    e / ((1.0 + e_curr[j]) * (1.0 + added))
                 } else {
-                    1.0
-                }
-        };
-        if cpe && self.coupling {
-            let n = self.n;
-            let n_q = self.n_q;
-            let [c0, c1] = &mut self.ch;
-            let pan = if c0.amp_res != 0 { 12 } else { 24 };
-            for e in 1..=c0.num_env {
-                for k in 0..n[usize::from(c0.freq_res[e])] {
-                    let (mut t1, t2) = if c0.amp_res != 0 {
-                        (
-                            exp2(c0.env_facs_q[e][k] + 7),
-                            exp2(pan - c1.env_facs_q[e][k]),
-                        )
-                    } else {
-                        (
-                            half(c0.env_facs_q[e][k] + 14),
-                            half(pan - c1.env_facs_q[e][k]),
-                        )
-                    };
-                    if t1 > 1e20 {
-                        t1 = 1.0;
+                    e * q / ((1.0 + e_curr[j]) * (1.0 + q))
+                };
+            }
+            const EPS: f32 = 1e-12;
+            for w in bands.limiter.windows(2) {
+                let (a, b) = (w[0] - kx, w[1] - kx);
+                let orig: f32 = e_orig[a..b].iter().sum();
+                let curr: f32 = e_curr[a..b].iter().sum();
+                let max = (limiter_gain * limiter_gain * (EPS + orig) / (EPS + curr)).min(1e10);
+                let mut total = 0f32;
+                for j in a..b {
+                    if gain[j] > max {
+                        noise[j] *= max / gain[j];
+                        gain[j] = max;
                     }
-                    let fac = t1 / (1.0 + t2);
-                    c0.env_facs[e][k] = fac;
-                    c1.env_facs[e][k] = fac * t2;
+                    total += e_curr[j] * gain[j] + sinus[j];
+                    if sinus[j] == 0.0 && !transient {
+                        total += noise[j];
+                    }
+                }
+                // At most +4 dB (1.584893192 in amplitude).
+                let boost = ((EPS + orig) / (EPS + total)).min(1.584_893_2 * 1.584_893_2);
+                for j in a..b {
+                    gain[j] = (gain[j] * boost).sqrt();
+                    noise[j] = (noise[j] * boost).sqrt();
+                    sinus[j] = (sinus[j] * boost).sqrt();
                 }
             }
-            for e in 1..=c0.num_noise {
-                for k in 0..n_q {
-                    let t1 = exp2(NOISE_FLOOR_OFFSET - c0.noise_facs_q[e][k] + 1);
-                    let t2 = exp2(12 - c1.noise_facs_q[e][k]);
-                    let fac = t1 / (1.0 + t2);
-                    c0.noise_facs[e][k] = fac;
-                    c1.noise_facs[e][k] = fac * t2;
+            if ch.hist_fresh {
+                for s in 0..5 {
+                    ch.gains[s][..m].copy_from_slice(&gain[..m]);
+                    ch.noises[s][..m].copy_from_slice(&noise[..m]);
                 }
+                ch.hist_fresh = false;
             }
-        } else {
-            for c in 0..if cpe { 2 } else { 1 } {
-                let n = self.n;
-                let n_q = self.n_q;
-                let ch = &mut self.ch[c];
-                for e in 1..=ch.num_env {
-                    for k in 0..n[usize::from(ch.freq_res[e])] {
-                        let q = ch.env_facs_q[e][k];
-                        let mut v = if ch.amp_res != 0 {
-                            exp2(q + 6)
-                        } else {
-                            half(q + 12)
-                        };
-                        if v > 1e20 {
-                            v = 1.0;
+            for i in s0..s1 {
+                ch.hist = (ch.hist + 1) % 5;
+                ch.gains[ch.hist][..m].copy_from_slice(&gain[..m]);
+                ch.noises[ch.hist][..m].copy_from_slice(&noise[..m]);
+                let smooth = smoothing && !transient;
+                let (yr, yi) = {
+                    let [hr, hi] = &mut ch.high;
+                    (&mut hr[i], &mut hi[i])
+                };
+                for j in 0..m {
+                    let k = kx + j;
+                    let (gf, qf) = if smooth {
+                        let mut gs = 0f32;
+                        let mut qs = 0f32;
+                        for (t, c) in SMOOTH.iter().enumerate() {
+                            let s = (ch.hist + 5 - t) % 5;
+                            gs += c * ch.gains[s][j];
+                            qs += c * ch.noises[s][j];
                         }
-                        ch.env_facs[e][k] = v;
+                        (gs, qs)
+                    } else {
+                        (gain[j], noise[j])
+                    };
+                    let mut re = xh[0][k][i] * gf;
+                    let mut im = xh[1][k][i] * gf;
+                    let index = (noise_index + j + 1) & 511;
+                    if sinus[j] != 0.0 {
+                        let sign = if k % 2 == 1 { -1.0 } else { 1.0 };
+                        match sine_index {
+                            0 => re += sinus[j],
+                            1 => im += sign * sinus[j],
+                            2 => re -= sinus[j],
+                            _ => im -= sign * sinus[j],
+                        }
+                    } else if !transient {
+                        re += qf * tab::NOISE[index][0];
+                        im += qf * tab::NOISE[index][1];
                     }
+                    yr[k] = re;
+                    yi[k] = im;
                 }
-                for e in 1..=ch.num_noise {
-                    for k in 0..n_q {
-                        ch.noise_facs[e][k] = exp2(NOISE_FLOOR_OFFSET - ch.noise_facs_q[e][k]);
-                    }
-                }
+                noise_index = (noise_index + m) & 511;
+                sine_index = (sine_index + 1) & 3;
             }
         }
+        ch.noise_index = noise_index;
+        ch.sine_index = sine_index;
+        ch.sines_prev = sines_now;
+        ch.transient_at_end = g.transient == g.envelopes as i32;
     }
+}
 
-    /// 32 slots of QMF analysis of 1024 core samples into `w[ypos]`.
+impl Sbr {
+    /// 32 slots of QMF analysis of 1024 core samples into the analysis
+    /// buffer after the kept slots.
     fn analysis(ch: &mut Channel, input: &[f32], sc: &mut Lanes) {
         const L: usize = 32;
         let st = statics();
@@ -1130,15 +1427,19 @@ impl Sbr {
         }
         st.dct64
             .run_lanes(a, d, &mut sc.re[..32 * L], &mut sc.im[..32 * L], L);
-        for (slot, ws) in ch.w[ch.ypos].iter_mut().enumerate() {
-            for (k, wk) in ws.iter_mut().enumerate() {
-                *wk = [2.0 * d[k * L + slot], -2.0 * d[(63 - k) * L + slot]];
+        for part in &mut ch.low {
+            part.copy_within(SLOTS..SPAN, 0);
+        }
+        for slot in 0..SLOTS {
+            for k in 0..32 {
+                ch.low[0][KEPT + slot][k] = 2.0 * d[k * L + slot];
+                ch.low[1][KEPT + slot][k] = -2.0 * d[(63 - k) * L + slot];
             }
         }
     }
 
     /// 32 slots of 64-band QMF synthesis of `x` into 2048 samples.
-    fn synthesis(ch: &mut Channel, x: &[[[f32; 64]; 38]; 2], out: &mut [f32], sc: &mut Lanes) {
+    fn synthesis(ch: &mut Channel, x: &Qmf, out: &mut [f32], sc: &mut Lanes) {
         const L: usize = 64;
         let c = &tab::QMF_WINDOW;
         let (xin, y) = (&mut sc.x[..], &mut sc.y[..]);
@@ -1175,7 +1476,7 @@ impl Sbr {
 
     /// Downsampled synthesis (4.6.18.4.3): the lower 32 bands into 1024
     /// samples at the core rate, for SBR signalled at the core's rate.
-    fn synthesis_ds(ch: &mut Channel, x: &[[[f32; 64]; 38]; 2], out: &mut [f32], _: &mut Lanes) {
+    fn synthesis_ds(ch: &mut Channel, x: &Qmf, out: &mut [f32], _: &mut Lanes) {
         let st = statics();
         let c = &tab::QMF_WINDOW;
         let (mut re, mut im) = ([0f32; 64], [0f32; 64]);
@@ -1204,445 +1505,36 @@ impl Sbr {
             }
         }
     }
+}
 
-    /// Low band of the current and the previous frame (`X_low`).
-    fn lf_gen(&mut self, c: usize) {
-        let ch = &self.ch[c];
-        let cur = &ch.w[ch.ypos];
-        let prev = &ch.w[1 - ch.ypos];
-        for row in self.x_low.iter_mut() {
-            *row = [[0.0; 2]; 40];
+impl Sbr {
+    /// One channel's frame for this call: its data, or the last frame's
+    /// repeated over one envelope when none arrived (concealment).
+    fn frame_for(ch: &Channel) -> Option<Frame> {
+        if let Some(f) = ch.frame {
+            return Some(f);
         }
-        for k in 0..self.kx[1] {
-            for i in 8..40 {
-                self.x_low[k][i] = cur[i - 8][k];
-            }
-        }
-        for k in 0..self.kx[0] {
-            for i in 0..8 {
-                self.x_low[k][i] = prev[i + 24][k];
-            }
-        }
-    }
-
-    /// Inverse filtering coefficients (4.6.18.6.2).
-    fn inverse_filter(&mut self) {
-        for k in 0..self.k[0] {
-            let x = &self.x_low[k];
-            let mut r2 = x[0][0] * x[2][0] + x[0][1] * x[2][1];
-            let mut i2 = x[0][0] * x[2][1] - x[0][1] * x[2][0];
-            let (mut r1, mut i1, mut r0) = (0f32, 0f32, 0f32);
-            for i in 1..38 {
-                r0 += x[i][0] * x[i][0] + x[i][1] * x[i][1];
-                r1 += x[i][0] * x[i + 1][0] + x[i][1] * x[i + 1][1];
-                i1 += x[i][0] * x[i + 1][1] - x[i][1] * x[i + 1][0];
-                r2 += x[i][0] * x[i + 2][0] + x[i][1] * x[i + 2][1];
-                i2 += x[i][0] * x[i + 2][1] - x[i][1] * x[i + 2][0];
-            }
-            // phi[lag][...] as FFmpeg names them.
-            let p0_1 = [r2, i2];
-            let p2_1_0 = r0 + x[0][0] * x[0][0] + x[0][1] * x[0][1];
-            let p1_0_0 = r0 + x[38][0] * x[38][0] + x[38][1] * x[38][1];
-            let p1_1 = [
-                r1 + x[0][0] * x[1][0] + x[0][1] * x[1][1],
-                i1 + x[0][0] * x[1][1] - x[0][1] * x[1][0],
-            ];
-            let p0_0 = [
-                r1 + x[38][0] * x[39][0] + x[38][1] * x[39][1],
-                i1 + x[38][0] * x[39][1] - x[38][1] * x[39][0],
-            ];
-            let dk = p2_1_0 * p1_0_0 - (p1_1[0] * p1_1[0] + p1_1[1] * p1_1[1]) / 1.000001;
-            let mut a1 = if dk == 0.0 {
-                [0.0, 0.0]
-            } else {
-                [
-                    (p0_0[0] * p1_1[0] - p0_0[1] * p1_1[1] - p0_1[0] * p1_0_0) / dk,
-                    (p0_0[0] * p1_1[1] + p0_0[1] * p1_1[0] - p0_1[1] * p1_0_0) / dk,
-                ]
-            };
-            let mut a0 = if p1_0_0 == 0.0 {
-                [0.0, 0.0]
-            } else {
-                [
-                    -(p0_0[0] + a1[0] * p1_1[0] + a1[1] * p1_1[1]) / p1_0_0,
-                    -(p0_0[1] + a1[1] * p1_1[0] - a1[0] * p1_1[1]) / p1_0_0,
-                ]
-            };
-            if a1[0] * a1[0] + a1[1] * a1[1] >= 16.0 || a0[0] * a0[0] + a0[1] * a0[1] >= 16.0 {
-                a1 = [0.0, 0.0];
-                a0 = [0.0, 0.0];
-            }
-            self.alpha0[k] = a0;
-            self.alpha1[k] = a1;
-        }
-    }
-
-    /// Chirp factors (4.6.18.6.2).
-    fn chirp(&mut self, c: usize) {
-        const BW: [f32; 4] = [0.0, 0.75, 0.9, 0.98];
-        let ch = &mut self.ch[c];
-        for i in 0..self.n_q {
-            let mut bw = if ch.invf_mode[0][i] + ch.invf_mode[1][i] == 1 {
-                0.6
-            } else {
-                BW[usize::from(ch.invf_mode[0][i])]
-            };
-            bw = if bw < ch.bw[i] {
-                0.75 * bw + 0.25 * ch.bw[i]
-            } else {
-                0.90625 * bw + 0.09375 * ch.bw[i]
-            };
-            ch.bw[i] = if bw < 0.015625 { 0.0 } else { bw };
-        }
-    }
-
-    /// High-band generation by patching (4.6.18.6.3).
-    fn hf_gen(&mut self, c: usize) -> bool {
-        let ch = &self.ch[c];
-        let (start, end) = (2 * ch.t_env[0], 2 * ch.t_env[ch.num_env]);
-        let mut g: i32 = 0;
-        let mut k = self.kx[1];
-        for j in 0..self.num_patches {
-            for x in 0..self.patch_num_subbands[j] {
-                let p = self.patch_start_subband[j] + x;
-                while g <= self.n_q as i32 && k >= self.f_tablenoise[g as usize] {
-                    g += 1;
-                }
-                g -= 1;
-                if g < 0 || k >= 64 || p >= 32 {
-                    return false;
-                }
-                let bw = ch.bw[g as usize];
-                let a1 = self.alpha1[p];
-                let a0 = self.alpha0[p];
-                let a = [a1[0] * bw * bw, a1[1] * bw * bw, a0[0] * bw, a0[1] * bw];
-                let lo = &self.x_low[p];
-                let hi = &mut self.x_high[k];
-                for i in start..end.min(38) {
-                    let (i0, i1, i2) = (lo[i + ENV_OFF], lo[i + ENV_OFF - 1], lo[i + ENV_OFF - 2]);
-                    hi[i + ENV_OFF] = [
-                        i2[0] * a[0] - i2[1] * a[1] + i1[0] * a[2] - i1[1] * a[3] + i0[0],
-                        i2[1] * a[0] + i2[0] * a[1] + i1[1] * a[2] + i1[0] * a[3] + i0[1],
-                    ];
-                }
-                k += 1;
-            }
-        }
-        for row in self.x_high.iter_mut().take(self.m[1] + self.kx[1]).skip(k) {
-            *row = [[0.0; 2]; 40];
-        }
-        true
-    }
-
-    /// Envelope, noise and sinusoid parameters mapped to QMF bands
-    /// (4.6.18.7.2).
-    fn mapping(&mut self, c: usize) -> bool {
-        let kx = self.kx[1];
-        let ch = &mut self.ch[c];
-        let e_a1 = ch.e_a[1];
-        ch.s_indexmapped[1..8].fill([0; 48]);
-        for e in 0..ch.num_env {
-            let res = usize::from(ch.freq_res[e + 1]);
-            let ilim = self.n[res];
-            let table: &[usize] = if res == 1 {
-                &self.f_tablehigh
-            } else {
-                &self.f_tablelow
-            };
-            if kx != table[0] {
-                return false;
-            }
-            for i in 0..ilim {
-                for m in table[i]..table[i + 1] {
-                    self.e_origmapped[e][m - kx] = ch.env_facs[e + 1][i];
-                }
-            }
-            let k = usize::from(ch.num_noise > 1 && ch.t_env[e] >= ch.t_q[1]);
-            for i in 0..self.n_q {
-                for m in self.f_tablenoise[i]..self.f_tablenoise[i + 1] {
-                    self.q_mapped[e][m - kx] = ch.noise_facs[k + 1][i];
-                }
-            }
-            for i in 0..self.n[1] {
-                if ch.add_harmonic_flag {
-                    let mid = (self.f_tablehigh[i] + self.f_tablehigh[i + 1]) >> 1;
-                    ch.s_indexmapped[e + 1][mid - kx] = ch.add_harmonic[i]
-                        * u8::from(e as i32 >= e_a1 || ch.s_indexmapped[0][mid - kx] == 1);
-                }
-            }
-            for i in 0..ilim {
-                let present =
-                    (table[i]..table[i + 1]).any(|m| ch.s_indexmapped[e + 1][m - kx] != 0);
-                for m in table[i]..table[i + 1] {
-                    self.s_mapped[e][m - kx] = u8::from(present);
-                }
-            }
-        }
-        ch.s_indexmapped[0] = ch.s_indexmapped[ch.num_env];
-        true
-    }
-
-    /// Energies of the generated high band per envelope (4.6.18.7.3).
-    fn env_estimate(&mut self, c: usize) {
-        let ch = &self.ch[c];
-        let kx = self.kx[1];
-        let sum_sq = |x: &[[f32; 2]]| -> f32 {
-            let (mut s0, mut s1) = (0f32, 0f32);
-            for p in x.chunks(2) {
-                s0 += p[0][0] * p[0][0];
-                s1 += p[0][1] * p[0][1];
-                if let Some(q) = p.get(1) {
-                    s0 += q[0] * q[0];
-                    s1 += q[1] * q[1];
-                }
-            }
-            s0 + s1
+        let mut f = ch.previous?;
+        let mut g = Grid {
+            class: FIXFIX,
+            envelopes: 1,
+            transient: -1,
+            ..Grid::default()
         };
-        for e in 0..ch.num_env {
-            let ilb = ch.t_env[e] * 2 + ENV_OFF;
-            let iub = (ch.t_env[e + 1] * 2 + ENV_OFF).min(40);
-            if self.interpol_freq {
-                let recip = 0.5 / (ch.t_env[e + 1] - ch.t_env[e]) as f32;
-                for m in 0..self.m[1] {
-                    self.e_curr[e][m] = sum_sq(&self.x_high[m + kx][ilb..iub]) * recip;
-                }
-            } else {
-                let env_size = 2 * (ch.t_env[e + 1] - ch.t_env[e]);
-                let res = usize::from(ch.freq_res[e + 1]);
-                let table: &[usize] = if res == 1 {
-                    &self.f_tablehigh
-                } else {
-                    &self.f_tablelow
-                };
-                for p in 0..self.n[res] {
-                    let den = (env_size * (table[p + 1] - table[p])) as f32;
-                    let mut sum = 0f32;
-                    for k in table[p]..table[p + 1] {
-                        sum += sum_sq(&self.x_high[k][ilb..iub]);
-                    }
-                    sum /= den;
-                    for k in table[p]..table[p + 1] {
-                        self.e_curr[e][k - kx] = sum;
-                    }
-                }
-            }
-        }
+        g.borders[0] = ch.end_prev.saturating_sub(16);
+        g.borders[1] = 16;
+        g.high[0] = ch.last.high;
+        g.set_noise(0);
+        f.grid = g;
+        f.envelope[0] = ch.last.envelope;
+        f.noise[0] = ch.last.noise;
+        f.sines = [false; 64];
+        Some(f)
     }
 
-    /// Gains of the high band, noise and sinusoids with the limiter
-    /// (4.6.18.7.4–5).
-    fn gain_calc(&mut self, c: usize) {
-        const LIMGAIN: [f32; 4] = [0.70795, 1.0, 1.41254, 10_000_000_000.0];
-        let ch = &self.ch[c];
-        let kx = self.kx[1];
-        for e in 0..ch.num_env {
-            let delta = f32::from(u8::from(!(e as i32 == ch.e_a[1] || e as i32 == ch.e_a[0])));
-            for k in 0..self.n_lim {
-                let (lo, hi) = (self.f_tablelim[k] - kx, self.f_tablelim[k + 1] - kx);
-                for m in lo..hi {
-                    let temp = self.e_origmapped[e][m] / (1.0 + self.q_mapped[e][m]);
-                    self.q_m[e][m] = (temp * self.q_mapped[e][m]).sqrt();
-                    self.s_m[e][m] = (temp * f32::from(ch.s_indexmapped[e + 1][m])).sqrt();
-                    self.gain[e][m] = if self.s_mapped[e][m] == 0 {
-                        (self.e_origmapped[e][m]
-                            / ((1.0 + self.e_curr[e][m]) * (1.0 + self.q_mapped[e][m] * delta)))
-                            .sqrt()
-                    } else {
-                        (self.e_origmapped[e][m] * self.q_mapped[e][m]
-                            / ((1.0 + self.e_curr[e][m]) * (1.0 + self.q_mapped[e][m])))
-                            .sqrt()
-                    };
-                    self.gain[e][m] += f32::MIN_POSITIVE;
-                }
-                let (mut s0, mut s1) = (0f32, 0f32);
-                for m in lo..hi {
-                    s0 += self.e_origmapped[e][m];
-                    s1 += self.e_curr[e][m];
-                }
-                let gain_max = (LIMGAIN[self.limiter_gains]
-                    * ((f32::EPSILON + s0) / (f32::EPSILON + s1)).sqrt())
-                .min(100_000.0);
-                for m in lo..hi {
-                    let q_m_max = self.q_m[e][m] * gain_max / self.gain[e][m];
-                    self.q_m[e][m] = self.q_m[e][m].min(q_m_max);
-                    self.gain[e][m] = self.gain[e][m].min(gain_max);
-                }
-                let (mut s0, mut s1) = (0f32, 0f32);
-                for m in lo..hi {
-                    s0 += self.e_origmapped[e][m];
-                    s1 += self.e_curr[e][m] * self.gain[e][m] * self.gain[e][m]
-                        + self.s_m[e][m] * self.s_m[e][m]
-                        + if delta != 0.0 && self.s_m[e][m] == 0.0 {
-                            self.q_m[e][m] * self.q_m[e][m]
-                        } else {
-                            0.0
-                        };
-                }
-                let boost = ((f32::EPSILON + s0) / (f32::EPSILON + s1))
-                    .sqrt()
-                    .min(1.584_893_2);
-                for m in lo..hi {
-                    self.gain[e][m] *= boost;
-                    self.q_m[e][m] *= boost;
-                    self.s_m[e][m] *= boost;
-                }
-            }
-        }
-    }
-
-    /// The adjusted high band with noise and sinusoids into `y[ypos]`
-    /// (4.6.18.7.5).
-    fn hf_assemble(&mut self, c: usize) {
-        const H_SMOOTH: [f32; 5] = [
-            0.333_333_33,
-            0.301_502_83,
-            0.218_169_5,
-            0.115_163_83,
-            0.031_830_5,
-        ];
-        let h_sl = if self.smoothing_mode { 0 } else { 4 };
-        let kx = self.kx[1];
-        let m_max = self.m[1];
-        let reset = self.reset;
-        let ch = &mut self.ch[c];
-        let mut indexnoise = ch.f_indexnoise;
-        let mut indexsine = ch.f_indexsine;
-        let t0 = 2 * ch.t_env[0];
-        if reset {
-            for i in 0..h_sl {
-                ch.g_temp[i + t0][..m_max].copy_from_slice(&self.gain[0][..m_max]);
-                ch.q_temp[i + t0][..m_max].copy_from_slice(&self.q_m[0][..m_max]);
-            }
-        } else if h_sl != 0 {
-            let old = 2 * ch.t_env_num_env_old;
-            for i in 0..4 {
-                ch.g_temp[i + t0] = ch.g_temp[i + old];
-                ch.q_temp[i + t0] = ch.q_temp[i + old];
-            }
-        }
-        for e in 0..ch.num_env {
-            for i in 2 * ch.t_env[e]..2 * ch.t_env[e + 1] {
-                ch.g_temp[h_sl + i][..m_max].copy_from_slice(&self.gain[e][..m_max]);
-                ch.q_temp[h_sl + i][..m_max].copy_from_slice(&self.q_m[e][..m_max]);
-            }
-        }
-        let y1 = &mut ch.y[ch.ypos];
-        for e in 0..ch.num_env {
-            let edge = e as i32 == ch.e_a[0] || e as i32 == ch.e_a[1];
-            for i in 2 * ch.t_env[e]..2 * ch.t_env[e + 1] {
-                let mut g_filt = [0f32; 48];
-                let mut q_filt = [0f32; 48];
-                if h_sl != 0 && !edge {
-                    let idx = i + h_sl;
-                    for m in 0..m_max {
-                        for (j, &h) in H_SMOOTH.iter().enumerate() {
-                            g_filt[m] += ch.g_temp[idx - j][m] * h;
-                            q_filt[m] += ch.q_temp[idx - j][m] * h;
-                        }
-                    }
-                } else {
-                    g_filt[..m_max].copy_from_slice(&ch.g_temp[i + h_sl][..m_max]);
-                    // FFmpeg takes the unshifted row here.
-                    q_filt[..m_max].copy_from_slice(&ch.q_temp[i][..m_max]);
-                }
-                let row = &mut y1[i];
-                for m in 0..m_max {
-                    let xh = self.x_high[kx + m][i + ENV_OFF];
-                    row[kx + m] = [xh[0] * g_filt[m], xh[1] * g_filt[m]];
-                }
-                if !edge {
-                    let (p0, p1) = match indexsine {
-                        0 => (1.0, 0.0),
-                        1 => (0.0, 1.0 - 2.0 * (kx & 1) as f32),
-                        2 => (-1.0, 0.0),
-                        _ => (0.0, -(1.0 - 2.0 * (kx & 1) as f32)),
-                    };
-                    let mut p1 = p1;
-                    let mut noise = indexnoise;
-                    for m in 0..m_max {
-                        noise = (noise + 1) & 0x1ff;
-                        let s = self.s_m[e][m];
-                        let y = &mut row[kx + m];
-                        if s != 0.0 {
-                            y[0] += s * p0;
-                            y[1] += s * p1;
-                        } else {
-                            y[0] += q_filt[m] * tab::NOISE[noise][0];
-                            y[1] += q_filt[m] * tab::NOISE[noise][1];
-                        }
-                        p1 = -p1;
-                    }
-                } else {
-                    let idx = indexsine & 1;
-                    let a = 1.0 - (((indexsine + (kx & 1)) & 2) as f32);
-                    let bsign = if idx == 1 { -a } else { a };
-                    let mut m = 0;
-                    while m + 1 < m_max {
-                        row[kx + m][idx] += self.s_m[e][m] * a;
-                        row[kx + m + 1][idx] += self.s_m[e][m + 1] * bsign;
-                        m += 2;
-                    }
-                    if m_max & 1 == 1 {
-                        row[kx + m][idx] += self.s_m[e][m] * a;
-                    }
-                }
-                indexnoise = (indexnoise + m_max) & 0x1ff;
-                indexsine = (indexsine + 1) & 3;
-            }
-        }
-        ch.f_indexnoise = indexnoise;
-        ch.f_indexsine = indexsine;
-    }
-
-    /// The QMF signal to synthesize: low band and the high band of the
-    /// previous and current frame (4.6.18.8).
-    fn x_gen(&mut self, c: usize) {
-        let ch = &self.ch[c];
-        let y0 = &ch.y[1 - ch.ypos];
-        let y1 = &ch.y[ch.ypos];
-        let i_temp = (2 * ch.t_env_num_env_old).saturating_sub(32).min(38);
-        let x = &mut self.x[c];
-        *x = [[[0.0; 64]; 38]; 2];
-        let mut k = 0;
-        while k < self.kx[0] {
-            for i in 0..i_temp {
-                let v = self.x_low[k][i + ENV_OFF];
-                x[0][i][k] = v[0];
-                x[1][i][k] = v[1];
-            }
-            k += 1;
-        }
-        while k < (self.kx[0] + self.m[0]).min(64) {
-            for i in 0..i_temp {
-                let v = y0[(i + 32).min(37)][k];
-                x[0][i][k] = v[0];
-                x[1][i][k] = v[1];
-            }
-            k += 1;
-        }
-        let mut k = 0;
-        while k < self.kx[1] {
-            for i in i_temp..38 {
-                let v = self.x_low[k][i + ENV_OFF];
-                x[0][i][k] = v[0];
-                x[1][i][k] = v[1];
-            }
-            k += 1;
-        }
-        while k < (self.kx[1] + self.m[1]).min(64) {
-            for i in i_temp..32 {
-                let v = y1[i][k];
-                x[0][i][k] = v[0];
-                x[1][i][k] = v[1];
-            }
-            k += 1;
-        }
-    }
-
-    /// Apply SBR to one element's 1024 core samples per channel (`left`,
-    /// and `right` for a pair or with PS), giving 2048 per channel (1024
-    /// with `down`: downsampled synthesis). `id`: 0 SCE, 1 CPE, 3 LFE.
-    /// With `ps`, a mono element comes out as stereo in `out_r`.
+    /// Decode one frame of element `id` from its core output: SBR on each
+    /// channel, then QMF synthesis into `out_l` (and `out_r` for a pair, or
+    /// for parametric stereo when `ps`). `down`: synthesis at the core rate.
     pub(crate) fn apply(
         &mut self,
         id: u32,
@@ -1652,57 +1544,71 @@ impl Sbr {
         out_l: &mut [f32],
         out_r: &mut [f32],
     ) {
-        let nch = if id == 1 { 2 } else { 1 };
-        if id != self.id {
-            self.turn_off();
-        }
-        if self.start && !self.ready {
-            self.turn_off();
-        }
-        if !self.kx_and_m_pushed {
-            self.kx[0] = self.kx[1];
-            self.m[0] = self.m[1];
-        } else {
-            self.kx_and_m_pushed = false;
-        }
-        if self.start {
-            self.dequant(id == 1);
-            self.ready = false;
-        }
-        for c in 0..nch {
-            Self::analysis(&mut self.ch[c], core[c], &mut self.lanes);
-            self.lf_gen(c);
-            self.ch[c].ypos ^= 1;
-            if self.start {
-                self.inverse_filter();
-                self.chirp(c);
-                if self.hf_gen(c) && self.mapping(c) {
-                    self.env_estimate(c);
-                    self.gain_calc(c);
-                    self.hf_assemble(c);
+        let channels = if id == 1 { 2 } else { 1 };
+        let frames: [Option<Frame>; 2] = [
+            Self::frame_for(&self.ch[0]).filter(|_| self.started()),
+            Self::frame_for(&self.ch[1]).filter(|_| self.started() && channels == 2),
+        ];
+        let levels: [Option<Levels>; 2] = match (&self.bands, frames) {
+            (Some(bands), [Some(f0), Some(f1)])
+                if channels == 2 && self.coupling && self.ch[0].frame.is_some() =>
+            {
+                let [a, b] = dequantize_coupled(&f0, &f1, bands);
+                [Some(a), Some(b)]
+            }
+            (Some(bands), _) => frames.map(|f| f.map(|f| dequantize(&f, bands))),
+            _ => [None, None],
+        };
+        for c in 0..channels {
+            let ch = &mut self.ch[c];
+            Self::analysis(ch, core[c], &mut self.lanes);
+            // The high band past the last frame carries into this one.
+            let [hr, hi] = &mut ch.high;
+            for part in [hr, hi] {
+                part.copy_within(SLOTS..SPAN, 0);
+                for s in &mut part[KEPT..] {
+                    s.fill(0.0);
                 }
             }
-            self.x_gen(c);
-        }
-        let mut stereo = nch == 2;
-        if ps {
-            let top = self.kx[1] + self.m[1];
-            let [l, r] = &mut *self.x;
-            if self.ps.started() {
-                self.ps.apply(l, r, top);
-            } else {
-                *r = *l;
+            let carried = (2 * ch.end_prev).saturating_sub(SLOTS);
+            let (kx, m) = match (&self.bands, &self.header, frames[c], &levels[c]) {
+                (Some(bands), Some(h), Some(f), Some(lv)) => {
+                    Self::generate(ch, &f, lv, bands, h);
+                    ch.previous = Some(f);
+                    ch.end_prev = f.grid.borders[f.grid.envelopes];
+                    (bands.kx, bands.m)
+                }
+                _ => {
+                    ch.end_prev = 16;
+                    (32, 0)
+                }
+            };
+            let mut x: Box<Qmf> = Box::new([[[0.0; 64]; SLOTS]; 2]);
+            for j in 0..SLOTS {
+                let (kx, m) = if j < carried {
+                    (ch.kx_prev, ch.m_prev)
+                } else {
+                    (kx, m)
+                };
+                let s = j + ADJ;
+                for part in 0..2 {
+                    x[part][j][..kx].copy_from_slice(&ch.low[part][s][..kx]);
+                    x[part][j][kx..kx + m].copy_from_slice(&ch.high[part][s][kx..kx + m]);
+                }
             }
-            stereo = true;
+            ch.kx_prev = kx;
+            ch.m_prev = m;
+            ch.frame = None;
+            let out = if c == 0 { &mut *out_l } else { &mut *out_r };
+            if down {
+                Self::synthesis_ds(ch, &x, out, &mut self.lanes);
+            } else {
+                Self::synthesis(ch, &x, out, &mut self.lanes);
+            }
         }
-        let synth = if down {
-            Self::synthesis_ds
-        } else {
-            Self::synthesis
-        };
-        synth(&mut self.ch[0], &self.x[0], out_l, &mut self.lanes);
-        if stereo {
-            synth(&mut self.ch[1], &self.x[1], out_r, &mut self.lanes);
+        if ps && channels == 1 {
+            let n = if down { 1024 } else { 2048 };
+            out_r[..n].copy_from_slice(&out_l[..n]);
         }
     }
 }

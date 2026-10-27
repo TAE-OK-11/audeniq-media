@@ -12,7 +12,6 @@ Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
 
 * `crates/audeniq-qc/src/wavpack.rs`, `crates/audeniq-qc/src/wavpack_table.rs`: `libavcodec/wavpack.c`, `wavpack.h`, `wavpackdata.c`; Konstantin Shishkov (2006, 2011), David Bryant (2020). Only integer lossless paths. Restructured in round 11 (register-resident entropy state, pass structure, branch-free weight steps, own bit reader); the format arithmetic and the attribution remain.
 * `crates/audeniq-qc/src/flac.rs`: FLAC fixed/LPC residual prediction, Rice mapping, frame/subframe structure from `libavcodec/flacenc.c` and Welch/Levinson approach from `lpc.c`; Justin Ruggles (2006). Reworked selection, buffers, verification and commit logic; round 12 replaced the Rice estimate with an own cost model and added exact stereo-assignment trials (levels 7-8).
-* `crates/audeniq-qc/src/alac.rs`: Rice/zero-run, adaptive LPC and stereo reconstruction from `libavcodec/alac.c`, `alacdsp.c`; David Hammerton (2005). Reworked bounded bit access, in-place reusable buffers and specialized predictor orders; round 12 restructured the adaptive Golomb state and coefficient steps as own functions.
 * `crates/audeniq-qc/src/flac_decode.rs`: frame/header, partitioned Rice, fixed/LPC and channel reconstruction from `libavcodec/flac.c`, `flacdec.c`, `flacdsp.c`; Alex Beregszaszi (2003), Mans Rullgard (2012). Reworked streaming input, strict CRC/count/MD5 checks and specialized LPC orders.
 * `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3 data) generated from `libavcodec/aactab.c` (FFmpeg n6.1.1); Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007). The decoder code in `crates/media-aac` is AUDENIQ's; its window overlap, intensity/noise gain and TNS coefficient conventions were checked against `libavcodec/aacdec_template.c` and match FFmpeg's output sample for sample (`crates/media-aac/tests/ffmpeg.rs`).
 * `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window and noise table (ISO/IEC 14496-3 data) generated from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c` and `aacpsdata.c` (FFmpeg n6.1.1); Robert Swain (2008-2009), Alex Converse (2008-2010). The window's c(384) and c(512) carry the standard's signs (FFmpeg negates them for its MDCT-based banks). `crates/media-aac/src/sbr.rs` and `ps.rs` are AUDENIQ's: the QMF banks are the standard's complex matrices computed as DCT-IVs of size 64 (`crates/media-dsp`, derived in `sbr.rs`); buffer timing, envelope adjustment and PS mixing follow `libavcodec/aacsbr*.c`, `sbrdsp*.c`, `aacps*.c` step for step so the output matches FFmpeg's and the MPEG conformance references (`crates/media-video/tests/conformance.rs`).
@@ -48,6 +47,13 @@ oracles: FFmpeg's binaries, conformance references, the previous output):
   inter-channel differences). Decodes FFmpeg-encoded mono/stereo 16/24-bit
   files bit for bit like the previous decoder and to the source PCM
   (`tests/regressions.rs`), at the same speed.
+* `crates/audeniq-qc/src/alac.rs`: the ALAC decoder, written from Apple's
+  published format (magic cookie, SCE/CPE elements with partial-frame,
+  shifted-byte and escape flags, adaptive Golomb residuals with zero runs,
+  sign-adaptive predictor, stereo unmixing). Decodes FFmpeg-encoded
+  mono/stereo 16/24-bit files bit for bit like the previous decoder and to
+  the source PCM, at the same speed. The previous decoder's ALAC Golomb
+  helper in `crates/media-bits` was removed with it.
 
 ## libebur128 MIT notice (historical: no longer used)
 

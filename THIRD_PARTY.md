@@ -10,7 +10,6 @@ photo crates record their sources next to the code: `docs/photo/PORTING.md`,
 
 Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
 
-* `crates/audeniq-qc/src/wavpack.rs`, `crates/audeniq-qc/src/wavpack_table.rs`: `libavcodec/wavpack.c`, `wavpack.h`, `wavpackdata.c`; Konstantin Shishkov (2006, 2011), David Bryant (2020). Only integer lossless paths. Restructured in round 11 (register-resident entropy state, pass structure, branch-free weight steps, own bit reader); the format arithmetic and the attribution remain.
 * `crates/audeniq-qc/src/flac.rs`: FLAC fixed/LPC residual prediction, Rice mapping, frame/subframe structure from `libavcodec/flacenc.c` and Welch/Levinson approach from `lpc.c`; Justin Ruggles (2006). Reworked selection, buffers, verification and commit logic; round 12 replaced the Rice estimate with an own cost model and added exact stereo-assignment trials (levels 7-8).
 * `crates/audeniq-qc/src/flac_decode.rs`: frame/header, partitioned Rice, fixed/LPC and channel reconstruction from `libavcodec/flac.c`, `flacdec.c`, `flacdsp.c`; Alex Beregszaszi (2003), Mans Rullgard (2012). Reworked streaming input, strict CRC/count/MD5 checks and specialized LPC orders.
 * `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3 data) generated from `libavcodec/aactab.c` (FFmpeg n6.1.1); Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007). The decoder code in `crates/media-aac` is AUDENIQ's; its window overlap, intensity/noise gain and TNS coefficient conventions were checked against `libavcodec/aacdec_template.c` and match FFmpeg's output sample for sample (`crates/media-aac/tests/ffmpeg.rs`).
@@ -54,6 +53,50 @@ oracles: FFmpeg's binaries, conformance references, the previous output):
   mono/stereo 16/24-bit files bit for bit like the previous decoder and to
   the source PCM, at the same speed. The previous decoder's ALAC Golomb
   helper in `crates/media-bits` was removed with it.
+* `crates/audeniq-qc/src/wavpack.rs`: the WavPack 4/5 integer lossless
+  decoder. Its format arithmetic (metadata sub-blocks, adaptive median
+  code with zero runs, decorrelation terms, integer shifts) follows the
+  WavPack 5 file format description and the reference library libwavpack
+  (BSD-3-Clause, notice below); its structure is AUDENIQ's (entropy state
+  in registers, separate passes, branch-free weight steps, the computed
+  exp2 table, the staged value decoder). It adds verification of the
+  WavPack 5 block checksum. Decodes the reference encoder's modes
+  (`-f`, `-h`, `-hh`, `-x`), mono/stereo, 16/24-bit, to the source PCM
+  (`tests/regressions.rs`), FFmpeg-encoded files and 800 corruptions like
+  the previous decoder, at the same or better speed.
+
+## libwavpack BSD-3-Clause notice
+
+The WavPack decoder follows the WavPack format as defined by libwavpack
+(https://github.com/dbry/WavPack); no libwavpack source is included.
+
+```
+                  Copyright (c) 1998 - 2025 David Bryant
+                          All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the copyright holder nor the names of its
+      contributors may be used to endorse or promote products derived from
+      this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## libebur128 MIT notice (historical: no longer used)
 

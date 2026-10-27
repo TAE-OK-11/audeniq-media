@@ -143,6 +143,74 @@ fn tta_and_wavpack_modes_decode_to_the_source() {
         }
     }
 }
+/// WavPack's own encoder (the reference implementation) in its modes,
+/// including the WavPack 5 block checksum and integer shifts (24-bit
+/// files with 16-bit content): every decode equals the source PCM, and a
+/// corrupted checksum is rejected. Skipped where `wavpack` is not
+/// installed.
+#[test]
+fn reference_wavpack_modes_decode_to_the_source() {
+    if Command::new("wavpack").arg("--version").output().is_err() {
+        eprintln!("wavpack not installed; skipping");
+        return;
+    }
+    let d = Dir::new();
+    for (name, filter, format) in [
+        (
+            "noise16",
+            "anoisesrc=d=0.7:c=pink:r=44100:a=0.5",
+            "pcm_s16le",
+        ),
+        (
+            "tone24",
+            "aevalsrc=0.6*sin(2*PI*1999*t)|0.6*sin(2*PI*31*t):s=96000:d=0.4",
+            "pcm_s24le",
+        ),
+        (
+            "padded24",
+            "aevalsrc=0.5*sin(2*PI*441*t),aformat=s16:sample_rates=48000",
+            "pcm_s24le",
+        ),
+    ] {
+        for channels in ["1", "2"] {
+            let src = d.0.join(format!("{name}-{channels}.wav"));
+            assert!(Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-f", "lavfi", "-t", "0.6", "-i", filter])
+                .args(["-ac", channels, "-c:a", format])
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success());
+            let (_, expected, frames) =
+                pcm_sha256(&src, Limits::default(), Backend::Scalar).unwrap();
+            for mode in ["-f", "-h", "-hh", "-x3", "-hhx6"] {
+                let p = d.0.join(format!("{name}-{channels}{mode}.wv"));
+                assert!(Command::new("wavpack")
+                    .args(["-q", "-y", mode])
+                    .arg(&src)
+                    .arg("-o")
+                    .arg(&p)
+                    .status()
+                    .unwrap()
+                    .success());
+                let (_, hash, count) = pcm_sha256(&p, Limits::default(), Backend::detect())
+                    .unwrap_or_else(|e| panic!("{name}-{channels}{mode}: {e}"));
+                assert_eq!(hash, expected, "{name}-{channels}{mode}");
+                assert_eq!(count, frames);
+            }
+        }
+    }
+    // The checksum is the block's last sub-block (id 0x2f, 4 bytes): flip
+    // a bit of it.
+    let p = d.0.join("noise16-2-h.wv");
+    let mut bytes = std::fs::read(&p).unwrap();
+    let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8;
+    assert_eq!(bytes[size - 6] & 0x3f, 0x2f);
+    bytes[size - 1] ^= 1;
+    std::fs::write(&p, &bytes).unwrap();
+    let err = pcm_sha256(&p, Limits::default(), Backend::detect()).unwrap_err();
+    assert!(err.to_string().contains("checksum"), "{err}");
+}
 #[test]
 fn truncation_never_publishes_output() {
     let d = Dir::new();

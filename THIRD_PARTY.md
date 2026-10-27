@@ -10,7 +10,6 @@ photo crates record their sources next to the code: `docs/photo/PORTING.md`,
 
 Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
 
-* `crates/audeniq-qc/src/tta.rs`: `libavcodec/tta.c`, `ttadata.c`, `ttadsp.c`; Alex Beregszaszi (2006), FFmpeg contributors. Restructured in round 11 (separate entropy/filter/output passes, register-resident filter state, own bit reader); the format arithmetic and the attribution remain.
 * `crates/audeniq-qc/src/wavpack.rs`, `crates/audeniq-qc/src/wavpack_table.rs`: `libavcodec/wavpack.c`, `wavpack.h`, `wavpackdata.c`; Konstantin Shishkov (2006, 2011), David Bryant (2020). Only integer lossless paths. Restructured in round 11 (register-resident entropy state, pass structure, branch-free weight steps, own bit reader); the format arithmetic and the attribution remain.
 * `crates/audeniq-qc/src/flac.rs`: FLAC fixed/LPC residual prediction, Rice mapping, frame/subframe structure from `libavcodec/flacenc.c` and Welch/Levinson approach from `lpc.c`; Justin Ruggles (2006). Reworked selection, buffers, verification and commit logic; round 12 replaced the Rice estimate with an own cost model and added exact stereo-assignment trials (levels 7-8).
 * `crates/audeniq-qc/src/alac.rs`: Rice/zero-run, adaptive LPC and stereo reconstruction from `libavcodec/alac.c`, `alacdsp.c`; David Hammerton (2005). Reworked bounded bit access, in-place reusable buffers and specialized predictor orders; round 12 restructured the adaptive Golomb state and coefficient steps as own functions.
@@ -43,6 +42,12 @@ oracles: FFmpeg's binaries, conformance references, the previous output):
   ITU-R BS.1770-5's 48 kHz stages, moved to other rates through their exact
   analog prototype (inverse and forward bilinear transform). Integrated
   loudness is unchanged at 48 kHz and within 0.005 LU at 44.1 kHz.
+* `crates/audeniq-qc/src/tta.rs`: the TTA1 decoder, written from the
+  format's description (header and frame table with CRC-32, two-parameter
+  adaptive Rice code, eight-tap sign–sign filter, first-order predictor,
+  inter-channel differences). Decodes FFmpeg-encoded mono/stereo 16/24-bit
+  files bit for bit like the previous decoder and to the source PCM
+  (`tests/regressions.rs`), at the same speed.
 
 ## libebur128 MIT notice (historical: no longer used)
 

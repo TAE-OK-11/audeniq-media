@@ -92,6 +92,15 @@ pub fn probe<R: Read + Seek>(r: &mut R) -> Result<Report, Error> {
 /// [`probe`], and with `sound` also decode and measure the sound track
 /// ([`sound::measure`]), which reads its media data.
 pub fn probe_with<R: Read + Seek>(r: &mut R, sound: bool) -> Result<Report, Error> {
+    probe_for(r, sound, None)
+}
+
+/// [`probe_with`], also checking one platform's spec ([`check::PROFILES`]).
+pub fn probe_for<R: Read + Seek>(
+    r: &mut R,
+    sound: bool,
+    profile: Option<&'static check::Profile>,
+) -> Result<Report, Error> {
     let size = r.seek(SeekFrom::End(0))?;
     let layout = file::walk(r, size)?;
     let (mut report, tracks) = report::build(&layout)?;
@@ -115,15 +124,25 @@ pub fn probe_with<R: Read + Seek>(r: &mut R, sound: bool) -> Result<Report, Erro
             Err(note) => report.sound_note = Some(note),
         }
     }
-    report.issues = check::evaluate(&report, &layout, &tracks);
+    report.profile = profile.map(|p| p.version);
+    report.issues = check::evaluate(&report, &layout, &tracks, profile);
     report.mv_ready = report.issues.iter().all(|i| i.severity != Severity::Error);
     Ok(report)
 }
 
 /// [`probe_with`] of a file on disk.
 pub fn probe_path(path: &std::path::Path, sound: bool) -> Result<Report, Error> {
+    probe_path_for(path, sound, None)
+}
+
+/// [`probe_for`] of a file on disk.
+pub fn probe_path_for(
+    path: &std::path::Path,
+    sound: bool,
+    profile: Option<&'static check::Profile>,
+) -> Result<Report, Error> {
     let mut f = std::io::BufReader::with_capacity(READ_BUFFER, std::fs::File::open(path)?);
-    probe_with(&mut f, sound)
+    probe_for(&mut f, sound, profile)
 }
 
 /// Byte ranges of the sound track's data ([`sound::ranges`]).

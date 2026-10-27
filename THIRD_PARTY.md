@@ -11,7 +11,7 @@ photo crates record their sources next to the code: `docs/photo/PORTING.md`,
 Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
 
 * `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3 data) generated from `libavcodec/aactab.c` (FFmpeg n6.1.1); Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007). The decoder code in `crates/media-aac` is AUDENIQ's; its window overlap, intensity/noise gain and TNS coefficient conventions were checked against `libavcodec/aacdec_template.c` and match FFmpeg's output sample for sample (`crates/media-aac/tests/ffmpeg.rs`).
-* `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window and noise table (ISO/IEC 14496-3 data) generated from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c` and `aacpsdata.c` (FFmpeg n6.1.1); Robert Swain (2008-2009), Alex Converse (2008-2010). The window's c(384) and c(512) carry the standard's signs (FFmpeg negates them for its MDCT-based banks). `crates/media-aac/src/sbr.rs` and `ps.rs` are AUDENIQ's: the QMF banks are the standard's complex matrices computed as DCT-IVs of size 64 (`crates/media-dsp`, derived in `sbr.rs`); buffer timing, envelope adjustment and PS mixing follow `libavcodec/aacsbr*.c`, `sbrdsp*.c`, `aacps*.c` step for step so the output matches FFmpeg's and the MPEG conformance references (`crates/media-video/tests/conformance.rs`).
+* `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window, noise table and the hybrid-band → parameter-band maps (ISO/IEC 14496-3 data) generated from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c` and `aacpsdata.c` (FFmpeg n6.1.1); Robert Swain (2008-2009), Alex Converse (2008-2010). Only the data: the window's c(384) and c(512) carry the standard's signs. The decoders that use them are AUDENIQ's (see Clean-room replacements).
 * `crates/media-mp3/src/tables.rs`: Layer III Huffman codebooks, scale-factor band widths, pretab, slen/LSF tables (ISO/IEC 11172-3, 13818-3 data) generated from `libavcodec/mpegaudiodec_common.c`, and the synthesis window from `mpegaudiodsp_data.c` (FFmpeg n6.1.1); Fabrice Bellard (2001-2003). The decoder code in `crates/media-mp3` is AUDENIQ's (the IMDCT folded to a DCT-IV of size 18 and the synthesis matrixing to a DCT-II of size 32, both from the standard's definitions); bit-reservoir, intensity-stereo and short-block conventions were checked against `mpegaudiodec_template.c` and match FFmpeg's output within 1e-5 (`crates/media-mp3/tests/ffmpeg.rs`).
 
 Rust translations change storage, bounds handling, error propagation, work limits and dispatch; they do not remove upstream attribution. No FFmpeg binary, libav* library, GPL-only filter, or native media-codec FFI is linked. Media processing is Rust, including CPU intrinsics; normal Rust system-runtime libraries still apply. Full LGPL text: LICENSE; referenced GPL text: COPYING.GPLv2.
@@ -72,6 +72,19 @@ oracles: FFmpeg's binaries, conformance references, the previous output):
   copies are one function. Encoder output is byte-identical at every
   level; decoding the reference `flac` and FFmpeg encoders' files and 800
   corruptions matches the previous decoder; both are as fast or faster.
+* `crates/media-aac/src/sbr.rs`, `crates/media-aac/src/ps.rs`: HE-AAC SBR
+  and parametric stereo, rewritten from ISO/IEC 14496-3 (4.6.18, 8.6.4):
+  header and frequency band tables, time grid, delta-coded scale factors
+  and coupling, covariance predictors and chirp factors, envelope
+  adjustment with limiter, boost and smoothing, noise and sinusoids; PS
+  bitstream, hybrid filter banks with look-ahead, all-pass decorrelation
+  with transient attenuation, Ra/Rb mixing with IPD/OPD and interpolation.
+  The QMF banks are AUDENIQ's DCT-IV forms. The previous decoders followed
+  FFmpeg step by step; the new ones were written without their code and
+  checked only against outputs: the MPEG conformance references give the
+  same error as before (al_sbr_cm_48_2 0.5000, al_sbr_sr_48_2_fsaac48
+  0.5741, al_sbr_ps_06 0.5001, CT_DecoderCheck 0.2844 LSB; al_sbr_ps_04
+  0.2772 against 0.2750), at the same speed.
 
 ## libwavpack BSD-3-Clause notice
 

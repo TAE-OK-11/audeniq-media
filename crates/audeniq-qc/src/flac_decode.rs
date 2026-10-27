@@ -1,7 +1,11 @@
-//! Bounded native FLAC decoder. Rice/fixed/LPC and channel reconstruction
-//! ported/reworked from FFmpeg flac.c, flacdec.c, flacdsp.c (LGPL-2.1-or-later).
-//! Copyright (c) 2003 Alex Beregszaszi; (c) 2012 Mans Rullgard.
-//! See THIRD_PARTY.md.
+//! Bounded FLAC decoder, written from RFC 9639: metadata and STREAMINFO,
+//! frame headers with CRC-8, constant/verbatim/fixed/LPC subframes with
+//! wasted bits, partitioned Rice residuals with escapes, stereo
+//! decorrelation, CRC-16 and the STREAMINFO MD5. AUDENIQ's design: Rice
+//! runs and LZCNT/BMI decoding, register-ring unrolled LPC with exact
+//! accumulator selection, range checks accumulated per subframe,
+//! vectorizable stereo reconstruction, and verification of encoded frames
+//! by residual comparison instead of serial restoration (see [`verify`]).
 use crate::{kernels::Backend, AudioSpec, Error, Limits, Result};
 use media_bits::Bits;
 use media_hash::Md5;
@@ -223,70 +227,65 @@ pub(crate) struct Header {
     pub variable: bool,
     mode: u32,
 }
+/// A frame header (RFC 9639 section 9.1), checked against the stream: the
+/// 15-bit sync code and blocking strategy, block size and sample rate
+/// codes (some with their value at the end of the header), the channel
+/// assignment, the sample size code, a reserved zero bit and the frame or
+/// sample number as a coded number. Frames must match STREAMINFO's rate,
+/// channels and bits per sample and stay within its maximum block size.
 fn header(b: &mut Bits<'_>, spec: &AudioSpec, maximum: usize) -> Result<Header> {
-    if b.get(15)? != 0x7ffc {
+    const SYNC: u32 = 0b111_1111_1111_1100;
+    if b.get(15)? != SYNC {
         return invalid("FLAC sync");
     }
     let variable = b.get(1)? != 0;
-    let block = b.get(4)?;
-    let rate = b.get(4)?;
+    let size_code = b.get(4)?;
+    let rate_code = b.get(4)?;
     let mode = b.get(4)?;
-    let bits = b.get(3)?;
-    if b.get(1)? != 0 || mode > 10 || (if mode < 8 { mode + 1 } else { 2 }) != spec.channels as u32
-    {
+    let width_code = b.get(3)?;
+    // Assignments 0..=7 are 1..=8 independent channels; 8, 9, 10 are the
+    // stereo pairs (left/side, side/right, mid/side); 11.. are reserved.
+    let channels = match mode {
+        0..=7 => mode + 1,
+        8..=10 => 2,
+        _ => 0,
+    };
+    if b.get(1)? != 0 || channels != u32::from(spec.channels) {
         return invalid("FLAC frame channels/reserved bit");
     }
-    let width = [0, 8, 12, 0, 16, 20, 24, 32][bits as usize];
-    if bits == 3 || (width != 0 && width != spec.bits_per_sample as u32) {
+    // Sample size codes: 0 from STREAMINFO, 3 reserved.
+    let width = [
+        Some(0),
+        Some(8),
+        Some(12),
+        None,
+        Some(16),
+        Some(20),
+        Some(24),
+        Some(32),
+    ][width_code as usize];
+    if width.is_none_or(|w| w != 0 && w != u32::from(spec.bits_per_sample)) {
         return invalid("FLAC frame sample width");
     }
-    let first = b.get(8)?;
-    let n = (first as u8).leading_ones();
-    let mut number = if n == 0 {
-        first as u64
-    } else {
-        if !(2..=7).contains(&n) {
-            return invalid("FLAC frame number encoding");
-        }
-        (first & ((1 << (7 - n)) - 1)) as u64
-    };
-    for _ in 1..n {
-        let byte = b.get(8)?;
-        if byte & 0xc0 != 0x80 {
-            return invalid("FLAC frame number continuation");
-        }
-        number = (number << 6) | (byte & 63) as u64;
-    }
-    if n != 0 {
-        let minimum = [0, 0, 0x80, 0x800, 0x10000, 0x200000, 0x4000000, 0x80000000][n as usize];
-        if number < minimum {
-            return invalid("FLAC overlong frame number");
-        }
-    }
-    if (!variable && number >= 1 << 31) || number >= 1 << 36 {
+    let number = coded_number(b)?;
+    // A fixed-blocksize stream numbers frames (31 bits at most), a
+    // variable one samples (36 bits).
+    if number >= if variable { 1 << 36 } else { 1 << 31 } {
         return invalid("FLAC frame number range");
     }
-    let samples = match block {
+    let samples = match size_code {
         0 => return invalid("FLAC block code"),
         1 => 192,
-        2..=5 => 576 << (block - 2),
+        2..=5 => 576 << (size_code - 2),
         6 => b.get(8)? + 1,
         7 => b.get(16)? + 1,
-        _ => 256 << (block - 8),
+        _ => 256 << (size_code - 8),
     } as usize;
-    let sample_rate = match rate {
+    let sample_rate = match rate_code {
         0 => spec.sample_rate,
-        1 => 88200,
-        2 => 176400,
-        3 => 192000,
-        4 => 8000,
-        5 => 16000,
-        6 => 22050,
-        7 => 24000,
-        8 => 32000,
-        9 => 44100,
-        10 => 48000,
-        11 => 96000,
+        1..=11 => [
+            88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000,
+        ][rate_code as usize - 1],
         12 => b.get(8)? * 1000,
         13 => b.get(16)?,
         14 => b.get(16)? * 10,
@@ -301,6 +300,35 @@ fn header(b: &mut Bits<'_>, spec: &AudioSpec, maximum: usize) -> Result<Header> 
         variable,
         mode,
     })
+}
+
+/// A coded number (RFC 9639 section 9.1.5): a byte below 0x80, or a lead
+/// byte whose `len` (2..=7) leading ones give the length, followed by
+/// `len − 1` continuation bytes `10xxxxxx`. The shortest form is required.
+fn coded_number(b: &mut Bits<'_>) -> Result<u64> {
+    let lead = b.get(8)?;
+    let len = (lead as u8).leading_ones();
+    if len == 0 {
+        return Ok(u64::from(lead));
+    }
+    if !(2..=7).contains(&len) {
+        return invalid("FLAC frame number encoding");
+    }
+    let mut n = u64::from(lead & (0x7f >> len));
+    for _ in 1..len {
+        let byte = b.get(8)?;
+        if byte & 0xc0 != 0x80 {
+            return invalid("FLAC frame number continuation");
+        }
+        n = (n << 6) | u64::from(byte & 0x3f);
+    }
+    // The shortest form: more payload bits than `len − 1` bytes carry
+    // (7 in one byte, 5·k + 1 in k ≥ 2 bytes).
+    let shorter = if len == 2 { 7 } else { 5 * (len - 1) + 1 };
+    if n < 1 << shorter {
+        return invalid("FLAC overlong frame number");
+    }
+    Ok(n)
 }
 pub(crate) fn decode(
     data: &[u8],
@@ -1001,6 +1029,79 @@ fn decorrelate<const MODE: u32>(
     bits >= span
 }
 
+/// The metadata blocks after the signature (RFC 9639 section 8): each a
+/// last-block flag, a 7-bit type (127 forbidden) and a 24-bit length.
+/// STREAMINFO (type 0, 34 bytes) must come first and once; the others are
+/// skipped. Returns STREAMINFO.
+fn metadata(file: &mut File, limits: &Limits) -> Result<[u8; 34]> {
+    const STREAMINFO: u8 = 0;
+    const FORBIDDEN: u8 = 127;
+    let length = file.metadata()?.len();
+    let mut info = None;
+    for i in 0..limits.max_chunks {
+        limits.check()?;
+        let mut h = [0; 4];
+        file.read_exact(&mut h)?;
+        let [flags, a, b, c] = h;
+        let (last, kind) = (flags & 0x80 != 0, flags & 0x7f);
+        let size = u64::from(u32::from_be_bytes([0, a, b, c]));
+        if size > limits.max_packet_bytes as u64
+            || size > length.saturating_sub(file.stream_position()?)
+        {
+            return invalid("FLAC metadata size");
+        }
+        if i == 0 && kind != STREAMINFO {
+            return invalid("FLAC STREAMINFO must be first");
+        }
+        match kind {
+            FORBIDDEN => return invalid("FLAC metadata type"),
+            STREAMINFO => {
+                if info.is_some() || size != 34 {
+                    return invalid("FLAC STREAMINFO size/count");
+                }
+                let mut block = [0; 34];
+                file.read_exact(&mut block)?;
+                info = Some(block);
+            }
+            _ => {
+                file.seek(SeekFrom::Current(size as i64))?;
+            }
+        }
+        if last {
+            break;
+        }
+        if i + 1 == limits.max_chunks {
+            return Err(Error::Limit("FLAC metadata blocks"));
+        }
+    }
+    info.ok_or(Error::Invalid("missing FLAC STREAMINFO"))
+}
+
+/// The stream format from STREAMINFO (RFC 9639 section 8.2): minimum and
+/// maximum block size (16 bits each; at least 16, minimum ≤ maximum), the
+/// frame size bounds (24 bits each), then sample rate (20 bits), channels
+/// − 1 (3), bits per sample − 1 (5) and total samples (36) in one 64-bit
+/// field, then the MD5 of the PCM.
+fn streaminfo(info: &[u8; 34]) -> Result<AudioSpec> {
+    let block_min = u16::from_be_bytes([info[0], info[1]]);
+    let block_max = u16::from_be_bytes([info[2], info[3]]);
+    if block_min < 16 || block_max < block_min {
+        return invalid("FLAC STREAMINFO block size");
+    }
+    let format = u64::from_be_bytes(info[10..18].try_into().unwrap());
+    let field = |shift: u32, bits: u32| (format >> shift) & ((1 << bits) - 1);
+    let spec = AudioSpec {
+        container: "flac".into(),
+        codec: "flac".into(),
+        sample_rate: field(44, 20) as u32,
+        channels: field(41, 3) as u16 + 1,
+        bits_per_sample: field(36, 5) as u16 + 1,
+        frames: Some(field(0, 36)),
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
 impl Decoder {
     pub fn open(mut file: File, limits: &Limits) -> Result<Self> {
         let mut magic = [0; 4];
@@ -1008,58 +1109,8 @@ impl Decoder {
         if &magic != b"fLaC" {
             return invalid("FLAC signature");
         }
-        let length = file.metadata()?.len();
-        let mut info = None;
-        for i in 0..limits.max_chunks {
-            limits.check()?;
-            let mut h = [0; 4];
-            file.read_exact(&mut h)?;
-            let kind = h[0] & 127;
-            let size = u32::from_be_bytes([0, h[1], h[2], h[3]]) as u64;
-            if size > limits.max_packet_bytes as u64
-                || size > length.saturating_sub(file.stream_position()?)
-            {
-                return invalid("FLAC metadata size");
-            }
-            if i == 0 && kind != 0 {
-                return invalid("FLAC STREAMINFO must be first");
-            }
-            if kind == 127 {
-                return invalid("FLAC metadata type");
-            }
-            if kind == 0 {
-                if info.is_some() || size != 34 {
-                    return invalid("FLAC STREAMINFO size/count");
-                }
-                let mut b = [0; 34];
-                file.read_exact(&mut b)?;
-                info = Some(b);
-            } else {
-                file.seek(SeekFrom::Current(size as i64))?;
-            }
-            if h[0] & 128 != 0 {
-                break;
-            }
-            if i + 1 == limits.max_chunks {
-                return Err(Error::Limit("FLAC metadata blocks"));
-            }
-        }
-        let info = info.ok_or(Error::Invalid("missing FLAC STREAMINFO"))?;
-        let maximum = u16::from_be_bytes(info[2..4].try_into().unwrap());
-        let minimum = u16::from_be_bytes(info[..2].try_into().unwrap());
-        if minimum < 16 || maximum < minimum {
-            return invalid("FLAC STREAMINFO block size");
-        }
-        let packed = u64::from_be_bytes(info[10..18].try_into().unwrap());
-        let spec = AudioSpec {
-            container: "flac".into(),
-            codec: "flac".into(),
-            sample_rate: (packed >> 44) as u32,
-            channels: ((packed >> 41) & 7) as u16 + 1,
-            bits_per_sample: ((packed >> 36) & 31) as u16 + 1,
-            frames: Some(packed & 0xfffffffff),
-        };
-        spec.validate()?;
+        let info = metadata(&mut file, limits)?;
+        let spec = streaminfo(&info)?;
         if spec.frames == Some(0) {
             return Err(Error::Unsupported("FLAC declared sample count required"));
         }
@@ -1278,8 +1329,9 @@ fn restore_fixed(p: &mut [i32], order: usize, bits: u32) -> Result<()> {
 /// LPC restoration. Products are widened to i64 (coefficients have at most 15
 /// bits, samples 32), and range failures are accumulated per subframe. When
 /// the stream's declared precision, width and order bound every partial sum
-/// below 2^31 (FFmpeg's flacdsp 32-bit condition), an exact i32 accumulator
-/// is used instead; any out-of-range sample still fails the subframe.
+/// below 2^31 (order · max|coefficient| · 2^(bits − 1) < 2^31), an exact i32
+/// accumulator is used instead; any out-of-range sample still fails the
+/// subframe.
 #[inline]
 fn restore_lpc<const N: usize>(p: &mut [i32], coeff: &[i32], shift: i32, bits: u32) -> Result<()> {
     let _profile = crate::profile::scope(crate::profile::Stage::FlacPredict);

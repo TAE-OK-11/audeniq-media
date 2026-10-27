@@ -1,13 +1,12 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
-// FLAC fixed predictors, signed Rice mapping and frame writer adapted from
-// FFmpeg libavcodec/flacenc.c / lpc.c, Copyright (c) 2006 Justin Ruggles.
-// Redesign: bounded 4096-frame work buffers; constant/fixed/verbatim choice;
-// exact Rice costs near an estimated parameter; adaptive independent/mid-side;
-// streaming MD5/PCM SHA256, verified output and atomic no-clobber publication.
-// Own planning kernels (bounded u32/i32 lanes, whole-block LPC residuals),
-// branch-free Rice writer and positional frame verification; own Rice cost
-// model and exact stereo-assignment trials at levels 7-8; LPC orders up to
-// 32, chosen from the Levinson error with one exact residual.
+//! FLAC encoder (RFC 9639 streamable subset), AUDENIQ's design: 4096-sample
+//! frames; per channel the cheapest of constant, verbatim, fixed predictors
+//! 0..=4 and LPC up to order 32 (Welch-windowed autocorrelation,
+//! Levinson–Durbin, an own per-order cost estimate, error-feedback
+//! coefficient quantization, exact residual costs); partitioned Rice with
+//! an own cost model and a branch-free writer; stereo assignment ranked by
+//! a Levinson estimate, with exact trials at levels 7–8; streaming MD5 and
+//! PCM SHA-256; every frame verified in memory before it is written, and
+//! atomic no-clobber publication.
 #[cfg(feature = "reference-codecs")]
 use crate::audio::pcm_sha256;
 use crate::{
@@ -611,16 +610,7 @@ impl Encoder {
             }
         };
         let mut bw = BeWriter::reuse(std::mem::take(&mut self.frame_buffer));
-        bw.put(16, 0xfff8);
-        bw.put(4, 7);
-        bw.put(4, 0);
-        bw.put(4, assignment);
-        bw.put(3, if depth == 16 { 4 } else { 6 });
-        bw.put(1, 0);
-        utf8(&mut bw, self.number);
-        bw.put(16, (n - 1) as u64);
-        let crc = crc8(&bw.bytes);
-        bw.put(8, crc as u64);
+        frame_header(&mut bw, self.number, n, assignment, depth);
         // The header does not depend on subframe contents, so below level 7
         // each subframe is planned and written in turn: only one planned
         // model (and its stored residual) is alive at a time.
@@ -679,19 +669,18 @@ impl Encoder {
         if self.frames == 0 || self.frames > self.limits.max_frames {
             return Err(Error::Invalid("empty/oversized FLAC output"));
         }
-        let mut b = BeWriter::new();
-        b.put(16, self.profile.block as u64);
-        b.put(16, self.profile.block as u64);
-        b.put(24, self.min_frame as u64);
-        b.put(24, self.max_frame as u64);
-        b.put(20, self.spec.sample_rate as u64);
-        b.put(3, (self.spec.channels - 1) as u64);
-        b.put(5, (self.spec.bits_per_sample - 1) as u64);
-        b.put(36, self.frames);
-        b.bytes.extend_from_slice(&md5);
+        let info = streaminfo(&StreamInfo {
+            block: self.profile.block,
+            frame_bytes: self.min_frame..=self.max_frame,
+            rate: self.spec.sample_rate,
+            channels: self.spec.channels,
+            depth: self.spec.bits_per_sample,
+            frames: self.frames,
+            md5,
+        });
         self.file.seek(SeekFrom::Start(8))?;
-        self.file.write_all(&b.bytes)?;
-        let header = flac_header(b.bytes.as_slice().try_into().unwrap());
+        self.file.write_all(&info)?;
+        let header = flac_header(&info);
         Ok((self.file, header, self.log))
     }
 }
@@ -1019,34 +1008,46 @@ fn stereo_estimate(x: &[i32], depth: u32, kernel: &AutocorrKernel, planner: &mut
 /// The estimate of [`stereo_estimate`] from autocorrelation lags
 /// `0..=order` of an `n`-sample window.
 fn levinson_estimate(r: &[f64], n: usize, depth: u32) -> f64 {
-    let max_order = r.len() - 1;
     // Silence and near-silence have no meaningful logarithm; below about
     // 0.01 per sample every channel costs the same.
     let floor = 1e-2 * n as f64;
     let mut best = 0.5 * n as f64 * r[0].max(floor).log2();
-    let mut a = [0.0f64; STEREO_ESTIMATE_ORDER];
-    let mut error = r[0];
-    for index in 0..max_order.min(STEREO_ESTIMATE_ORDER) {
-        if error <= r[0] * 1e-12 || !error.is_finite() {
-            break;
-        }
-        let reflection =
-            (r[index + 1] - (0..index).map(|j| a[j] * r[index - j]).sum::<f64>()) / error;
-        if !reflection.is_finite() || reflection.abs() >= 1.0 {
-            break;
-        }
-        let old = a;
-        for j in 0..index {
-            a[j] = old[j] - reflection * old[index - j - 1];
-        }
-        a[index] = reflection;
-        error *= 1.0 - reflection * reflection;
-        let order = index + 1;
+    let orders = (r.len() - 1).min(STEREO_ESTIMATE_ORDER);
+    levinson(&r[..=orders], |order, _, error| {
         let estimate = 0.5 * (n - order) as f64 * error.max(floor).log2()
             + (order as u32 * (LPC_PRECISION + depth)) as f64;
         best = best.min(estimate);
-    }
+    });
     best
+}
+
+/// The Levinson–Durbin recursion on autocorrelation lags `r`: for each
+/// order up to `r.len() − 1`, `each(order, predictor, error)` with the
+/// order's predictor coefficients (`a[j]` weighs the sample `j + 1` back)
+/// and its prediction error. Stops early once the error vanishes or a
+/// reflection coefficient leaves (−1, 1) (numerically unstable).
+fn levinson(r: &[f64], mut each: impl FnMut(usize, &[f64; MAX_LPC_ORDER], f64)) {
+    let mut a = [0.0f64; MAX_LPC_ORDER];
+    let mut error = r[0];
+    for m in 0..r.len() - 1 {
+        if error <= r[0] * 1e-12 || !error.is_finite() {
+            break;
+        }
+        // The new reflection coefficient from the part of lag m + 1 the
+        // order-m predictor does not explain.
+        let explained: f64 = (0..m).map(|j| a[j] * r[m - j]).sum();
+        let k = (r[m + 1] - explained) / error;
+        if !k.is_finite() || k.abs() >= 1.0 {
+            break;
+        }
+        let previous = a;
+        for j in 0..m {
+            a[j] = previous[j] - k * previous[m - j - 1];
+        }
+        a[m] = k;
+        error *= 1.0 - k * k;
+        each(m + 1, &a, error);
+    }
 }
 
 #[derive(Clone)]
@@ -1262,7 +1263,7 @@ impl Plan {
                 );
             }
             autocorr.end();
-            let levinson = crate::profile::scope(crate::profile::Stage::EncoderLevinson);
+            let levinson_stage = crate::profile::scope(crate::profile::Stage::EncoderLevinson);
             // Levinson-Durbin keeps the predictor of every order. A Laplacian
             // residual with prediction error e costs about log2(e) / 2 bits
             // per sample plus a constant, so each order is estimated at
@@ -1272,28 +1273,11 @@ impl Plan {
             // compressed as well as exactly costing the highest order and
             // the best of every order's 128-point sampled cost (the former
             // levels 4-5), with one exact residual instead of two.
-            let mut a = [0.0f64; MAX_LPC_ORDER];
             let mut models = [[0.0f64; MAX_LPC_ORDER]; MAX_LPC_ORDER + 1];
             let mut estimated = (0, f64::INFINITY);
-            let mut error = r[0];
             let mut computed = 0;
-            for index in 0..max_order {
-                if error <= r[0] * 1e-12 || !error.is_finite() {
-                    break;
-                }
-                let reflection =
-                    (r[index + 1] - (0..index).map(|j| a[j] * r[index - j]).sum::<f64>()) / error;
-                if !reflection.is_finite() || reflection.abs() >= 1.0 {
-                    break;
-                }
-                let old = a;
-                for j in 0..index {
-                    a[j] = old[j] - reflection * old[index - j - 1];
-                }
-                a[index] = reflection;
-                error *= 1.0 - reflection * reflection;
-                let order = index + 1;
-                models[order] = a;
+            levinson(&r[..=max_order], |order, a, error| {
+                models[order] = *a;
                 computed = order;
                 let estimate = (n - order) as f64 * 0.5 * (error / r[0]).max(1e-30).log2()
                     + (order as u32 * (LPC_PRECISION + depth)) as f64;
@@ -1301,8 +1285,8 @@ impl Plan {
                 if estimate < estimated.1 {
                     estimated = (order, estimate);
                 }
-            }
-            levinson.end();
+            });
+            levinson_stage.end();
             let _cost = crate::profile::scope(crate::profile::Stage::EncoderLpcCost);
             // Highest order first; iterating downwards, a lower order also
             // replaces an equal-cost LPC model (lowest order among equal
@@ -1478,31 +1462,76 @@ fn write_residual(
         bw.rice_block(&residual[start..(i + 1) * size - predictor], param as u32);
     }
 }
-fn utf8(bw: &mut BeWriter, n: u64) {
-    if n < 128 {
+/// A frame header (RFC 9639 section 9.1) for a fixed-blocksize stream:
+/// the sync code with blocking bit 0, block size code 7 (the size minus one
+/// follows in 16 bits), sample rate code 0 (from STREAMINFO), the channel
+/// assignment, sample size code 4 (16 bits) or 6 (24 bits), a zero
+/// reserved bit, the frame number as a coded number, the block size and
+/// the CRC-8 of all that.
+fn frame_header(bw: &mut BeWriter, number: u64, samples: usize, assignment: u64, depth: u32) {
+    const SYNC_FIXED: u64 = 0b1111_1111_1111_1000;
+    const BLOCK_SIZE_16_BITS: u64 = 7;
+    const RATE_FROM_STREAMINFO: u64 = 0;
+    let size_code = if depth == 16 { 4 } else { 6 };
+    let start = bw.bytes.len();
+    bw.put(16, SYNC_FIXED);
+    bw.put(4, BLOCK_SIZE_16_BITS);
+    bw.put(4, RATE_FROM_STREAMINFO);
+    bw.put(4, assignment);
+    bw.put(3, size_code);
+    bw.put(1, 0);
+    coded_number(bw, number);
+    bw.put(16, (samples - 1) as u64);
+    let crc = crc8(&bw.bytes[start..]);
+    bw.put(8, u64::from(crc));
+}
+
+/// A coded number (RFC 9639 section 9.1.5): below 2^7 one byte; otherwise
+/// a lead byte of `len` one bits, a zero and the top bits, then `len − 1`
+/// continuation bytes `10xxxxxx`, for the shortest `len` (2..=7) whose
+/// 5·len + 1 payload bits (36 for len 7) hold the value.
+fn coded_number(bw: &mut BeWriter, n: u64) {
+    if n < 1 << 7 {
         bw.put(8, n);
         return;
     }
     let bits = 64 - n.leading_zeros();
-    let len = if bits <= 11 {
-        2
-    } else if bits <= 16 {
-        3
-    } else if bits <= 21 {
-        4
-    } else if bits <= 26 {
-        5
-    } else if bits <= 31 {
-        6
-    } else {
-        7
-    };
-    let first = (0xffu64 << (8 - len)) & 0xff;
-    let remaining = (len - 1) * 6;
-    bw.put(8, first | (n >> remaining));
+    let len = (2..7).find(|&len| bits <= 5 * len + 1).unwrap_or(7);
+    let tail = 6 * (len - 1);
+    let lead = (0xff00u64 >> len) & 0xff;
+    bw.put(8, lead | (n >> tail));
     for i in (0..len - 1).rev() {
-        bw.put(8, 0x80 | ((n >> (i * 6)) & 63));
+        bw.put(8, 0x80 | ((n >> (6 * i)) & 0x3f));
     }
+}
+
+/// The STREAMINFO fields this encoder writes.
+struct StreamInfo {
+    block: usize,
+    frame_bytes: std::ops::RangeInclusive<usize>,
+    rate: u32,
+    channels: u16,
+    depth: u16,
+    frames: u64,
+    md5: [u8; 16],
+}
+
+/// The 34-byte STREAMINFO block (RFC 9639 section 8.2): minimum and
+/// maximum block size (16 bits each, equal for a fixed block size),
+/// minimum and maximum frame size (24 bits each), sample rate (20),
+/// channels − 1 (3), bits per sample − 1 (5), total samples (36), MD5.
+fn streaminfo(info: &StreamInfo) -> [u8; 34] {
+    let mut b = BeWriter::new();
+    b.put(16, info.block as u64);
+    b.put(16, info.block as u64);
+    b.put(24, *info.frame_bytes.start() as u64);
+    b.put(24, *info.frame_bytes.end() as u64);
+    b.put(20, u64::from(info.rate));
+    b.put(3, u64::from(info.channels - 1));
+    b.put(5, u64::from(info.depth - 1));
+    b.put(36, info.frames);
+    b.bytes.extend_from_slice(&info.md5);
+    b.bytes.try_into().unwrap()
 }
 
 #[cfg(all(test, not(feature = "reference-codecs")))]

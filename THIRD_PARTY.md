@@ -10,8 +10,6 @@ photo crates record their sources next to the code: `docs/photo/PORTING.md`,
 
 Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
 
-* `crates/audeniq-qc/src/flac.rs`: FLAC fixed/LPC residual prediction, Rice mapping, frame/subframe structure from `libavcodec/flacenc.c` and Welch/Levinson approach from `lpc.c`; Justin Ruggles (2006). Reworked selection, buffers, verification and commit logic; round 12 replaced the Rice estimate with an own cost model and added exact stereo-assignment trials (levels 7-8).
-* `crates/audeniq-qc/src/flac_decode.rs`: frame/header, partitioned Rice, fixed/LPC and channel reconstruction from `libavcodec/flac.c`, `flacdec.c`, `flacdsp.c`; Alex Beregszaszi (2003), Mans Rullgard (2012). Reworked streaming input, strict CRC/count/MD5 checks and specialized LPC orders.
 * `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3 data) generated from `libavcodec/aactab.c` (FFmpeg n6.1.1); Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007). The decoder code in `crates/media-aac` is AUDENIQ's; its window overlap, intensity/noise gain and TNS coefficient conventions were checked against `libavcodec/aacdec_template.c` and match FFmpeg's output sample for sample (`crates/media-aac/tests/ffmpeg.rs`).
 * `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window and noise table (ISO/IEC 14496-3 data) generated from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c` and `aacpsdata.c` (FFmpeg n6.1.1); Robert Swain (2008-2009), Alex Converse (2008-2010). The window's c(384) and c(512) carry the standard's signs (FFmpeg negates them for its MDCT-based banks). `crates/media-aac/src/sbr.rs` and `ps.rs` are AUDENIQ's: the QMF banks are the standard's complex matrices computed as DCT-IVs of size 64 (`crates/media-dsp`, derived in `sbr.rs`); buffer timing, envelope adjustment and PS mixing follow `libavcodec/aacsbr*.c`, `sbrdsp*.c`, `aacps*.c` step for step so the output matches FFmpeg's and the MPEG conformance references (`crates/media-video/tests/conformance.rs`).
 * `crates/media-mp3/src/tables.rs`: Layer III Huffman codebooks, scale-factor band widths, pretab, slen/LSF tables (ISO/IEC 11172-3, 13818-3 data) generated from `libavcodec/mpegaudiodec_common.c`, and the synthesis window from `mpegaudiodsp_data.c` (FFmpeg n6.1.1); Fabrice Bellard (2001-2003). The decoder code in `crates/media-mp3` is AUDENIQ's (the IMDCT folded to a DCT-IV of size 18 and the synthesis matrixing to a DCT-II of size 32, both from the standard's definitions); bit-reservoir, intensity-stereo and short-block conventions were checked against `mpegaudiodec_template.c` and match FFmpeg's output within 1e-5 (`crates/media-mp3/tests/ffmpeg.rs`).
@@ -64,6 +62,16 @@ oracles: FFmpeg's binaries, conformance references, the previous output):
   (`-f`, `-h`, `-hh`, `-x`), mono/stereo, 16/24-bit, to the source PCM
   (`tests/regressions.rs`), FFmpeg-encoded files and 800 corruptions like
   the previous decoder, at the same or better speed.
+* `crates/audeniq-qc/src/flac_decode.rs`, `crates/audeniq-qc/src/flac.rs`:
+  the FLAC decoder and encoder. Both began as FFmpeg ports and were
+  redesigned by AUDENIQ over many rounds (Rice runs and quads, register
+  rings, accumulated range checks, inductive frame verification, own cost
+  models and stereo trials); the format code that survived from the ports
+  (frame header and coded number, metadata and STREAMINFO reading and
+  writing) is now written from RFC 9639, and the two Levinson–Durbin
+  copies are one function. Encoder output is byte-identical at every
+  level; decoding the reference `flac` and FFmpeg encoders' files and 800
+  corruptions matches the previous decoder; both are as fast or faster.
 
 ## libwavpack BSD-3-Clause notice
 

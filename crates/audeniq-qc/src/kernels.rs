@@ -72,6 +72,8 @@ pub fn cpu_features() -> Vec<&'static str> {
 
 /// Direct planar S32 -> interleaved S32. NEON structure stores avoid an extra
 /// ALAC/FLAC staging buffer; all loads and stores cover complete four-frame runs.
+// Only the reference (Symphonia) decoders use it outside tests.
+#[cfg_attr(not(feature = "reference-codecs"), allow(dead_code))]
 pub(crate) fn interleave_i32(left: &[i32], right: &[i32], out: &mut [i32]) {
     assert_eq!(left.len(), right.len());
     assert_eq!(out.len(), left.len() * 2);

@@ -242,66 +242,6 @@ impl<'a> Bits<'a> {
             self.available += bytes * 8;
         }
     }
-    /// ALAC's adaptive Golomb value: unary prefix (escape at 9 ones to a
-    /// `bits`-wide value), then a `k`-bit suffix whose all-zero form is one
-    /// bit shorter.
-    #[inline(always)]
-    pub fn alac_scalar(&mut self, k: u32, bits: u32) -> Result<u32> {
-        let v = self.alac_scalar_unbounded(k, bits)?;
-        self.bounded(v)
-    }
-    #[inline(always)]
-    fn alac_scalar_unbounded(&mut self, k: u32, bits: u32) -> Result<u32> {
-        if k == 0 || k > 31 || bits > 32 {
-            return Err(Error::Invalid("ALAC Rice width"));
-        }
-        if self.available < 9 {
-            self.fill();
-        }
-        let q = (!self.cache).leading_zeros().min(9);
-        let prefix = if q == 9 { 9 } else { q + 1 };
-        let tail_bits = if q == 9 {
-            bits
-        } else if k == 1 {
-            0
-        } else {
-            k
-        };
-        let required = prefix + tail_bits;
-        if required <= self.available {
-            let tail = if tail_bits == 0 {
-                0
-            } else {
-                (self.cache >> (64 - required)) & ((1u64 << tail_bits) - 1)
-            };
-            let (consumed, value) = if q == 9 {
-                (required, tail)
-            } else if k == 1 {
-                (prefix, q as u64)
-            } else {
-                (
-                    prefix + if tail > 1 { k } else { k - 1 },
-                    ((q as u64) << k) - q as u64 + tail.saturating_sub(1),
-                )
-            };
-            if value > u32::MAX as u64 {
-                return Err(Error::Invalid("ALAC scalar range"));
-            }
-            self.consume(consumed);
-            return Ok(value as u32);
-        }
-        let q = self.unary(true, 9)?;
-        if q == 9 {
-            return self.get(bits);
-        }
-        if k == 1 {
-            return Ok(q);
-        }
-        let tail = self.peek(k)?;
-        let value = ((q as u64) << k) - q as u64 + (tail as u64).saturating_sub(1);
-        self.get(if tail > 1 { k } else { k - 1 })?;
-        u32::try_from(value).map_err(|_| Error::Invalid("ALAC scalar range"))
-    }
     /// Consume up to limit equal bits; consume the terminator only if found.
     #[inline]
     pub fn unary(&mut self, ones: bool, limit: u32) -> Result<u32> {
@@ -440,40 +380,6 @@ mod tests {
                     let expected = ((value >> 1) as i32) ^ -((value & 1) as i32);
                     assert_eq!(b.rice_signed(k).unwrap(), expected);
                     assert_eq!(b.pos(), offset as usize + q as usize + 1 + k as usize);
-                }
-            }
-        }
-        for offset in 0..64 {
-            for k in 1..=24 {
-                for q in 0..=9 {
-                    for tail in [0u64, 1, 2, 7] {
-                        if k == 1 && tail != 0 {
-                            continue;
-                        }
-                        let mut w = crate::BeWriter::new();
-                        w.put(offset, 0);
-                        w.put(q, (1u64 << q) - 1);
-                        let expected = if q == 9 {
-                            w.put(24, tail);
-                            tail
-                        } else {
-                            w.put(1, 0);
-                            if k == 1 {
-                                q as u64
-                            } else {
-                                let tail = tail & ((1 << k) - 1);
-                                w.put(k, tail);
-                                ((q as u64) << k) - q as u64 + tail.saturating_sub(1)
-                            }
-                        };
-                        w.put(32, 0);
-                        w.align();
-                        let mut b = Bits::new(&w.bytes);
-                        for _ in 0..offset {
-                            b.get(1).unwrap();
-                        }
-                        assert_eq!(b.alac_scalar(k, 24).unwrap(), expected as u32);
-                    }
                 }
             }
         }

@@ -4,8 +4,10 @@ description = "AAC-LC decoder and encoder, HE-AAC (SBR) and HE-AACv2 (PS) decodi
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# Codebook, band, SBR and PS tables are transcribed from FFmpeg (LGPL).
-license = "LGPL-2.1-or-later"
+# Only src/tables.rs, sbr_tables.rs and ps_tables.rs (MPEG table data
+# transcribed from FFmpeg) are LGPL; the code is AUDENIQ's. See THIRD_PARTY.md.
+license = "LicenseRef-AUDENIQ-Proprietary AND LGPL-2.1-or-later"
+publish = false
 
 [dependencies]
 media-bits.workspace = true

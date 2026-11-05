@@ -5,7 +5,8 @@ version.workspace = true
 # The merged engine is edition-2021 code.
 edition = "2021"
 rust-version.workspace = true
-license.workspace = true
+license = "LicenseRef-AUDENIQ-Proprietary AND Zlib"
+publish = false
 
 [dependencies]
 media-hash = { workspace = true, features = ["std"] }

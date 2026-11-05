@@ -109,4 +109,4 @@ Zen3에서는 AVX2, AArch64에서는 NEON을 사용하며, 전역 `target-cpu=na
 
 ## 라이선스
 
-FFmpeg 번역 코드를 포함하므로 LGPL-2.1-or-later입니다. 최적화/재작성 후에도 출처와 해당 의무가 유지됩니다. Rust 의존성에는 MPL-2.0, MIT, Apache-2.0 등이 적용됩니다. [LICENSE](../../LICENSE), [THIRD_PARTY.md](../../THIRD_PARTY.md)를 참조하세요.
+FFmpeg에서 옮겼던 코덱·미터 코드(TTA, WavPack, FLAC, ALAC, K-가중)는 모두 명세 기준으로 새로 작성(클린룸)되어 오디오 엔진은 AUDENIQ 독점 라이선스입니다. 선택 빌드 `reference-codecs`의 Symphonia(MPL-2.0)는 기본 빌드에 들어가지 않습니다. [LICENSE](../../LICENSE), [THIRD_PARTY.md](../../THIRD_PARTY.md)를 참조하세요.

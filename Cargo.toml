@@ -6,8 +6,9 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-license = "UNLICENSED"
-repository = "https://github.com/TAE-OK-11/audeniq-qc"
+license = "LicenseRef-AUDENIQ-Proprietary"
+publish = false
+repository = "https://github.com/TAE-OK-11/audeniq-media"
 
 [workspace.dependencies]
 media-hash = { path = "crates/media-hash", default-features = false }

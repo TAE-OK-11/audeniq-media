@@ -16,7 +16,7 @@ jobs:
       - name: Reference tools for parity tests
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends ffmpeg libimage-exiftool-perl zbar-tools qrencode poppler-utils python3-pil icc-profiles-free
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg wavpack libimage-exiftool-perl zbar-tools qrencode poppler-utils python3-pil icc-profiles-free
           pip install --break-system-packages -q qrcode==8.2 || true
       # rustup installs the pinned toolchain from rust-toolchain.toml.
       - run: rustc --version && cargo --version
@@ -46,6 +46,6 @@ jobs:
       - name: FFmpeg for the codec parity tests
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg wavpack
       # The sound codecs and their shared kernels on NEON.
       - run: cargo test --locked -p media-bits -p media-dsp -p media-aac -p media-mp3 -p media-resample -p media-video

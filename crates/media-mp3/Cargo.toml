@@ -4,8 +4,10 @@ description = "MPEG-1/2/2.5 Layer III (MP3) decoder for AUDENIQ music-video soun
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# Huffman and scale-factor band tables are transcribed from FFmpeg (LGPL).
-license = "LGPL-2.1-or-later"
+# Only src/tables.rs (MPEG table data transcribed from FFmpeg) is LGPL;
+# the code is AUDENIQ's. See THIRD_PARTY.md.
+license = "LicenseRef-AUDENIQ-Proprietary AND LGPL-2.1-or-later"
+publish = false
 
 [lints]
 workspace = true

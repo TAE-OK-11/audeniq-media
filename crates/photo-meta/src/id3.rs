@@ -1,4 +1,5 @@
-//! ID3v1 and ID3v2.2/2.3/2.4 (ExifTool ID3.pm names, groups `ID3v2_N`).
+//! ID3v1 and ID3v2.2/2.3/2.4, written from the id3.org specifications
+//! (groups `ID3v2_N` as in ExifTool's output).
 
 use crate::{Metadata, clean, latin1, tag_name};
 
@@ -81,6 +82,10 @@ fn split_term(enc: u8, b: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// Frame id (v2.3/2.4 and v2.2) → the frame's description in the ID3v2
+/// specifications, shortened to CamelCase (TPE2 "Band/orchestra/
+/// accompaniment" → `Band`); `EncoderSettings` (TSSE) and `FileOwner`
+/// (TOWN) are ExifTool's names.
 fn frame_name(id: &str) -> Option<&'static str> {
     Some(match id {
         "TIT2" | "TT2" => "Title",

@@ -73,7 +73,7 @@ FFmpeg `ebur128`과의 비교(`tests/ffprobe.rs`): AAC MP4·PCM 24비트 MOV·PC
 
 ISO/IEC 14496-3 AAC-LC: SCE·CPE·LFE, 모든 창 순서·모양(사인/KBD), M/S·인텐시티 스테레오, PNS, TNS, 펄스,
 IMDCT(DCT-IV를 1/4 크기 복소 FFT로). 채널 구성 0(PCE)도 읽습니다. Huffman·밴드 경계 표는 FFmpeg `aactab.c`에서 옮겼으므로(생성 스크립트 결과)
-크레이트 라이선스는 LGPL-2.1-or-later입니다. 코드는 자체 작성입니다.
+이 표 파일(`tables.rs`·`sbr_tables.rs`·`ps_tables.rs`)만 LGPL-2.1-or-later이고, 코드는 자체 작성(AUDENIQ 독점)입니다.
 
 - FFmpeg 디코더와 표본 단위 비교(`crates/media-aac/tests/ffmpeg.rs`): 48/44.1/32/22.05kHz, 모노·스테레오·5.1,
   M/S·IS·TNS 각각과 모두 켠 경우, 64k~384k에서 최대 차이 2.4e-7(float 반올림 수준). PNS는 난수라 블록 에너지 1dB 이내.
@@ -105,7 +105,7 @@ MPEG 적합성 스트림(FFmpeg FATE가 쓰는 것)의 기준 디코더 출력�
 MPEG-1/2/2.5 Layer III: 모노·스테레오, M/S·인텐시티 스테레오, 긴·짧은·혼합 블록, 비트 저장소(앞 프레임 데이터가 일부 없으면
 받을 수 있는 그래뉼만), CRC 프레임. 36점 IMDCT는 크기 18 DCT-IV로, 다상 합성의 행렬은 코사인 대칭으로 크기 32 DCT-II로
 줄여 32개 서브밴드·18개 슬롯을 벡터 레인으로 한 번에 계산합니다. 허프만·밴드·합성 창 표는 FFmpeg에서 옮겼고
-(LGPL-2.1-or-later) 코드는 자체 작성입니다. Free format, Layer I/II는 디코드하지 않습니다.
+(`tables.rs`만 LGPL-2.1-or-later) 코드는 자체 작성(AUDENIQ 독점)입니다. Free format, Layer I/II는 디코드하지 않습니다.
 
 - FFmpeg 디코더와 비교(`crates/media-mp3/tests/ffmpeg.rs`): LAME으로 만든 44.1/48/22.05/11.025kHz, CBR·VBR, 모노·스테레오에서
   최대 차이 3e-6. ISO 적합성 스트림(`si`·`si_block`·`si_huff`·`sin1k0db`·`compl`·`he_32/44/48khz`)도 1e-5 이내.

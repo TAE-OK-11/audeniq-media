@@ -44,5 +44,7 @@ Pinned upstream `FFmpeg/FFmpeg` at `12c589a37d093cc55618f8377b092dc21416806f`:
 `libswresample/resample.c`, `resample_template.c`, `rematrix.c`.
 
 Referenced/translated LGPL code retains attribution and LGPL-2.1-or-later.
+(Later replaced: all of the translated code has since been rewritten clean-room;
+see THIRD_PARTY.md.)
 Rust dependencies have their own licenses; see THIRD_PARTY.md as modules land.
 Rewriting or optimizing a translation does not erase upstream license obligations.

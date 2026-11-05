@@ -4,7 +4,8 @@ description = "JPEG decoder (baseline/progressive, libjpeg-turbo compatible outp
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "LicenseRef-AUDENIQ-Proprietary AND IJG"
+publish = false
 
 [dependencies]
 photo-core.workspace = true

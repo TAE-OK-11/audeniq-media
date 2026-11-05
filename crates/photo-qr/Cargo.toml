@@ -4,7 +4,8 @@ description = "QR code detection and decoding (port of quirc's identifier, stand
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "LicenseRef-AUDENIQ-Proprietary AND ISC"
+publish = false
 
 [dependencies]
 photo-core.workspace = true

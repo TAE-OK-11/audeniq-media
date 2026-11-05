@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LicenseRef-AUDENIQ-Proprietary
 //! MPEG-1/2/2.5 Layer III decoder (ISO/IEC 11172-3, 13818-3) for the sound
 //! of music videos: mono and stereo, M/S and intensity stereo, long, short
 //! and mixed blocks, the bit reservoir, CRC-protected frames. Output is f32

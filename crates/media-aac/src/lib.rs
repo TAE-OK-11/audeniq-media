@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LicenseRef-AUDENIQ-Proprietary
 //! AAC-LC decoder (ISO/IEC 14496-3 4.4–4.6) for music-video sound checks:
 //! single / pair / LFE elements, all window sequences and shapes, M/S and
 //! intensity stereo, perceptual noise substitution, temporal noise shaping

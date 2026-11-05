@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LicenseRef-AUDENIQ-Proprietary
 //! AAC-LC encoder for deliveries (music-video sound at 256–384 kbit/s).
 //!
 //! Sine windows with block switching: an attack (high-passed energy of a

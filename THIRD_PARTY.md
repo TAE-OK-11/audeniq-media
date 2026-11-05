@@ -1,36 +1,88 @@
-# Third-party provenance
+# Licensing and third-party provenance
 
-This file covers the audio engine and the shared crates (`crates/audeniq-qc`,
-`crates/audeniq-qc-tools`, `crates/media-hash`, `crates/media-json`). The
-photo crates record their sources next to the code: `docs/photo/PORTING.md`,
-`crates/photo-deflate/ENGINE.md`, `crates/photo-pdf/UPSTREAM.md`,
-`crates/photo-pdf-cmap/assets/README.md` and the OCR model notes.
+This repository is private. AUDENIQ's own code is proprietary
+(`LicenseRef-AUDENIQ-Proprietary`, see [LICENSE](LICENSE)). The files listed
+below come from, or are ported from, third-party software and keep their
+original licenses; their license texts are in [LICENSES/](LICENSES) or next
+to the crate. Each crate's `Cargo.toml` `license` field states the
+combination (`LicenseRef-AUDENIQ-Proprietary AND <upstream>`), and every
+crate has `publish = false`.
 
-## FFmpeg-derived modules (LGPL-2.1-or-later)
+The obligations of these licenses mostly attach to *distribution* (handing
+source or binaries to someone outside AUDENIQ). Running the engine on
+AUDENIQ's own servers is not distribution. Keep this file and `LICENSES/`
+with any copy that leaves AUDENIQ (a shipped binary, a source drop to a
+partner), and include the notices below in that copy's documentation.
 
-Pinned FFmpeg commit: `12c589a37d093cc55618f8377b092dc21416806f`.
+## Summary by crate
 
-* `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3 data) generated from `libavcodec/aactab.c` (FFmpeg n6.1.1); Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007). The decoder code in `crates/media-aac` is AUDENIQ's; its window overlap, intensity/noise gain and TNS coefficient conventions were checked against `libavcodec/aacdec_template.c` and match FFmpeg's output sample for sample (`crates/media-aac/tests/ffmpeg.rs`).
-* `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window, noise table and the hybrid-band → parameter-band maps (ISO/IEC 14496-3 data) generated from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c` and `aacpsdata.c` (FFmpeg n6.1.1); Robert Swain (2008-2009), Alex Converse (2008-2010). Only the data: the window's c(384) and c(512) carry the standard's signs. The decoders that use them are AUDENIQ's (see Clean-room replacements).
-* `crates/media-mp3/src/tables.rs`: Layer III Huffman codebooks, scale-factor band widths, pretab, slen/LSF tables (ISO/IEC 11172-3, 13818-3 data) generated from `libavcodec/mpegaudiodec_common.c`, and the synthesis window from `mpegaudiodsp_data.c` (FFmpeg n6.1.1); Fabrice Bellard (2001-2003). The decoder code in `crates/media-mp3` is AUDENIQ's (the IMDCT folded to a DCT-IV of size 18 and the synthesis matrixing to a DCT-II of size 32, both from the standard's definitions); bit-reservoir, intensity-stereo and short-block conventions were checked against `mpegaudiodec_template.c` and match FFmpeg's output within 1e-5 (`crates/media-mp3/tests/ffmpeg.rs`).
+| Crate | Origin | License of the third-party part | Text |
+|---|---|---|---|
+| `audeniq-qc`, `audeniq-qc-tools`, `audeniq-music`, `media-bits`, `media-dsp`, `media-hash`, `media-video`, `media-adm`, `media-resample`, `audeniq-photo`, `photo-cli`, `photo-core`, `photo-png`, `photo-meta`, `photo-bench` | AUDENIQ (see the notes below for formats implemented from specifications) | — | [LICENSE](LICENSE) |
+| `media-aac`, `media-mp3` | AUDENIQ code; **only** the table files `media-aac/src/tables.rs`, `sbr_tables.rs`, `ps_tables.rs` and `media-mp3/src/tables.rs` are transcribed from FFmpeg | LGPL-2.1-or-later (those four files) | [LICENSES/LGPL-2.1-or-later.txt](LICENSES/LGPL-2.1-or-later.txt) |
+| `media-json` | AUDENIQ; `src/ryu.rs` and its tables port Ryu `d2d` (Ulf Adams) | Apache-2.0 OR BSL-1.0 | [Apache-2.0](LICENSES/Apache-2.0.txt), [BSL-1.0](LICENSES/BSL-1.0.txt) |
+| `photo-deflate` | `src/engine` is the zlib-rs 0.6.8 engine (Trifecta Tech Foundation), modified ([ENGINE.md](crates/photo-deflate/ENGINE.md)) | Zlib | [crates/photo-deflate/LICENSE-zlib-rs](crates/photo-deflate/LICENSE-zlib-rs) |
+| `photo-jpeg` | Decoder and baseline encoder ported from libjpeg-turbo's libjpeg API code (`jidctint.c`, `jdsample.c`, `jdcolor.c`, `jdphuff.c`, `jcdctmgr.c`, `jfdctint.c`, ...) | IJG | [LICENSES/IJG.txt](LICENSES/IJG.txt) |
+| `photo-icc` | Transforms ported from LittleCMS 2 (Marti Maria Saguer) | MIT | [LICENSES/MIT-LittleCMS.txt](LICENSES/MIT-LittleCMS.txt) |
+| `photo-qr` | Identification pipeline ported from quirc (Daniel Beer); the Reed–Solomon decoder is AUDENIQ's | ISC | [LICENSES/ISC-quirc.txt](LICENSES/ISC-quirc.txt) |
+| `photo-ocr` | Port of Tesseract 5.3 LSTM recognizer and layout (Google, Tesseract contributors); `src/page/lept.rs` and the preprocessing follow Leptonica (Dan Bloomberg) | Apache-2.0; Leptonica: BSD-2-Clause style | [Apache-2.0](LICENSES/Apache-2.0.txt), [Leptonica](LICENSES/BSD-2-Clause-Leptonica.txt) |
+| `photo-ocr/models/*.traineddata` | `tessdata_fast` models, © Google Inc. ([README](crates/photo-ocr/models/README.md)) | Apache-2.0 | [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
+| `photo-pdf`, `photo-pdf-syntax`, `-interpret`, `-ccitt`, `-jbig2`, `-jpeg2000`, `-cmap`, `-postscript` | hayro 0.8.0 (The Hayro Authors), which itself adapts code from PDFBox, pdf.js and the png crate ([UPSTREAM.md](crates/photo-pdf/UPSTREAM.md), [NOTICE-hayro.md](crates/photo-pdf/NOTICE-hayro.md)) | Apache-2.0 OR MIT | [crates/photo-pdf/LICENSE-APACHE-hayro](crates/photo-pdf/LICENSE-APACHE-hayro), [LICENSE-MIT-hayro](crates/photo-pdf/LICENSE-MIT-hayro) |
+| `photo-pdf-interpret/assets/Foxit*.pfb` | Fonts from PDFium (© 2014 PDFium Authors, Foxit Software) | BSD-3-Clause | [LICENSE_FOXIT](crates/photo-pdf-interpret/assets/LICENSE_FOXIT) |
+| `photo-pdf-interpret/assets/*.icc`, `photo-pdf-jpeg2000/assets/*.icc` | Compact-ICC-Profiles (saucecontrol); `LAB.icc` generated with LittleCMS | CC0-1.0 | [CGATS_LICENSE.txt](crates/photo-pdf-interpret/assets/CGATS_LICENSE.txt), [LICENSE.txt](crates/photo-pdf-jpeg2000/assets/LICENSE.txt) |
+| `photo-pdf-cmap/assets/cmaps.zlib` | Adobe predefined CMaps (cmap-resources) | BSD-3-Clause | [LICENSE.txt](crates/photo-pdf-cmap/assets/LICENSE.txt) |
+| `audeniq-photo/tests/fixtures/pdf/*.pdf` | hayro test suite ([NOTICE.md](crates/audeniq-photo/tests/fixtures/pdf/NOTICE.md)) | Apache-2.0 OR MIT | hayro texts above |
 
-Rust translations change storage, bounds handling, error propagation, work limits and dispatch; they do not remove upstream attribution. No FFmpeg binary, libav* library, GPL-only filter, or native media-codec FFI is linked. Media processing is Rust, including CPU intrinsics; normal Rust system-runtime libraries still apply. Full LGPL text: LICENSE; referenced GPL text: COPYING.GPLv2.
+**IJG acknowledgement** (required by the IJG License for any copy that is
+distributed): *This software is based in part on the work of the Independent
+JPEG Group.*
 
-## Rust dependencies
+### Implemented from specifications (no third-party code)
 
-* Symphonia (MPL-2.0): **optional `reference-codecs` comparison build only**, FLAC/ALAC decoding and FLAC/M4A demuxing. Default builds do not link it. Reference implementations are existing Rust code, not claimed as our ports.
-* JPEG/PNG cover validation is implemented in this repository (`crates/audeniq-qc/src/jpeg.rs`, `crates/audeniq-qc/src/png.rs`, `crates/audeniq-qc/src/inflate.rs`). It accepts and rejects the same files as image 0.24.9 (MIT, with jpeg-decoder 0.3.2 and png 0.17.16), which remains only as a dev-dependency test oracle.
-* JSON reports and the tools' JSON reading use `crates/media-json` (formerly `src/json.rs`), implemented in this repository. Its output is byte-for-byte what serde 1.0.219 / serde_json 1.0.140 (MIT OR Apache-2.0) wrote, including ryu's shortest float digits. f64 digits come from `crates/media-json/src/ryu.rs`, a port of Ryu's `d2d` (Ulf Adams, https://github.com/ulfjack/ryu, Apache-2.0 OR BSL-1.0) with its power-of-5 tables regenerated by `crates/media-json/scripts/gen_ryu_tables.py`; f32 digits come from Rust's own shortest `{:e}` formatting with ties resolved to even. serde_json remains only as a dev-dependency test oracle.
-* SHA-256 (canonical PCM hash; x86 SHA extensions, ARMv8 SHA2 or portable) and the required FLAC PCM MD5 (a format integrity field, not a security authenticator) are implemented in this repository (`crates/media-hash/src/sha256.rs`, FIPS 180-4; `crates/media-hash/src/md5.rs`, RFC 1321). RustCrypto sha2 and md-5 (MIT OR Apache-2.0) remain only as dev-dependency test oracles; the development tools crate uses the in-repository SHA-256, with FFmpeg as its independent hash oracle.
-* IEEE CRC-32 (TTA header/frame checks and the frame-copy round-trip check) is implemented in this repository (`crates/media-hash/src/crc32.rs`; carry-less-multiply folding after Gopal et al., Intel 2009, with AVX-512/AVX2 VPCLMULQDQ, PCLMULQDQ, AArch64 PMULL and slicing-by-8 paths). crc32fast (MIT OR Apache-2.0) remains only as a dev-dependency test oracle.
+* `photo-meta` reads TIFF/EXIF, XMP, ID3v2, RIFF INFO/bext, Vorbis comments,
+  APEv2, QuickTime/ISO BMFF and PNG text from their format specifications.
+  It contains no ExifTool code; it only emits ExifTool-compatible tag and
+  group names (each format's own field names, plus the few ExifTool aliases
+  marked in the tables) so existing callers see the same keys.
+* `audeniq-qc` WavPack decoding follows the WavPack format as defined by
+  libwavpack; no libwavpack source is included (its BSD-3-Clause notice is
+  kept in [LICENSES/BSD-3-Clause-libwavpack.txt](LICENSES/BSD-3-Clause-libwavpack.txt)
+  as a courtesy).
+* `photo-icc` profile parsing, `photo-png`, `media-video` (MP4/QuickTime),
+  `media-adm` (ITU-R BS.2076/BS.2088), `media-hash` (RFC 1321, FIPS 180-4,
+  CRC folding after Gopal et al.) and `media-resample` are AUDENIQ's.
 
-Cargo.lock pins transitive dependencies. Dependency sources/license notices remain available through crates.io. Linking into other applications requires complying with each applicable license; no claim is made that optimization removes copyleft obligations.
+External programs (FFmpeg, ExifTool, zbarimg, Tesseract, Pillow/LittleCMS,
+image, serde_json, RustCrypto, crc32fast, Symphonia) appear only as test
+oracles, benchmark baselines or dev-dependencies. They are not linked into
+the default build and none of their code is in the engine.
 
-`crates/audeniq-qc/src/m4a.rs` and `crates/audeniq-qc/src/msb.rs` are AUDENIQ-specific Rust implementations of the container tables and cached bounded bit reader, rather than copied Symphonia source. The default build has no third-party crates; the `reference-codecs` build adds Symphonia, and the Rust standard library still applies.
+## FFmpeg: what remains
+
+All FFmpeg-derived *code* has been replaced (see "Clean-room replacements").
+What remains is table **data** of the MPEG standards, transcribed from FFmpeg
+n6.1.1 (pinned commit `12c589a37d093cc55618f8377b092dc21416806f`). These four
+files keep `SPDX-License-Identifier: LGPL-2.1-or-later` and FFmpeg's
+attribution:
+
+* `crates/media-aac/src/tables.rs`: AAC Huffman codebooks, scalefactor band offsets and TNS band limits (ISO/IEC 14496-3) from `libavcodec/aactab.c`; Oded Shimon (2005-2006), Maxim Gavrilov (2006-2007).
+* `crates/media-aac/src/sbr_tables.rs`, `crates/media-aac/src/ps_tables.rs`: SBR and parametric-stereo Huffman codebooks, start-frequency offsets, QMF prototype window, noise table and hybrid-band maps (ISO/IEC 14496-3) from `libavcodec/aacsbrdata.h`, `sbrdsp_template.c`, `aacpsdata.c`; Robert Swain (2008-2009), Alex Converse (2008-2010). The window's c(384) and c(512) carry the standard's signs.
+* `crates/media-mp3/src/tables.rs`: Layer III Huffman codebooks, scale-factor band widths, pretab, slen/LSF tables (ISO/IEC 11172-3, 13818-3) from `libavcodec/mpegaudiodec_common.c`, and the synthesis window from `mpegaudiodsp_data.c`; Fabrice Bellard (2001-2003).
+
+The values are the standards' normative tables, but because these files were
+produced from FFmpeg's sources they are kept under LGPL-2.1-or-later. To make
+the engine entirely AUDENIQ-licensed, regenerate them from the ISO/IEC texts
+(or another permissively licensed transcription) and check they are
+identical; then drop LGPL from `media-aac` and `media-mp3`. Until then, a
+binary that is distributed outside AUDENIQ must meet LGPL-2.1 (offer the
+source of these files and allow relinking); internal use needs nothing.
+
+No FFmpeg binary, libav* library or native media-codec FFI is linked.
 
 ## Clean-room replacements
 
-Modules once derived from the sources above, rewritten from public
+
+Modules once derived from FFmpeg, rewritten from public
 specifications without the derived code (each verified against independent
 oracles: FFmpeg's binaries, conformance references, the previous output):
 
@@ -86,57 +138,32 @@ oracles: FFmpeg's binaries, conformance references, the previous output):
   0.5741, al_sbr_ps_06 0.5001, CT_DecoderCheck 0.2844 LSB; al_sbr_ps_04
   0.2772 against 0.2750), at the same speed.
 
-## libwavpack BSD-3-Clause notice
 
-The WavPack decoder follows the WavPack format as defined by libwavpack
-(https://github.com/dbry/WavPack); no libwavpack source is included.
+## Rust dependencies
 
-```
-                  Copyright (c) 1998 - 2025 David Bryant
-                          All rights reserved.
+* Symphonia (MPL-2.0): **optional `reference-codecs` comparison build only**, FLAC/ALAC decoding and FLAC/M4A demuxing. Default builds do not link it. Reference implementations are existing Rust code, not claimed as our ports.
+* JPEG/PNG cover validation is implemented in this repository (`crates/audeniq-qc/src/jpeg.rs`, `crates/audeniq-qc/src/png.rs`, `crates/audeniq-qc/src/inflate.rs`). It accepts and rejects the same files as image 0.24.9 (MIT, with jpeg-decoder 0.3.2 and png 0.17.16), which remains only as a dev-dependency test oracle.
+* JSON reports and the tools' JSON reading use `crates/media-json` (formerly `src/json.rs`), implemented in this repository. Its output is byte-for-byte what serde 1.0.219 / serde_json 1.0.140 (MIT OR Apache-2.0) wrote, including ryu's shortest float digits. f64 digits come from `crates/media-json/src/ryu.rs`, a port of Ryu's `d2d` (Ulf Adams, https://github.com/ulfjack/ryu, Apache-2.0 OR BSL-1.0) with its power-of-5 tables regenerated by `crates/media-json/scripts/gen_ryu_tables.py`; f32 digits come from Rust's own shortest `{:e}` formatting with ties resolved to even. serde_json remains only as a dev-dependency test oracle.
+* SHA-256 (canonical PCM hash; x86 SHA extensions, ARMv8 SHA2 or portable) and the required FLAC PCM MD5 (a format integrity field, not a security authenticator) are implemented in this repository (`crates/media-hash/src/sha256.rs`, FIPS 180-4; `crates/media-hash/src/md5.rs`, RFC 1321). RustCrypto sha2 and md-5 (MIT OR Apache-2.0) remain only as dev-dependency test oracles; the development tools crate uses the in-repository SHA-256, with FFmpeg as its independent hash oracle.
+* IEEE CRC-32 (TTA header/frame checks and the frame-copy round-trip check) is implemented in this repository (`crates/media-hash/src/crc32.rs`; carry-less-multiply folding after Gopal et al., Intel 2009, with AVX-512/AVX2 VPCLMULQDQ, PCLMULQDQ, AArch64 PMULL and slicing-by-8 paths). crc32fast (MIT OR Apache-2.0) remains only as a dev-dependency test oracle.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
+Cargo.lock pins transitive dependencies. Dependency sources/license notices remain available through crates.io. Linking into other applications requires complying with each applicable license.
 
-    * Redistributions of source code must retain the above copyright notice,
-      this list of conditions and the following disclaimer.
-    * Redistributions in binary form must reproduce the above copyright notice,
-      this list of conditions and the following disclaimer in the
-      documentation and/or other materials provided with the distribution.
-    * Neither the name of the copyright holder nor the names of its
-      contributors may be used to endorse or promote products derived from
-      this software without specific prior written permission.
+`crates/audeniq-qc/src/m4a.rs` and `crates/media-bits/src/msb.rs` are AUDENIQ-specific Rust implementations of the container tables and cached bounded bit reader, rather than copied Symphonia source. The audio engine's default build has no third-party crates; the `reference-codecs` build adds Symphonia, and the Rust standard library still applies.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
+Third-party crates that the default build still links (hayro's
+dependencies such as kurbo, skrifa, vello_cpu, moxcms, pic-scale, and
+mimalloc) are all permissively licensed (MIT, Apache-2.0, BSD, Zlib,
+Unicode-3.0). A distributed binary must carry their notices too; generate
+them with `cargo about` or `cargo deny` at that time.
 
-## libebur128 MIT notice (historical: no longer used)
+## History
 
-Copyright (c) 2011 Jan Kokemüller
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+* FFmpeg-derived code (TTA, WavPack, FLAC encoder/decoder, ALAC, the
+  K-weighting coefficients from `libavfilter/ebur128.c`, SBR/PS decoding)
+  was LGPL-2.1-or-later until the clean-room rewrites above. The libebur128
+  MIT notice that came with the K-weighting equations is no longer needed.
+* `media-hash` and `media-json` were labelled LGPL because they lived in the
+  audio engine; they were always AUDENIQ's own code.
+* `COPYING.GPLv2` was removed: LGPL-2.1 does not require the GPL text, and
+  no GPL code is present.

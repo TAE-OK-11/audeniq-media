@@ -2,8 +2,9 @@
 
 The MD5, SHA-256, CRC-32 and fused MD5+SHA-256 kernels were written for the
 audio engine (formerly `src/md5.rs`, `src/sha256.rs`, `src/crc32.rs`,
-`src/hash_fused.rs` in TAE-OK-11/audeniq-qc) and are licensed
-LGPL-2.1-or-later; the license is reproduced in LICENSE.
+`src/hash_fused.rs` in TAE-OK-11/audeniq-qc). They are AUDENIQ's own code
+(RFC 1321, FIPS 180-4, CRC folding after Gopal et al.) under the
+repository's proprietary license (`LICENSE` at the root).
 
 When audeniq-photo was merged into this repository, its `photo-hash` copy of
 these files was replaced by this crate so both engines build the same code.

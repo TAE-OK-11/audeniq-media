@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LicenseRef-AUDENIQ-Proprietary
 // AUDENIQ: fused 50ms meters, four-scalar gate history, fixed-size histogram,
 // explicit null for silence, polyphase true peak, reusable decode buffers.
 use crate::{

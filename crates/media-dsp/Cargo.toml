@@ -4,7 +4,8 @@ description = "FFT, DCT-IV and dot-product kernels for the AUDENIQ media codecs,
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license = "LGPL-2.1-or-later"
+license.workspace = true
+publish = false
 
 # Not the workspace lints: `unsafe` is denied crate-wide and allowed only in
 # `simd`, which calls the AVX2 builds after runtime detection (as in

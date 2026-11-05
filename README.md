@@ -103,6 +103,10 @@ cargo install --locked --git https://github.com/TAE-OK-11/audeniq-media --rev <r
 
 ## 라이선스
 
-크레이트마다 `Cargo.toml`의 `license`를 따릅니다. 오디오 엔진과 공통 크레이트는 LGPL-2.1-or-later
-([LICENSE](LICENSE), [COPYING.GPLv2](COPYING.GPLv2), 출처는 [THIRD_PARTY.md](THIRD_PARTY.md)),
-photo 크레이트는 워크스페이스 기본값(`UNLICENSED`) 또는 각 업스트림 라이선스(hayro 계열 Apache-2.0 OR MIT 등)입니다.
+비공개 저장소입니다. AUDENIQ가 직접 작성한 코드는 독점 라이선스(`LicenseRef-AUDENIQ-Proprietary`, [LICENSE](LICENSE))이고,
+모든 크레이트가 `publish = false`입니다. 외부 코드에서 온 부분은 원래 라이선스를 유지합니다.
+
+- FFmpeg 유래 **코드**는 모두 클린룸으로 바뀌었고, 남은 것은 MPEG 표준 표 데이터 4개 파일(`media-aac`의 `tables.rs`·`sbr_tables.rs`·`ps_tables.rs`, `media-mp3`의 `tables.rs`, LGPL-2.1-or-later)뿐입니다.
+- 포팅·병합한 외부 코드: hayro(`photo-pdf*`, Apache-2.0 OR MIT), zlib-rs(`photo-deflate`, Zlib), libjpeg-turbo/IJG(`photo-jpeg`), LittleCMS(`photo-icc`, MIT), quirc(`photo-qr`, ISC), Tesseract·Leptonica와 tessdata_fast 모델(`photo-ocr`, Apache-2.0·BSD-2), Ryu(`media-json`, Apache-2.0 OR BSL-1.0).
+
+크레이트별 정리, 필요한 고지, 남은 과제는 [THIRD_PARTY.md](THIRD_PARTY.md), 라이선스 원문은 [LICENSES/](LICENSES)에 있습니다.

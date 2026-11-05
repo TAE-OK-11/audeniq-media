@@ -1,5 +1,14 @@
-//! Metadata extraction modelled on ExifTool: the same tag names and
-//! family-1 group names (`-G1`), numeric values as with `-n`.
+//! Metadata extraction with ExifTool-compatible output: the same tag names
+//! and family-1 group names (`-G1`), numeric values as with `-n`, so that
+//! callers which used ExifTool see the same keys.
+//!
+//! The readers are written from the container and metadata formats (TIFF
+//! 6.0 / EXIF (CIPA DC-008), XMP (ISO 16684-1), ID3v2.2–2.4, RIFF INFO and
+//! EBU bext, Vorbis comments, APEv2, ISO BMFF / QuickTime item lists, PNG
+//! text chunks); no ExifTool code is used. The name tables map each
+//! format's field to its output name: the format's own field name or
+//! description in CamelCase, except for a few aliases ExifTool chose
+//! (marked where they occur), kept so the output stays compatible.
 //!
 //! Covered containers are the ones the backend accepts: JPEG and PNG
 //! images; WAV (RIFF/BWF), AIFF, FLAC, MP4/M4A, WavPack and TTA audio.

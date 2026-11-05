@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LicenseRef-AUDENIQ-Proprietary
 //! AAC-LC decoder (ISO/IEC 14496-3 4.4–4.6) for music-video sound checks:
 //! single / pair / LFE elements, all window sequences and shapes, M/S and
 //! intensity stereo, perceptual noise substitution, temporal noise shaping
@@ -463,7 +463,7 @@ impl Decoder {
                 6 => {
                     let mut n = b.get(4)? as usize;
                     if n == 15 {
-                        n += b.get(8)? as usize - 1;
+                        n = n + b.get(8)? as usize - 1;
                     }
                     if n > 0 {
                         self.fill(&b, n, &elements)?;
@@ -532,6 +532,13 @@ impl Decoder {
                 &self.core[first]
             };
             let stereo_out = pair || (ps && id == 0);
+            if oc + 1 + usize::from(stereo_out) > total {
+                // More channels than the configuration (a damaged frame).
+                out.truncate(start);
+                return Err(Error::Invalid(
+                    "AAC elements beyond the channel configuration",
+                ));
+            }
             s.apply(
                 id,
                 [&self.core[first], core_r],
@@ -1247,7 +1254,10 @@ mod tests {
             let mut d = Decoder::new(&he_config(object, if pair { 2 } else { 1 })).unwrap();
             let mut out = Vec::new();
             let (mut ok, mut started) = (0, 0);
-            for unit in 0..4000 {
+            // A damaged payload switches SBR off until the next header, so
+            // random data keeps it running only now and then: enough units
+            // that every case still exercises the HF generator.
+            for unit in 0..16000 {
                 let mut w = Writer::new();
                 let elements = if pair { 1 } else { 0 };
                 w.put(elements, 3);

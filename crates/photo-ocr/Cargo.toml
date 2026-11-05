@@ -4,7 +4,8 @@ description = "OCR: port of Tesseract's LSTM line recognizer (tessdata_fast mode
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0"
+license = "LicenseRef-AUDENIQ-Proprietary AND Apache-2.0 AND BSD-2-Clause"
+publish = false
 
 [dependencies]
 photo-core.workspace = true

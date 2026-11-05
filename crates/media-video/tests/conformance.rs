@@ -92,3 +92,40 @@ fn signalling_variants() {
         check_pcm(&format!("CT_DecoderCheck/{s}"), &bytes[at..], 2);
     }
 }
+
+/// A stream looped onto itself (`ffmpeg -stream_loop 1 -c copy`): at the
+/// splice the delta-coded SBR/PS state and the header in force no longer
+/// match the frames, which must not turn into a boosted high band.
+#[test]
+fn spliced_streams_stay_in_range() {
+    for stream in ["al_sbr_cm_48_2.mp4", "al_sbr_ps_06_new.mp4"] {
+        let Some(src) = samples().map(|d| d.join(stream)).filter(|p| p.exists()) else {
+            eprintln!("skip {stream}: not in FATE_SAMPLES");
+            continue;
+        };
+        let out = std::env::temp_dir().join(format!("spliced-{}-{stream}", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-stream_loop", "1", "-i"])
+            .arg(&src)
+            .args(["-c", "copy"])
+            .arg(&out)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skip {stream}: ffmpeg unavailable");
+            continue;
+        }
+        let peak = |p: &Path| {
+            let (_, _, pcm) = media_video::decode_sound(p).unwrap();
+            pcm.iter().fold(0f32, |m, &x| m.max(x.abs()))
+        };
+        let (clean, spliced) = (peak(&src), peak(&out));
+        let _ = std::fs::remove_file(&out);
+        // The splice itself clicks in the core (FFmpeg's decoder peaks at
+        // the same 0.69 on the PS stream), but nothing may clip: the old
+        // failure boosted the high band to peaks of ~10^4.
+        assert!(
+            spliced < 1.0,
+            "{stream}: spliced peak {spliced} against {clean}"
+        );
+    }
+}

@@ -782,6 +782,20 @@ fn read_envelope(
                 env[k] = env[k - 1] + step * huff(b, f_table)?;
             }
         }
+        // Quantized levels outside the coded range (0..=127 in 1.5 dB
+        // steps, 0..=63 in 3 dB steps; a balance 0..=24 or 0..=48 around
+        // its centre) cannot come from an encoder: a damaged or spliced
+        // stream drifted there through the delta coding. Using them would
+        // multiply the high band by up to 2^120: the payload is damaged.
+        let max = match (balance, fine) {
+            (false, true) => 127,
+            (false, false) => 63,
+            (true, true) => 48,
+            (true, false) => 24,
+        };
+        if env[..n].iter().any(|&e| !(0..=max).contains(&e)) {
+            return Err(Error::Invalid("SBR envelope out of range"));
+        }
         last.envelope = *env;
         last.high = high;
     }
@@ -816,6 +830,12 @@ fn read_noise(
             for k in 1..n {
                 noise[k] = noise[k - 1] + step * huff(b, f_table)?;
             }
+        }
+        // Noise floors are coded 0..=30 (a balance 0..=24); see the
+        // envelope check.
+        let max = if balance { 24 } else { 30 };
+        if noise[..n].iter().any(|&e| !(0..=max).contains(&e)) {
+            return Err(Error::Invalid("SBR noise floor out of range"));
         }
         last.noise = *noise;
     }
@@ -945,14 +965,21 @@ impl Sbr {
 
     /// The SBR extension payload of a fill element (4.5.2.8.1) for the
     /// element `id` before it: CRC bits, an optional header, the frame
-    /// data. A damaged payload leaves the frame without data.
+    /// data. A damaged payload turns SBR off until the next header.
     pub(crate) fn read(&mut self, b: &mut Bits, crc: bool, id: u32, ps_allowed: bool) {
         for ch in &mut self.ch {
             ch.frame = None;
         }
         if self.read_payload(b, crc, id, ps_allowed).is_err() {
+            // The payload did not parse, or decoded to levels no encoder
+            // writes: the header in force no longer describes the stream
+            // (a splice, a lost header) and the delta-coded state is
+            // unusable. Drop both and stay at the core band until the next
+            // SBR header; the filter banks keep running.
+            self.header = None;
+            self.bands = None;
             for ch in &mut self.ch {
-                ch.frame = None;
+                ch.reset();
             }
         }
     }

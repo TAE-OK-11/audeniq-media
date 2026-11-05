@@ -314,7 +314,10 @@ impl Ps {
         let used = match self.parse(&mut sub) {
             Ok(()) if sub.pos() - start <= bits_left => sub.pos() - start,
             _ => {
+                // As for SBR: a damaged payload means the PS header in
+                // force may not describe the stream; wait for the next.
                 self.params = None;
+                self.header = None;
                 bits_left
             }
         };

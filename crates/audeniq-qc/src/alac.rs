@@ -179,7 +179,7 @@ impl Decoder {
                 ID_FIL => {
                     let mut count = b.get(4)? as usize;
                     if count == 15 {
-                        count += b.get(8)? as usize - 1;
+                        count = count + b.get(8)? as usize - 1;
                     }
                     b.skip(count * 8)?;
                 }
@@ -326,22 +326,47 @@ struct Golomb {
     max_run: u32,
 }
 
-/// Leading ones of the next (up to) 32 bits, and those bits left-aligned.
+/// The next (up to) 32 bits left-aligned, and how many of them are real.
 #[inline(always)]
-fn window(b: &mut Bits) -> Result<u32> {
+fn window(b: &mut Bits) -> Result<(u32, u32)> {
     // A full cache keeps the peek on its fast path.
     b.refill();
+    if let Ok(w) = b.peek(32) {
+        return Ok((w, 32));
+    }
     let n = b.left().min(32) as u32;
     if n == 0 {
         return Err(Error::Invalid("ALAC residuals end early"));
     }
-    Ok(b.peek(n)? << (32 - n))
+    Ok((b.peek(n)? << (32 - n), n))
+}
+
+/// Consume `len` bits of a [`window`] that showed `n`: past them the read
+/// fails exactly as a plain skip would.
+#[inline(always)]
+fn consume(b: &mut Bits, len: u32, n: u32) -> Result<()> {
+    if len <= n {
+        b.advance(len);
+        Ok(())
+    } else {
+        b.skip(len as usize).map_err(Into::into)
+    }
 }
 
 impl Golomb {
     /// `out.len()` residuals; `max_bits` is the escape width.
     #[inline(always)]
     fn decode(&self, b: &mut Bits, out: &mut [i32], max_bits: u32) -> Result<()> {
+        // Work on a local copy so the reader's state stays in registers
+        // across the loop instead of round-tripping through `*b`.
+        let mut local = b.clone();
+        let r = self.decode_local(&mut local, out, max_bits);
+        *b = local;
+        r
+    }
+
+    #[inline(always)]
+    fn decode_local(&self, b: &mut Bits, out: &mut [i32], max_bits: u32) -> Result<()> {
         const QB_SHIFT: u32 = 9;
         let n = out.len();
         let mut mb = self.mb0;
@@ -393,32 +418,28 @@ impl Golomb {
     /// as 2 or more (a truncated binary code of m = 2ᵏ − 1).
     #[inline(always)]
     fn value(b: &mut Bits, k: u32, max_bits: u32) -> Result<u32> {
-        let w = window(b)?;
+        let (w, n) = window(b)?;
         let prefix = (!w).leading_zeros();
         if prefix >= 9 {
             b.skip(9)?;
             return b.get(max_bits).map_err(Into::into);
         }
         if k <= 1 {
-            b.skip(prefix as usize + 1)?;
+            consume(b, prefix + 1, n)?;
             return Ok(prefix);
         }
         let v = (w << (prefix + 1)) >> (32 - k);
         let m = (1u32 << k) - 1;
-        if v >= 2 {
-            b.skip((prefix + 1 + k) as usize)?;
-            Ok(prefix * m + v - 1)
-        } else {
-            b.skip((prefix + k) as usize)?;
-            Ok(prefix * m)
-        }
+        let more = u32::from(v >= 2);
+        consume(b, prefix + k + more, n)?;
+        Ok(prefix * m + (v.wrapping_sub(1) & more.wrapping_neg()))
     }
 
     /// A zero-run length: the same code with divisor `m`, escaping to 16
     /// raw bits.
     #[inline(always)]
     fn run(b: &mut Bits, k: u32, m: u32) -> Result<u32> {
-        let w = window(b)?;
+        let (w, n) = window(b)?;
         let prefix = (!w).leading_zeros();
         if prefix >= 9 {
             b.skip(9)?;
@@ -429,13 +450,11 @@ impl Golomb {
         } else {
             (w << (prefix + 1)) >> (32 - k)
         };
-        if v >= 2 {
-            b.skip((prefix + 1 + k) as usize)?;
-            Ok(prefix * m + v - 1)
-        } else {
-            b.skip((prefix + k) as usize)?;
-            Ok(prefix * m)
-        }
+        let more = u32::from(v >= 2);
+        consume(b, prefix + k + more, n)?;
+        Ok(prefix
+            .wrapping_mul(m)
+            .wrapping_add(v.wrapping_sub(1) & more.wrapping_neg()))
     }
 }
 

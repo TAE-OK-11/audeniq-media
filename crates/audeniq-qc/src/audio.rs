@@ -232,10 +232,15 @@ impl Pcm {
             return Err(Error::Invalid("WAV signature"));
         }
         let rf = &h[..4] != b"RIFF";
-        let mut end = if rf { len } else { u32le(&h[4..]) as u64 + 8 };
-        if end > len || end < 12 {
-            return Err(Error::Invalid("truncated RIFF"));
-        }
+        // The RIFF size repeats what the chunks say, and writers leave it 0,
+        // 0xFFFFFFFF, stale after appending a chunk, or counting a final pad
+        // byte they did not write. Within the file it bounds the walk (bytes
+        // after it are ignored); past the end of the file or too small for a
+        // chunk, the file's length does. Each chunk, the audio included,
+        // must still be whole: a truncated file is still refused.
+        let declared = u32le(&h[4..]) as u64 + 8;
+        let mut stale = !rf && (declared > len || declared < 20);
+        let mut end = if rf || stale { len } else { declared };
         let mut fmt = None;
         let mut data = None;
         let mut ds64 = None;
@@ -257,10 +262,21 @@ impl Pcm {
                 if &ch[..4] != b"data" {
                     return Err(Error::Unsupported("RF64 ds64 table chunks"));
                 }
+                if !rf {
+                    // A streamed WAV: without the size, a cut-off file
+                    // cannot be told from a whole one.
+                    return Err(Error::Unsupported("WAV without a data size (streamed)"));
+                }
                 size = ds64.ok_or(Error::Invalid("missing ds64"))?;
             }
             if size > end - body {
-                return Err(Error::Invalid("truncated WAV chunk"));
+                if !rf && !stale && size <= len - body {
+                    // A chunk past a RIFF size that was not updated.
+                    stale = true;
+                    end = len;
+                } else {
+                    return Err(Error::Invalid("truncated WAV chunk"));
+                }
             }
             match &ch[..4] {
                 b"ds64" => {
@@ -331,6 +347,11 @@ impl Pcm {
                 _ => (),
             }
             pos = body + size + (size & 1);
+            if pos == len + 1 && end >= len && size & 1 == 1 {
+                // The last chunk's pad byte, left out at the end of the file.
+                end = len;
+                pos = len;
+            }
             if pos > end {
                 return Err(Error::Invalid("missing chunk pad"));
             }
@@ -362,10 +383,11 @@ impl Pcm {
         if !aifc && &h[8..] != b"AIFF" {
             return Err(Error::Invalid("AIFF signature"));
         }
-        let end = u32be(&h[4..]) as u64 + 8;
-        if end > len || end < 12 {
-            return Err(Error::Invalid("truncated AIFF"));
-        }
+        // As for the RIFF size: a FORM size past the file or too small for
+        // a chunk is replaced by the file's length; chunks must be whole.
+        let declared = u32be(&h[4..]) as u64 + 8;
+        let mut stale = declared > len || declared < 20;
+        let mut end = if stale { len } else { declared };
         let mut pos = 12;
         let mut fmt = None;
         let mut data = None;
@@ -384,7 +406,12 @@ impl Pcm {
             let size = u32be(&ch[4..]) as u64;
             let body = pos + 8;
             if size > end - body {
-                return Err(Error::Invalid("truncated AIFF chunk"));
+                if !stale && size <= len - body {
+                    stale = true;
+                    end = len;
+                } else {
+                    return Err(Error::Invalid("truncated AIFF chunk"));
+                }
             }
             match &ch[..4] {
                 b"COMM" => {
@@ -436,6 +463,10 @@ impl Pcm {
                 _ => (),
             }
             pos = body + size + (size & 1);
+            if pos == len + 1 && end >= len && size & 1 == 1 {
+                end = len;
+                pos = len;
+            }
             if pos > end {
                 return Err(Error::Invalid("AIFF pad"));
             }

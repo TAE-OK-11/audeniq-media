@@ -731,3 +731,97 @@ fn alac_sample_entry_legacy_depth_is_accepted_and_decoded() {
     ffmpeg(Some(&src), &aac, "aac");
     assert!(pcm_sha256(&aac, Limits::default(), Backend::detect()).is_err());
 }
+
+/// The RIFF/FORM size repeats what the chunks say and writers get it wrong
+/// (0, 0xFFFFFFFF, stale after an appended chunk, counting a final pad byte
+/// they left out): such files decode like the correct ones. A data chunk
+/// that the file does not hold, a streamed (size-less) data chunk and a
+/// partial frame are still refused, so a cut-off file never passes.
+#[test]
+fn wav_and_aiff_size_fields_are_tolerated_but_truncation_is_not() {
+    let d = Dir::new();
+    let le32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let check = |name: &str, bytes: &[u8], expected: Option<&str>| {
+        let p = d.0.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        let result = pcm_sha256(&p, Limits::default(), Backend::detect());
+        match expected {
+            Some(hash) => assert_eq!(result.map(|r| r.1).ok().as_deref(), Some(hash), "{name}"),
+            None => assert!(result.is_err(), "{name}: {result:?}"),
+        }
+    };
+    // Stereo 16-bit (even data) and mono 24-bit with an odd frame count.
+    for (codec, layout) in [("pcm_s16le", "stereo"), ("pcm_s24le", "mono")] {
+        let wav = d.0.join(format!("{codec}.wav"));
+        assert!(Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i"])
+            .arg("aevalsrc=0.5*sin(2*PI*441*t):s=44100:d=0.50002")
+            .args([
+                "-ac",
+                if layout == "mono" { "1" } else { "2" },
+                "-c:a",
+                codec
+            ])
+            .args(["-bitexact", "-map_metadata", "-1"])
+            .arg(&wav)
+            .status()
+            .unwrap()
+            .success());
+        let good = std::fs::read(&wav).unwrap();
+        let (_, hash, _) = pcm_sha256(&wav, Limits::default(), Backend::Scalar).unwrap();
+        let data = good.windows(4).position(|w| w == b"data").unwrap();
+        let size = u32::from_le_bytes(good[data + 4..data + 8].try_into().unwrap()) as usize;
+        for (name, riff) in [
+            ("riff0", 0u32),
+            ("riff_max", u32::MAX),
+            ("riff_big", good.len() as u32 + 999),
+        ] {
+            let mut b = good.clone();
+            le32(&mut b, 4, riff);
+            check(&format!("{codec}-{name}.wav"), &b, Some(&hash));
+        }
+        // A chunk appended without updating the RIFF size.
+        let mut b = good.clone();
+        if size % 2 == 1 && b.len() == data + 8 + size {
+            b.push(0);
+        }
+        b.extend_from_slice(b"LIST\x04\x00\x00\x00INFO");
+        check(&format!("{codec}-appended.wav"), &b, Some(&hash));
+        if size % 2 == 1 {
+            // The final pad byte left out, the RIFF size with and without it.
+            let body = &good[..data + 8 + size];
+            for extra in [0u32, 1] {
+                let mut b = body.to_vec();
+                le32(&mut b, 4, (body.len() - 8) as u32 + extra);
+                check(&format!("{codec}-nopad{extra}.wav"), &b, Some(&hash));
+            }
+        }
+        // Still refused: cut-off data (at a frame boundary or not), a
+        // streamed data size, a partial final frame.
+        let end = data + 8 + size;
+        for cut in [end - 6, end - 1, data + 8 + 600] {
+            check(&format!("{codec}-cut{cut}.wav"), &good[..cut], None);
+        }
+        let mut b = good.clone();
+        le32(&mut b, data + 4, u32::MAX);
+        check(&format!("{codec}-streamed.wav"), &b, None);
+        let mut b = good[..end - 1].to_vec();
+        le32(&mut b, data + 4, size as u32 - 1);
+        check(&format!("{codec}-partial.wav"), &b, None);
+    }
+    // AIFF: a wrong FORM size decodes, a cut-off SSND does not.
+    let aiff = d.0.join("a.aiff");
+    ffmpeg(None, &aiff, "pcm_s16be");
+    let good = std::fs::read(&aiff).unwrap();
+    let (_, hash, _) = pcm_sha256(&aiff, Limits::default(), Backend::Scalar).unwrap();
+    for (name, form) in [
+        ("form0", 0u32),
+        ("formbig", good.len() as u32 + 999),
+        ("formsmall", 100),
+    ] {
+        let mut b = good.clone();
+        b[4..8].copy_from_slice(&form.to_be_bytes());
+        check(&format!("{name}.aiff"), &b, Some(&hash));
+    }
+    check("cut.aiff", &good[..good.len() - 10], None);
+}

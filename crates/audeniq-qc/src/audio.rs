@@ -30,6 +30,33 @@ pub struct AudioReader {
     limits: Limits,
     decoded: u64,
 }
+/// Where the audio starts: after an ID3v2 tag at the front of the file
+/// (taggers add one to FLAC and TTA files; libFLAC and the TTA format skip
+/// it), else 0. The file is left at that position.
+pub(crate) fn id3v2_end(f: &mut File, len: u64) -> Result<u64> {
+    let mut h = [0u8; 10];
+    f.rewind()?;
+    if len < 10 {
+        return Ok(0);
+    }
+    f.read_exact(&mut h)?;
+    // "ID3", major version 2..=4, revision, flags, 28-bit syncsafe size.
+    let start = if &h[..3] == b"ID3" && (2..=4).contains(&h[3]) && h[6..].iter().all(|&b| b < 0x80)
+    {
+        let size = h[6..].iter().fold(0u64, |s, &b| s << 7 | u64::from(b));
+        let footer = if h[3] == 4 && h[5] & 0x10 != 0 { 10 } else { 0 };
+        let end = 10 + size + footer;
+        if end.saturating_add(12) > len {
+            return Err(Error::Invalid("ID3v2 tag larger than the file"));
+        }
+        end
+    } else {
+        0
+    };
+    f.seek(SeekFrom::Start(start))?;
+    Ok(start)
+}
+
 impl AudioReader {
     pub fn open(path: &Path, limits: Limits) -> Result<Self> {
         limits.check()?;
@@ -41,9 +68,16 @@ impl AudioReader {
         if meta.len() > limits.max_file_bytes {
             return Err(Error::Limit("input bytes"));
         }
+        let start = id3v2_end(&mut f, meta.len())?;
         let mut magic = [0u8; 12];
         f.read_exact(&mut magic)?;
-        f.rewind()?;
+        f.seek(SeekFrom::Start(start))?;
+        if start != 0 && &magic[..4] != b"fLaC" && &magic[..4] != b"TTA1" {
+            // Only FLAC (libFLAC skips it) and TTA allow a leading ID3v2 tag.
+            return Err(Error::Unsupported(
+                "an ID3v2 tag ahead of the audio is accepted for FLAC and TTA only",
+            ));
+        }
         let (spec, source) =
             if &magic[..4] == b"RIFF" || &magic[..4] == b"RF64" || &magic[..4] == b"BW64" {
                 let p = Pcm::wav(f, &limits)?;

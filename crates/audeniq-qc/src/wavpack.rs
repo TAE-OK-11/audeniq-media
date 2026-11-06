@@ -131,7 +131,10 @@ impl Wavpack {
         if self.frames == self.spec.frames.unwrap() {
             // Recognized trailing tags only; do not scan arbitrary bytes for blocks.
             if self.position < len {
-                self.validate_tail(len, limits)?;
+                self.trailing_metadata(len, limits)?;
+                if self.position < len {
+                    self.validate_tail(len, limits)?;
+                }
                 self.position = len;
             }
             return Ok(());
@@ -252,6 +255,57 @@ impl Wavpack {
         self.frames += n as u64;
         self.position += size;
         Ok(())
+    }
+    /// Metadata-only blocks after the last sample: `wavpack -m` stores its
+    /// MD5 sum in one, and a WAV source's trailing chunks go there too.
+    /// They carry no samples and no audio sub-blocks (anything else is
+    /// rejected), and their block checksum is verified when flagged.
+    fn trailing_metadata(&mut self, len: u64, limits: &Limits) -> Result<()> {
+        for _ in 0..16 {
+            if len - self.position < 32 {
+                return Ok(());
+            }
+            limits.check()?;
+            self.file.seek(SeekFrom::Start(self.position))?;
+            let mut h = [0u8; 32];
+            self.file.read_exact(&mut h)?;
+            if &h[..4] != b"wvpk" {
+                return Ok(());
+            }
+            let version = u16::from_le_bytes([h[8], h[9]]);
+            if !(0x402..=0x410).contains(&version) {
+                return Err(Error::Invalid("WavPack header"));
+            }
+            if le32(&h[20..]) != 0 {
+                return Err(Error::Invalid("WavPack samples past the declared count"));
+            }
+            let size = le32(&h[4..]) as u64 + 8;
+            if size < 32 || size > len - self.position || size > limits.max_packet_bytes as u64 {
+                return Err(Error::Invalid("WavPack block length"));
+            }
+            let mut data = vec![0; size as usize - 32];
+            self.file.read_exact(&mut data)?;
+            let mut checked = false;
+            for block in SubBlocks::new(&data) {
+                let (start, id, d) = block?;
+                match id {
+                    ID_CHECKSUM => {
+                        checksum(&h, &data[..start], d)?;
+                        checked = true;
+                    }
+                    // Padding, encoder information, optional data (the MD5
+                    // sum, RIFF trailer, configuration).
+                    0 | 1 => (),
+                    _ if id & 0x20 != 0 => (),
+                    _ => return Err(Error::Invalid("WavPack audio data past the declared count")),
+                }
+            }
+            if le32(&h[24..]) & HAS_CHECKSUM != 0 && !checked {
+                return Err(Error::Invalid("missing WavPack block checksum"));
+            }
+            self.position += size;
+        }
+        Err(Error::Limit("WavPack trailing blocks"))
     }
     fn validate_tail(&mut self, len: u64, limits: &Limits) -> Result<()> {
         let mut end = len;

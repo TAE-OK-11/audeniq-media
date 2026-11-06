@@ -183,7 +183,9 @@ fn reference_wavpack_modes_decode_to_the_source() {
                 .success());
             let (_, expected, frames) =
                 pcm_sha256(&src, Limits::default(), Backend::Scalar).unwrap();
-            for mode in ["-f", "-h", "-hh", "-x3", "-hhx6"] {
+            // -m stores an MD5 sum in a metadata-only block after the last
+            // samples.
+            for mode in ["-f", "-h", "-hh", "-x3", "-hhx6", "-m", "-hhm"] {
                 let p = d.0.join(format!("{name}-{channels}{mode}.wv"));
                 assert!(Command::new("wavpack")
                     .args(["-q", "-y", mode])
@@ -210,6 +212,94 @@ fn reference_wavpack_modes_decode_to_the_source() {
     std::fs::write(&p, &bytes).unwrap();
     let err = pcm_sha256(&p, Limits::default(), Backend::detect()).unwrap_err();
     assert!(err.to_string().contains("checksum"), "{err}");
+    // The trailing MD5 block is checksummed too, and an audio block after
+    // it (samples past the declared count) is refused.
+    let p = d.0.join("noise16-2-m.wv");
+    let bytes = std::fs::read(&p).unwrap();
+    let mut blocks = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize + 8;
+        blocks.push(pos..pos + size);
+        pos += size;
+    }
+    let md5 = blocks.last().unwrap().clone();
+    assert_eq!(
+        &bytes[md5.start + 20..md5.start + 24],
+        &[0; 4],
+        "metadata-only block"
+    );
+    let mut bad = bytes.clone();
+    bad[md5.end - 1] ^= 1;
+    let q = d.0.join("bad-md5-block.wv");
+    std::fs::write(&q, &bad).unwrap();
+    let err = pcm_sha256(&q, Limits::default(), Backend::detect()).unwrap_err();
+    assert!(err.to_string().contains("checksum"), "{err}");
+    let mut hidden = bytes.clone();
+    hidden.extend_from_slice(&bytes[blocks[blocks.len() - 2].clone()]);
+    std::fs::write(&q, &hidden).unwrap();
+    let err = pcm_sha256(&q, Limits::default(), Backend::detect()).unwrap_err();
+    assert!(err.to_string().contains("past the declared count"), "{err}");
+}
+
+/// Taggers put an ID3v2 tag in front of FLAC and TTA files (libFLAC and
+/// the TTA format skip it): the audio after it decodes as without it, the
+/// conversion copies only the audio, and other containers still refuse it.
+#[test]
+fn leading_id3v2_tags_on_flac_and_tta_are_skipped() {
+    let d = Dir::new();
+    let wav = d.0.join("src.wav");
+    ffmpeg(None, &wav, "pcm_s24le");
+    let (_, expected, frames) = pcm_sha256(&wav, Limits::default(), Backend::Scalar).unwrap();
+    let frame = b"TIT2\0\0\0\x05\0\0\x03abc";
+    let tag = |version: u8, footer: bool| {
+        let n = frame.len() as u32;
+        let size = [
+            (n >> 21) as u8 & 127,
+            (n >> 14) as u8 & 127,
+            (n >> 7) as u8 & 127,
+            n as u8 & 127,
+        ];
+        let mut t = vec![b'I', b'D', b'3', version, 0, if footer { 0x10 } else { 0 }];
+        t.extend_from_slice(&size);
+        t.extend_from_slice(frame);
+        if footer {
+            t.extend_from_slice(b"3DI");
+            t.extend_from_slice(&[version, 0, 0x10]);
+            t.extend_from_slice(&size);
+        }
+        t
+    };
+    for (codec, ext) in [("flac", "flac"), ("tta", "tta"), ("pcm_s24le", "wav")] {
+        let plain = d.0.join(format!("plain.{ext}"));
+        ffmpeg(Some(&wav), &plain, codec);
+        let body = std::fs::read(&plain).unwrap();
+        for (version, footer) in [(3, false), (4, true)] {
+            let p = d.0.join(format!("tagged-{version}.{ext}"));
+            let mut bytes = tag(version, footer);
+            bytes.extend_from_slice(&body);
+            std::fs::write(&p, &bytes).unwrap();
+            let result = pcm_sha256(&p, Limits::default(), Backend::detect());
+            if ext == "wav" {
+                assert!(
+                    matches!(result, Err(Error::Unsupported(_))),
+                    "{ext}: {result:?}"
+                );
+                continue;
+            }
+            let (_, hash, count) = result.unwrap_or_else(|e| panic!("{ext} v{version}: {e}"));
+            assert_eq!(
+                (hash.as_str(), count),
+                (expected.as_str(), frames),
+                "{ext} v{version}"
+            );
+            let out = d.0.join(format!("out-{version}-{ext}.flac"));
+            flac::convert(&p, &out, Limits::default(), Backend::detect())
+                .unwrap_or_else(|e| panic!("convert {ext} v{version}: {e}"));
+            let (_, hash, _) = pcm_sha256(&out, Limits::default(), Backend::Scalar).unwrap();
+            assert_eq!(hash, expected, "converted {ext} v{version}");
+        }
+    }
 }
 #[test]
 fn truncation_never_publishes_output() {

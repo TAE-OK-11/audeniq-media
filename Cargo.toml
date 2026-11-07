@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99"
 license = "LicenseRef-AUDENIQ-Proprietary"
 publish = false
 repository = "https://github.com/TAE-OK-11/audeniq-media"
@@ -43,12 +43,12 @@ media-resample = { path = "crates/media-resample" }
 # Global allocator of the binaries (libraries never pick one).
 mimalloc = { version = "0.1.52", default-features = false }
 bytemuck = "1"
-fearless_simd = "1.0.0"
-kurbo = "0.13.0"
+fearless_simd = "1.2.0"
+kurbo = "0.13.1"
 log = "0.4"
-moxcms = "0.8.1"
-pic-scale = { version = "0.7.9", default-features = false }
-skrifa = "0.46.0"
+moxcms = "0.9.1"
+pic-scale = { version = "0.7.12", default-features = false }
+skrifa = "0.49.0"
 smallvec = "1"
 vello_cpu = { version = "0.3", default-features = false, features = ["std", "u8_pipeline"] }
 yoke = "0.8"

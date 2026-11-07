@@ -3,7 +3,7 @@ name = "photo-pdf-jbig2"
 description = "JBIG2 decoder (from hayro-jbig2)"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.92"
+rust-version.workspace = true
 license = "Apache-2.0 OR MIT"
 publish = false
 

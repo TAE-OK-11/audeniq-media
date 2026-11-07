@@ -3,7 +3,7 @@ name = "photo-pdf-jpeg2000"
 description = "JPEG 2000 decoder (from hayro-jpeg2000)"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.92"
+rust-version.workspace = true
 license = "Apache-2.0 OR MIT"
 publish = false
 

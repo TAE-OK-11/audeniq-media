@@ -17,7 +17,9 @@ use kurbo::{Affine, Point, Shape};
 use photo_pdf_syntax::content::TypedIter;
 use photo_pdf_syntax::content::ops::TypedInstruction;
 use photo_pdf_syntax::fxhash::FxHashMap;
-use photo_pdf_syntax::object::dict::keys::{ANNOTS, AP, AS, F, MCID, N, OC, RECT};
+use photo_pdf_syntax::object::dict::keys::{
+    ANNOTS, AP, AS, F, MCID, N, NEED_APPEARANCES, OC, RECT, SUBTYPE,
+};
 use photo_pdf_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
 use photo_pdf_syntax::page::{Page, Resources};
 use smallvec::smallvec;
@@ -108,10 +110,7 @@ impl Default for InterpreterSettings {
             #[cfg(not(feature = "embed-fonts"))]
             font_resolver: Arc::new(|_| None),
             #[cfg(feature = "embed-fonts")]
-            font_resolver: Arc::new(|query| match query {
-                FontQuery::Standard(s) => Some(s.get_font_data()),
-                FontQuery::Fallback(f) => Some(f.pick_standard_font().get_font_data()),
-            }),
+            font_resolver: Arc::new(crate::font::default_font_data),
             #[cfg(feature = "embed-cmaps")]
             cmap_resolver: Arc::new(photo_pdf_cmap::load_embedded),
             #[cfg(not(feature = "embed-cmaps"))]
@@ -149,6 +148,18 @@ pub fn interpret_page<'a>(
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
     {
+        // Form widgets without a usable appearance are drawn from their
+        // values (see `forms`).
+        let acro = crate::forms::acro_form(page.xref());
+        let need_appearances = acro
+            .as_ref()
+            .and_then(|a| a.get::<bool>(NEED_APPEARANCES))
+            .unwrap_or(false);
+        let form_da = acro
+            .as_ref()
+            .and_then(|_| crate::forms::form_default_da(page.xref()));
+        // Generated widgets per page: a bound for hostile documents.
+        let mut generated = 0u32;
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annot.get::<u32>(F).unwrap_or(0);
 
@@ -157,7 +168,20 @@ pub fn interpret_page<'a>(
                 continue;
             }
 
-            if let Some(apx) = appearance_stream(&annot).and_then(|o| FormXObject::new(&o)) {
+            let stream = appearance_stream(&annot);
+            if annot
+                .get::<Name<'_>>(SUBTYPE)
+                .is_some_and(|s| s.as_ref() == b"Widget")
+                && crate::forms::needs_generated(&annot, stream.is_some(), need_appearances)
+            {
+                if generated < 2_000 {
+                    generated += 1;
+                    draw_generated_widget(&annot, form_da.as_deref(), resources, context, device);
+                }
+                continue;
+            }
+
+            if let Some(apx) = stream.and_then(|o| FormXObject::new(&o)) {
                 let Some(rect) = annot.get::<Rect>(RECT) else {
                     continue;
                 };
@@ -214,6 +238,31 @@ pub fn interpret_page<'a>(
             }
         }
     }
+}
+
+/// A widget drawn from its field value, in its rectangle.
+fn draw_generated_widget<'a>(
+    annot: &Dict<'a>,
+    form_da: Option<&str>,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    let Some(rect) = annot.get::<Rect>(RECT) else {
+        return;
+    };
+    let r = rect.to_kurbo();
+    let Some(content) =
+        crate::forms::widget_content(annot, r.width() as f32, r.height() as f32, form_da)
+    else {
+        return;
+    };
+    context.save_state();
+    context.pre_concat_affine(Affine::translate((r.x0, r.y0)));
+    context.push_root_transform();
+    interpret(TypedIter::new(&content), resources, context, device);
+    context.pop_root_transform();
+    context.restore_state(device);
 }
 
 fn appearance_stream<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {

@@ -145,11 +145,12 @@ pub fn tags(path: &Path, limits: &Limits) -> Result<Tags> {
     if len > limits.max_file_bytes {
         return Err(Error::Limit("input bytes"));
     }
+    let start = crate::audio::id3v2_end(&mut f, len)?;
     let mut h = [0u8; 12];
     f.read_exact(&mut h)?;
     let mut tags = Tags::new();
     if &h[..4] == b"fLaC" {
-        f.seek(SeekFrom::Start(4))?;
+        f.seek(SeekFrom::Start(start + 4))?;
         for _ in 0..4096 {
             limits.check()?;
             let mut h = [0u8; 4];

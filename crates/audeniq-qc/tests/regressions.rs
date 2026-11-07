@@ -183,7 +183,9 @@ fn reference_wavpack_modes_decode_to_the_source() {
                 .success());
             let (_, expected, frames) =
                 pcm_sha256(&src, Limits::default(), Backend::Scalar).unwrap();
-            for mode in ["-f", "-h", "-hh", "-x3", "-hhx6"] {
+            // -m stores an MD5 sum in a metadata-only block after the last
+            // samples.
+            for mode in ["-f", "-h", "-hh", "-x3", "-hhx6", "-m", "-hhm"] {
                 let p = d.0.join(format!("{name}-{channels}{mode}.wv"));
                 assert!(Command::new("wavpack")
                     .args(["-q", "-y", mode])
@@ -210,6 +212,94 @@ fn reference_wavpack_modes_decode_to_the_source() {
     std::fs::write(&p, &bytes).unwrap();
     let err = pcm_sha256(&p, Limits::default(), Backend::detect()).unwrap_err();
     assert!(err.to_string().contains("checksum"), "{err}");
+    // The trailing MD5 block is checksummed too, and an audio block after
+    // it (samples past the declared count) is refused.
+    let p = d.0.join("noise16-2-m.wv");
+    let bytes = std::fs::read(&p).unwrap();
+    let mut blocks = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize + 8;
+        blocks.push(pos..pos + size);
+        pos += size;
+    }
+    let md5 = blocks.last().unwrap().clone();
+    assert_eq!(
+        &bytes[md5.start + 20..md5.start + 24],
+        &[0; 4],
+        "metadata-only block"
+    );
+    let mut bad = bytes.clone();
+    bad[md5.end - 1] ^= 1;
+    let q = d.0.join("bad-md5-block.wv");
+    std::fs::write(&q, &bad).unwrap();
+    let err = pcm_sha256(&q, Limits::default(), Backend::detect()).unwrap_err();
+    assert!(err.to_string().contains("checksum"), "{err}");
+    let mut hidden = bytes.clone();
+    hidden.extend_from_slice(&bytes[blocks[blocks.len() - 2].clone()]);
+    std::fs::write(&q, &hidden).unwrap();
+    let err = pcm_sha256(&q, Limits::default(), Backend::detect()).unwrap_err();
+    assert!(err.to_string().contains("past the declared count"), "{err}");
+}
+
+/// Taggers put an ID3v2 tag in front of FLAC and TTA files (libFLAC and
+/// the TTA format skip it): the audio after it decodes as without it, the
+/// conversion copies only the audio, and other containers still refuse it.
+#[test]
+fn leading_id3v2_tags_on_flac_and_tta_are_skipped() {
+    let d = Dir::new();
+    let wav = d.0.join("src.wav");
+    ffmpeg(None, &wav, "pcm_s24le");
+    let (_, expected, frames) = pcm_sha256(&wav, Limits::default(), Backend::Scalar).unwrap();
+    let frame = b"TIT2\0\0\0\x05\0\0\x03abc";
+    let tag = |version: u8, footer: bool| {
+        let n = frame.len() as u32;
+        let size = [
+            (n >> 21) as u8 & 127,
+            (n >> 14) as u8 & 127,
+            (n >> 7) as u8 & 127,
+            n as u8 & 127,
+        ];
+        let mut t = vec![b'I', b'D', b'3', version, 0, if footer { 0x10 } else { 0 }];
+        t.extend_from_slice(&size);
+        t.extend_from_slice(frame);
+        if footer {
+            t.extend_from_slice(b"3DI");
+            t.extend_from_slice(&[version, 0, 0x10]);
+            t.extend_from_slice(&size);
+        }
+        t
+    };
+    for (codec, ext) in [("flac", "flac"), ("tta", "tta"), ("pcm_s24le", "wav")] {
+        let plain = d.0.join(format!("plain.{ext}"));
+        ffmpeg(Some(&wav), &plain, codec);
+        let body = std::fs::read(&plain).unwrap();
+        for (version, footer) in [(3, false), (4, true)] {
+            let p = d.0.join(format!("tagged-{version}.{ext}"));
+            let mut bytes = tag(version, footer);
+            bytes.extend_from_slice(&body);
+            std::fs::write(&p, &bytes).unwrap();
+            let result = pcm_sha256(&p, Limits::default(), Backend::detect());
+            if ext == "wav" {
+                assert!(
+                    matches!(result, Err(Error::Unsupported(_))),
+                    "{ext}: {result:?}"
+                );
+                continue;
+            }
+            let (_, hash, count) = result.unwrap_or_else(|e| panic!("{ext} v{version}: {e}"));
+            assert_eq!(
+                (hash.as_str(), count),
+                (expected.as_str(), frames),
+                "{ext} v{version}"
+            );
+            let out = d.0.join(format!("out-{version}-{ext}.flac"));
+            flac::convert(&p, &out, Limits::default(), Backend::detect())
+                .unwrap_or_else(|e| panic!("convert {ext} v{version}: {e}"));
+            let (_, hash, _) = pcm_sha256(&out, Limits::default(), Backend::Scalar).unwrap();
+            assert_eq!(hash, expected, "converted {ext} v{version}");
+        }
+    }
 }
 #[test]
 fn truncation_never_publishes_output() {
@@ -640,4 +730,142 @@ fn alac_sample_entry_legacy_depth_is_accepted_and_decoded() {
     let aac = d.0.join("aac.m4a");
     ffmpeg(Some(&src), &aac, "aac");
     assert!(pcm_sha256(&aac, Limits::default(), Backend::detect()).is_err());
+}
+
+/// The RIFF/FORM size repeats what the chunks say and writers get it wrong
+/// (0, 0xFFFFFFFF, stale after an appended chunk, counting a final pad byte
+/// they left out): such files decode like the correct ones. A data chunk
+/// that the file does not hold, a streamed (size-less) data chunk and a
+/// partial frame are still refused, so a cut-off file never passes.
+#[test]
+fn wav_and_aiff_size_fields_are_tolerated_but_truncation_is_not() {
+    let d = Dir::new();
+    let le32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let check = |name: &str, bytes: &[u8], expected: Option<&str>| {
+        let p = d.0.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        let result = pcm_sha256(&p, Limits::default(), Backend::detect());
+        match expected {
+            Some(hash) => assert_eq!(result.map(|r| r.1).ok().as_deref(), Some(hash), "{name}"),
+            None => assert!(result.is_err(), "{name}: {result:?}"),
+        }
+    };
+    // Stereo 16-bit (even data) and mono 24-bit with an odd frame count.
+    for (codec, layout) in [("pcm_s16le", "stereo"), ("pcm_s24le", "mono")] {
+        let wav = d.0.join(format!("{codec}.wav"));
+        assert!(Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i"])
+            .arg("aevalsrc=0.5*sin(2*PI*441*t):s=44100:d=0.50002")
+            .args([
+                "-ac",
+                if layout == "mono" { "1" } else { "2" },
+                "-c:a",
+                codec
+            ])
+            .args(["-bitexact", "-map_metadata", "-1"])
+            .arg(&wav)
+            .status()
+            .unwrap()
+            .success());
+        let good = std::fs::read(&wav).unwrap();
+        let (_, hash, _) = pcm_sha256(&wav, Limits::default(), Backend::Scalar).unwrap();
+        let data = good.windows(4).position(|w| w == b"data").unwrap();
+        let size = u32::from_le_bytes(good[data + 4..data + 8].try_into().unwrap()) as usize;
+        for (name, riff) in [
+            ("riff0", 0u32),
+            ("riff_max", u32::MAX),
+            ("riff_big", good.len() as u32 + 999),
+        ] {
+            let mut b = good.clone();
+            le32(&mut b, 4, riff);
+            check(&format!("{codec}-{name}.wav"), &b, Some(&hash));
+        }
+        // A chunk appended without updating the RIFF size.
+        let mut b = good.clone();
+        if size % 2 == 1 && b.len() == data + 8 + size {
+            b.push(0);
+        }
+        b.extend_from_slice(b"LIST\x04\x00\x00\x00INFO");
+        check(&format!("{codec}-appended.wav"), &b, Some(&hash));
+        if size % 2 == 1 {
+            // The final pad byte left out, the RIFF size with and without it.
+            let body = &good[..data + 8 + size];
+            for extra in [0u32, 1] {
+                let mut b = body.to_vec();
+                le32(&mut b, 4, (body.len() - 8) as u32 + extra);
+                check(&format!("{codec}-nopad{extra}.wav"), &b, Some(&hash));
+            }
+        }
+        // Still refused: cut-off data (at a frame boundary or not), a
+        // streamed data size, a partial final frame.
+        let end = data + 8 + size;
+        for cut in [end - 6, end - 1, data + 8 + 600] {
+            check(&format!("{codec}-cut{cut}.wav"), &good[..cut], None);
+        }
+        let mut b = good.clone();
+        le32(&mut b, data + 4, u32::MAX);
+        check(&format!("{codec}-streamed.wav"), &b, None);
+        let mut b = good[..end - 1].to_vec();
+        le32(&mut b, data + 4, size as u32 - 1);
+        check(&format!("{codec}-partial.wav"), &b, None);
+    }
+    // AIFF: a wrong FORM size decodes, a cut-off SSND does not.
+    let aiff = d.0.join("a.aiff");
+    ffmpeg(None, &aiff, "pcm_s16be");
+    let good = std::fs::read(&aiff).unwrap();
+    let (_, hash, _) = pcm_sha256(&aiff, Limits::default(), Backend::Scalar).unwrap();
+    for (name, form) in [
+        ("form0", 0u32),
+        ("formbig", good.len() as u32 + 999),
+        ("formsmall", 100),
+    ] {
+        let mut b = good.clone();
+        b[4..8].copy_from_slice(&form.to_be_bytes());
+        check(&format!("{name}.aiff"), &b, Some(&hash));
+    }
+    check("cut.aiff", &good[..good.len() - 10], None);
+}
+
+/// A 24-bit ramp that wraps around full scale: with the Rice parameter low
+/// on the smooth slope, each wrap is coded with a unary run far past 2^16
+/// ones, which the format allows (FFmpeg's encoder writes it). Found by
+/// `audeniq-qc-tools codec-stress`.
+#[test]
+fn tta_long_unary_runs_decode() {
+    let d = Dir::new();
+    for channels in [1u16, 2] {
+        let frames = 8193usize;
+        let mut pcm = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..frames as i64 {
+            for ch in 0..i64::from(channels) {
+                let v = ((i * 7919 + ch * 71) % (1 << 24) - (1 << 23)) as i32;
+                pcm.extend_from_slice(&v.to_le_bytes()[..3]);
+                expected.extend_from_slice(&(v << 8).to_le_bytes());
+            }
+        }
+        let wav = d.0.join(format!("ramp{channels}.wav"));
+        let align = 3 * u32::from(channels);
+        let mut b = b"RIFF".to_vec();
+        b.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0");
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&48000u32.to_le_bytes());
+        b.extend_from_slice(&(48000 * align).to_le_bytes());
+        b.extend_from_slice(&(align as u16).to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        b.extend_from_slice(&pcm);
+        std::fs::write(&wav, &b).unwrap();
+        let tta = d.0.join(format!("ramp{channels}.tta"));
+        ffmpeg(Some(&wav), &tta, "tta");
+        let (_, hash, count) = pcm_sha256(&tta, Limits::default(), Backend::detect())
+            .unwrap_or_else(|e| panic!("{channels} channels: {e}"));
+        assert_eq!(count as usize, frames);
+        let mut sha = audeniq_qc::Sha256::new();
+        sha.update(&expected);
+        let want: String = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash, want, "{channels} channels");
+    }
 }

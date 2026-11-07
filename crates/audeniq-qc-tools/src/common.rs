@@ -1,5 +1,5 @@
-use audeniq_qc::json::Value;
 use audeniq_qc::Sha256;
+use audeniq_qc::json::Value;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -295,11 +295,7 @@ pub fn fixture(
                 "noise" => (rng.next() % (2 * scale) as u64) as i32 - scale,
                 "clip" => {
                     if i % 11 < 7 {
-                        if (i / 11) % 2 != 0 {
-                            scale - 1
-                        } else {
-                            -scale
-                        }
+                        if (i / 11) % 2 != 0 { scale - 1 } else { -scale }
                     } else {
                         0
                     }

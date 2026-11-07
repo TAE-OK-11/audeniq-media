@@ -1,5 +1,6 @@
 //! Strings.
 
+use super::compact::Compact;
 use crate::crypto::DecryptionTarget;
 use crate::filter::ascii_hex;
 use crate::object::Object;
@@ -16,7 +17,7 @@ use smallvec::SmallVec;
 #[derive(Clone)]
 enum StringInner<'a> {
     Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
+    Owned(Compact),
 }
 
 impl AsRef<[u8]> for StringInner<'_> {
@@ -106,7 +107,7 @@ impl Skippable for String<'_> {
 impl<'a> Readable<'a> for String<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let decoded = match r.peek_byte()? {
-            b'<' => StringInner::Owned(read_hex(r)?),
+            b'<' => StringInner::Owned(Compact::new(&read_hex(r)?)),
             b'(' => read_literal(r)?,
             _ => return None,
         };
@@ -131,7 +132,7 @@ impl<'a> Readable<'a> for String<'a> {
 
 impl From<Vec<u8>> for StringInner<'_> {
     fn from(value: Vec<u8>) -> Self {
-        Self::Owned(SmallVec::from_vec(value))
+        Self::Owned(Compact::from(value))
     }
 }
 
@@ -152,7 +153,7 @@ fn skip_hex(r: &mut Reader<'_>) -> Option<()> {
     Some(())
 }
 
-fn read_hex(r: &mut Reader<'_>) -> Option<SmallVec<[u8; 23]>> {
+fn read_hex(r: &mut Reader<'_>) -> Option<SmallVec<[u8; 32]>> {
     let start = r.offset();
     skip_hex(r)?;
     let end = r.offset();
@@ -197,7 +198,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     }
 
     let mut r = Reader::new(data);
-    let mut result = SmallVec::new();
+    let mut result: SmallVec<[u8; 32]> = SmallVec::new();
 
     while let Some(byte) = r.read_byte() {
         match byte {
@@ -273,7 +274,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
         }
     }
 
-    Some(StringInner::Owned(result))
+    Some(StringInner::Owned(Compact::new(&result)))
 }
 
 fn is_octal_digit(byte: u8) -> bool {

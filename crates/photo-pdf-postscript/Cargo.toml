@@ -3,7 +3,7 @@ name = "photo-pdf-postscript"
 description = "PostScript scanner for PDF CMaps and Type 1 fonts (from hayro-postscript)"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.92"
+rust-version.workspace = true
 license = "Apache-2.0 OR MIT"
 publish = false
 

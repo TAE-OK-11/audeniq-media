@@ -8,7 +8,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = "0.4.13"
 media-hash = { path = "../crates/media-hash" }
 photo-deflate = { path = "../crates/photo-deflate" }
 audeniq-qc = { path = "../crates/audeniq-qc" }

@@ -1,5 +1,6 @@
 //! Names.
 
+use super::compact::Compact;
 use crate::filter::ascii_hex::decode_hex_digit;
 use crate::object::Object;
 use crate::object::macros::object;
@@ -15,7 +16,7 @@ use smallvec::SmallVec;
 #[derive(Clone)]
 enum NameInner<'a> {
     Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
+    Owned(Compact),
 }
 
 /// A PDF name object.
@@ -91,7 +92,7 @@ impl<'a> Name<'a> {
     /// Create a new name from bytes that may contain escape sequences.
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
-        let mut result = SmallVec::new();
+        let mut result: SmallVec<[u8; 32]> = SmallVec::new();
         let mut r = Reader::new(data);
 
         while let Some(b) = r.read_byte() {
@@ -103,7 +104,7 @@ impl<'a> Name<'a> {
             }
         }
 
-        Some(Self(NameInner::Owned(result)))
+        Some(Self(NameInner::Owned(Compact::new(&result))))
     }
 
     /// Return a string representation of the name.

@@ -124,9 +124,13 @@ fn entry() -> Result<()> {
             },
         );
         if comparison_mode {
-            report["comparison_mode"] = json!("Explicit comparison binary; both review builds use fused conversion/QC. Consult binary SHA-256 and workflow checkout SHA for provenance.");
+            report["comparison_mode"] = json!(
+                "Explicit comparison binary; both review builds use fused conversion/QC. Consult binary SHA-256 and workflow checkout SHA for provenance."
+            );
         } else {
-            report["reference_mode"] = json!("Same engine/encoder/QC, reference-codecs feature enables Symphonia ALAC/FLAC decoding and demuxing. Generic JSON/hash/image dependencies remain in both builds.");
+            report["reference_mode"] = json!(
+                "Same engine/encoder/QC, reference-codecs feature enables Symphonia ALAC/FLAC decoding and demuxing. Generic JSON/hash/image dependencies remain in both builds."
+            );
         }
     }
     if let Some(path) = options.output {

@@ -295,7 +295,11 @@ impl Rice {
 
     #[inline(always)]
     fn decode(&mut self, r: &mut Lsb<'_>) -> Result<i32> {
-        let ones = r.ones(1 << 16)?;
+        // The format puts no limit on the run: after a jump in 24-bit audio
+        // with a small parameter, valid streams carry runs well past 2^16.
+        // The frame's length bounds it (reading past it fails), and the
+        // value check below bounds what it codes.
+        let ones = r.ones(u32::MAX)?;
         let (i, run) = if ones == 0 { (0, 0) } else { (1, ones - 1) };
         let k = self.k[i];
         if k > 31 || (run as u64) << k > u64::from(u32::MAX) {

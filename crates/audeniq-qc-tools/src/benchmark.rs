@@ -608,7 +608,7 @@ pub fn convert(options: &Options) -> Result<Value> {
             }
             if let Some(baseline) = qc.get("baseline") {
                 check(
-                    baseline == &qc["native"],
+                    same_review_qc(baseline, &qc["native"])?,
                     "review baseline/current QC equality",
                 )?;
             }
@@ -655,4 +655,26 @@ fn combine_metrics(total: &mut Value, part: &Value) {
         .as_u64()
         .unwrap()
         .max(part["peak_rss_kib"].as_u64().unwrap()));
+}
+
+/// Review QC from the baseline and current engines: every field identical,
+/// except integrated loudness within 1e-6 LU. The K-weighting coefficients
+/// are derived from ITU-R BS.1770 itself since the clean-room meter (the
+/// baseline used FFmpeg's), which moves the value by floating-point rounding
+/// (about 1e-11 LU at 48 kHz); anything larger still fails.
+fn same_review_qc(baseline: &Value, current: &Value) -> Result<bool> {
+    let lufs = |v: &Value| v["integrated_lufs"].as_f64();
+    let close = match (lufs(baseline), lufs(current)) {
+        (Some(a), Some(b)) => (a - b).abs() <= 1e-6,
+        (a, b) => {
+            a.is_none() && b.is_none() && baseline["integrated_lufs"] == current["integrated_lufs"]
+        }
+    };
+    let mut rest = [baseline.clone(), current.clone()];
+    for v in &mut rest {
+        v.as_object_mut()
+            .ok_or("review JSON")?
+            .remove("integrated_lufs");
+    }
+    Ok(close && rest[0] == rest[1])
 }

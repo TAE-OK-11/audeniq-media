@@ -29,11 +29,7 @@ pub fn audeniq_sans(bold: bool) -> Option<(FontData, u32)> {
     let face = if bold {
         BOLD.get_or_init(|| inflate(include_bytes!("../../assets/AudeniqSans-Bold.ttf.zlib")))
     } else {
-        REGULAR.get_or_init(|| {
-            inflate(include_bytes!(
-                "../../assets/AudeniqSans-Regular.ttf.zlib"
-            ))
-        })
+        REGULAR.get_or_init(|| inflate(include_bytes!("../../assets/AudeniqSans-Regular.ttf.zlib")))
     };
     face.clone().map(|data| (data, 0))
 }

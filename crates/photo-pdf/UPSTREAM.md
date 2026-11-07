@@ -24,6 +24,17 @@
 - `XRef::is_encrypted` 추가(정화기의 암호화 문서 거부용).
 - `image` 크레이트 연동(jbig2/jpeg2000 `integration.rs`), `unsafe` 기능 플래그(flate2·zune SIMD 선택), 예제·벤치·외부 자산 테스트 제거.
   파일을 읽던 단위 테스트는 생성한 PDF로 대체.
+- **기본 글꼴 AUDENIQ Sans**: 내장되지 않은 글꼴의 대체 글꼴을 AUDENIQ Sans(Regular/Bold, OFL-1.1, zlib 압축으로
+  내장, 처음 필요할 때 한 번 풀기)로. Helvetica 계열(글꼴을 정하지 않은 글자의 기본값 포함)·Arial 등 산세리프,
+  그리고 한글 등 CJK(CID) 글꼴은 스타일과 관계없이 AUDENIQ Sans(Foxit에는 한글이 없어 아무것도 그리지 않았음).
+  Times·Courier·Symbol·ZapfDingbats와 기울인 Helvetica는 Foxit 유지. 글리프는 PDF(또는 표준 AFM) 글자 폭에 맞춰
+  늘이므로 배치는 그대로. 한자(CJK 통합 한자)는 AUDENIQ Sans에도 없음.
+- **양식 필드(`forms`)**: 모양 스트림(`/AP`)이 없는 위젯 — 또는 `/NeedAppearances true`인 문서의 텍스트·선택 필드 —
+  을 값으로 그림. 체크박스·라디오는 AUDENIQ 공통 입력 요소(`audeniq/web/studio/app/src/styles/controls.css`:
+  22 단위 상자·반경 7, 빈 칸 `#E8EDF5`, 선택 `#3B63F3`+같은 흰 체크 경로, 라디오 흰 점), 텍스트·선택 값은
+  AUDENIQ Sans로 `/DA` 크기·색, `/Q` 정렬, 여러 줄 줄바꿈, 칸(comb), 비밀번호 가림. 문서 자체의 `/AP`가 있으면 그것을
+  씀. 페이지당 생성 위젯 2,000개 상한. `forms::form_fields`로 필드 이름·종류·값·체크·서명 여부를 읽고,
+  `audeniq-photo pdf-info`가 `form`으로 보고.
 - `unsafe`: `photo-pdf-syntax`의 자기참조 페이지 캐시(`page.rs` `CachedPages`) 한 곳만 `#[allow(unsafe_code)]`, 나머지는 금지.
 
 ## 아직 외부 크레이트를 쓰는 부분 (이후 합칠 후보)

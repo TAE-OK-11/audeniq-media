@@ -33,6 +33,17 @@ pub fn info(data: &[u8]) -> Result<PdfInfo> {
     })
 }
 
+/// The document's form fields and their values (empty without a form): a
+/// filled-in form keeps its answers here, whether or not the pages show
+/// them.
+pub fn form(data: &[u8]) -> Result<photo_pdf::photo_pdf_interpret::forms::Form> {
+    guard(|| {
+        Ok(photo_pdf::photo_pdf_interpret::forms::form_fields(
+            open(data)?.xref(),
+        ))
+    })
+}
+
 fn open(data: &[u8]) -> Result<Pdf> {
     match Pdf::new(data.to_vec()) {
         Ok(pdf) => Ok(pdf),

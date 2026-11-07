@@ -504,13 +504,13 @@ pub(crate) fn build(l: &Layout) -> Result<(Report, Vec<Track>), Error> {
             .filter(|s| !s.is_empty())
             .collect()
     };
-    let major = l.ftyp.as_deref().and_then(|f| f.get(0..4)).map(&brands);
+    let major = l.ftyp.as_deref().and_then(|f| f.get(0..4)).map(brands);
     let major_brand = major.and_then(|m| m.into_iter().next());
     let compatible = l
         .ftyp
         .as_deref()
         .and_then(|f| f.get(8..))
-        .map(&brands)
+        .map(brands)
         .unwrap_or_default();
     let quicktime = major_brand.as_deref() == Some("qt") || l.ftyp.is_none();
     let mut report = Report {

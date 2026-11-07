@@ -38,7 +38,7 @@ Python/Pillow 정화기)를 대체하는 Rust 엔진입니다. 뮤직비디오 �
   AAC 인코더의 비트 쓰기 → `media-bits` 한 벌. FLAC CRC16·CRC8은 `media-hash`로.
 - **신호 처리**: AAC IMDCT·인코더 MDCT, SBR QMF, MP3 IMDCT·합성, 리샘플러가 `media-dsp`의 FFT·DCT-IV·dot·이력 버퍼를 씁니다.
 - **JSON**: qc의 `src/json.rs` → `media-json`. photo의 serde_json 의존을 없앴습니다(출력은 바이트 단위로 동일).
-- **툴체인·잠금·CI**: `rust-toolchain.toml`(1.98.1), `Cargo.lock`, 워크스페이스 린트·프로필을 하나로.
+- **툴체인·잠금·CI**: `rust-toolchain.toml`(1.99.1), `Cargo.lock`, 워크스페이스 린트·프로필을 하나로.
 
 ## 빌드
 

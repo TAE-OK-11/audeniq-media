@@ -825,3 +825,47 @@ fn wav_and_aiff_size_fields_are_tolerated_but_truncation_is_not() {
     }
     check("cut.aiff", &good[..good.len() - 10], None);
 }
+
+/// A 24-bit ramp that wraps around full scale: with the Rice parameter low
+/// on the smooth slope, each wrap is coded with a unary run far past 2^16
+/// ones, which the format allows (FFmpeg's encoder writes it). Found by
+/// `audeniq-qc-tools codec-stress`.
+#[test]
+fn tta_long_unary_runs_decode() {
+    let d = Dir::new();
+    for channels in [1u16, 2] {
+        let frames = 8193usize;
+        let mut pcm = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..frames as i64 {
+            for ch in 0..i64::from(channels) {
+                let v = ((i * 7919 + ch * 71) % (1 << 24) - (1 << 23)) as i32;
+                pcm.extend_from_slice(&v.to_le_bytes()[..3]);
+                expected.extend_from_slice(&(v << 8).to_le_bytes());
+            }
+        }
+        let wav = d.0.join(format!("ramp{channels}.wav"));
+        let align = 3 * u32::from(channels);
+        let mut b = b"RIFF".to_vec();
+        b.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0");
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&48000u32.to_le_bytes());
+        b.extend_from_slice(&(48000 * align).to_le_bytes());
+        b.extend_from_slice(&(align as u16).to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        b.extend_from_slice(&pcm);
+        std::fs::write(&wav, &b).unwrap();
+        let tta = d.0.join(format!("ramp{channels}.tta"));
+        ffmpeg(Some(&wav), &tta, "tta");
+        let (_, hash, count) = pcm_sha256(&tta, Limits::default(), Backend::detect())
+            .unwrap_or_else(|e| panic!("{channels} channels: {e}"));
+        assert_eq!(count as usize, frames);
+        let mut sha = audeniq_qc::Sha256::new();
+        sha.update(&expected);
+        let want: String = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash, want, "{channels} channels");
+    }
+}

@@ -330,3 +330,133 @@ fn malformed_frame_streams_are_refused() {
         );
     }
 }
+
+/// A pixel of a 612×792-point page rendered at 1583×2048, by PDF point.
+fn pixel(img: &audeniq_photo::Image, x: f32, y: f32) -> [u8; 3] {
+    let s = img.width as f32 / 612.0;
+    let (px, py) = ((x * s) as usize, ((792.0 - y) * s) as usize);
+    let i = py * img.stride() + px * 3;
+    [img.data[i], img.data[i + 1], img.data[i + 2]]
+}
+
+/// Dark pixels in a rectangle of PDF points.
+fn ink(img: &audeniq_photo::Image, x0: f32, y0: f32, x1: f32, y1: f32) -> usize {
+    let mut n = 0;
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            if pixel(img, x, y).iter().all(|&c| c < 128) {
+                n += 1;
+            }
+            x += 0.25;
+        }
+        y += 0.25;
+    }
+    n
+}
+
+fn near(a: [u8; 3], b: [u8; 3]) -> bool {
+    a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= 6)
+}
+
+/// Korean text whose fonts are not embedded renders in AUDENIQ Sans (it
+/// used to render as nothing), and form fields without appearance streams
+/// show their values: check boxes and radios as AUDENIQ's common controls,
+/// text and choices in AUDENIQ Sans.
+#[test]
+fn non_embedded_korean_and_form_values_render() {
+    let data = fixture("forms_ko.pdf");
+    let img = pdf::render_page(&data, 0).unwrap();
+    assert_eq!((img.width, img.height), (1583, 2048));
+    // "계약서: 아티스트 동의 확인" (Batang, CID, not embedded) and the bold line.
+    assert!(
+        ink(&img, 72.0, 715.0, 380.0, 740.0) > 2_000,
+        "Korean regular line"
+    );
+    assert!(
+        ink(&img, 72.0, 686.0, 140.0, 702.0) > 500,
+        "Korean bold line"
+    );
+    // Check box without /AP, checked: AUDENIQ Blue with the white check.
+    const BLUE: [u8; 3] = [0x3B, 0x63, 0xF3];
+    const BOX: [u8; 3] = [0xE8, 0xED, 0xF5];
+    assert!(
+        near(pixel(&img, 75.0, 528.0), BLUE),
+        "{:?}",
+        pixel(&img, 75.0, 528.0)
+    );
+    // The check's corner vertex: (6.6, 11.3) of the 16-unit view box.
+    let stroke = pixel(&img, 79.1, 520.9);
+    assert!(stroke.iter().all(|&c| c >= 230), "check stroke {stroke:?}");
+    // Unchecked: the light box.
+    assert!(
+        near(pixel(&img, 80.0, 492.0), BOX),
+        "{:?}",
+        pixel(&img, 80.0, 492.0)
+    );
+    // Radio group: the first widget off, the second on with a white dot.
+    assert!(near(pixel(&img, 80.0, 412.0), BOX));
+    assert!(near(pixel(&img, 122.0, 418.0), BLUE));
+    assert_eq!(pixel(&img, 128.0, 418.0), [255, 255, 255], "radio dot");
+    // The text field's value and the multiline notes.
+    assert!(
+        ink(&img, 120.0, 450.0, 400.0, 470.0) > 300,
+        "text field value"
+    );
+    assert!(
+        ink(&img, 120.0, 230.0, 400.0, 290.0) > 300,
+        "multiline value"
+    );
+    let png = photo_png::encode(&img, photo_deflate::Level::default()).unwrap();
+    let tsv = audeniq_photo::ocr_tsv(
+        &png,
+        &audeniq_photo::Deadline::after(std::time::Duration::from_secs(120)),
+    )
+    .unwrap();
+    let words: String = tsv.lines().filter_map(|l| l.rsplit('\t').next()).collect();
+    for expected in ["계약서", "확인", "Gildong", "Worldwide", "Agreement"] {
+        assert!(words.contains(expected), "{expected} in {words}");
+    }
+}
+
+/// The form's fields and their values, also when no appearance shows them.
+#[test]
+fn form_fields_report_values() {
+    let form = pdf::form(&fixture("forms_ko.pdf")).unwrap();
+    assert!(form.need_appearances);
+    let summary: Vec<(&str, &str, Option<&str>, Option<bool>)> = form
+        .fields
+        .iter()
+        .map(|f| {
+            (
+                f.name.as_str(),
+                f.kind.as_str(),
+                f.value.as_deref(),
+                f.checked,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("agree_ap", "checkbox", Some("Yes"), Some(true)),
+            ("agree_noap", "checkbox", Some("Yes"), Some(true)),
+            ("marketing", "checkbox", None, Some(false)),
+            ("artist_name", "text", Some("홍길동 (Hong Gildong)"), None),
+            ("plan", "radio", Some("Excl"), Some(true)),
+            ("territory", "choice", Some("Worldwide"), None),
+            ("signature", "signature", None, None),
+            (
+                "notes",
+                "text",
+                Some("First line\rSecond line of notes"),
+                None
+            ),
+        ]
+    );
+    assert!(form.fields.iter().all(|f| !f.signed && !f.read_only));
+    // No form: nothing to report.
+    let plain = pdf::form(&pages_pdf(1)).unwrap();
+    assert_eq!(plain, Default::default());
+}

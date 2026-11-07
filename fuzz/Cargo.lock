@@ -156,9 +156,9 @@ checksum = "f4beca3cb2444e3304ac30843cc091f44ed58932353cd492ce740067bfce6b12"
 
 [[package]]
 name = "fearless_simd"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3296eb97d869113eaf148a6bdf01884e90b3828ad7ae2340b0f93362fc158611"
+checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
 
 [[package]]
 name = "find-msvc-tools"
@@ -375,9 +375,9 @@ dependencies = [
 
 [[package]]
 name = "moxcms"
-version = "0.8.1"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
+checksum = "396077b717181ce3f9a6b66739b269b82d756be5ec0f76be0bc40a7c51775830"
 dependencies = [
  "num-traits",
  "pxfm",
@@ -460,7 +460,7 @@ name = "photo-pdf"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "fearless_simd 1.1.0",
+ "fearless_simd 1.2.0",
  "kurbo",
  "photo-pdf-interpret",
  "pic-scale",
@@ -485,9 +485,10 @@ version = "0.1.0"
 dependencies = [
  "kurbo",
  "moxcms",
+ "photo-deflate",
  "photo-pdf-cmap",
  "photo-pdf-syntax",
- "skrifa 0.46.2",
+ "skrifa 0.49.0",
  "smallvec",
  "yoke",
 ]
@@ -496,7 +497,7 @@ dependencies = [
 name = "photo-pdf-jbig2"
 version = "0.1.0"
 dependencies = [
- "fearless_simd 1.1.0",
+ "fearless_simd 1.2.0",
  "photo-pdf-ccitt",
 ]
 
@@ -504,7 +505,7 @@ dependencies = [
 name = "photo-pdf-jpeg2000"
 version = "0.1.0"
 dependencies = [
- "fearless_simd 1.1.0",
+ "fearless_simd 1.2.0",
 ]
 
 [[package]]
@@ -602,13 +603,16 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
-version = "0.43.3"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005c8acf251756c478b0bf402885bfd88a1476020c4c7e6060edc1aa68da38ea"
+checksum = "bdaa4fffe9ff3ca2c353fa9729792805b9b3e324695ff5a081f860612e81b330"
 dependencies = [
  "bytemuck",
+ "foldhash",
  "font-types",
  "once_cell",
+ "smallvec",
+ "yoke",
 ]
 
 [[package]]
@@ -640,12 +644,15 @@ dependencies = [
 
 [[package]]
 name = "skrifa"
-version = "0.46.2"
+version = "0.49.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4febebda507fb889c545a37a135517769d1391941013561292897961d1887d6"
+checksum = "a7459fb60888ad9a5f367dd293fa2fb9df142cb451aa6bfd6cd66a7d6a9b739d"
 dependencies = [
  "bytemuck",
- "read-fonts 0.43.3",
+ "once_cell",
+ "read-fonts 0.46.0",
+ "smallvec",
+ "yoke",
 ]
 
 [[package]]

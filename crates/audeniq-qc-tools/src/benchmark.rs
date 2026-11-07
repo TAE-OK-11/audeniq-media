@@ -110,7 +110,19 @@ fn source(root: &Path, seconds: u32) -> Result<std::path::PathBuf> {
             path(&wav),
         ])?;
     } else {
-        ff(&["-v","error","-f","lavfi","-i",&format!("aevalsrc=0.4*sin(2*PI*997*t)+0.05*sin(2*PI*13001*t)|0.3*sin(2*PI*437*t)+0.04*sin(2*PI*9011*t):s=48000:d={seconds}"),"-c:a","pcm_s24le",path(&wav)])?;
+        ff(&[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "aevalsrc=0.4*sin(2*PI*997*t)+0.05*sin(2*PI*13001*t)|0.3*sin(2*PI*437*t)+0.04*sin(2*PI*9011*t):s=48000:d={seconds}"
+            ),
+            "-c:a",
+            "pcm_s24le",
+            path(&wav),
+        ])?;
     }
     Ok(wav)
 }
@@ -179,7 +191,9 @@ fn metadata(options: &Options, seconds: u32, results: Vec<Value>) -> Result<Valu
     }
     if std::env::var("AUDENIQ_BENCH_SIGNAL").as_deref() == Ok("music") {
         metadata["signal"] = json!("seeded pink noise (L) and 0.7 pink + 0.3 220 Hz tone (R)");
-        metadata["qualification"] = json!("Synthetic broadband pink-noise/tone mix, warm page cache, median repeated runs. Applies only to the reported host; not a production corpus or end-to-end AUDENIQ measurement.");
+        metadata["qualification"] = json!(
+            "Synthetic broadband pink-noise/tone mix, warm page cache, median repeated runs. Applies only to the reported host; not a production corpus or end-to-end AUDENIQ measurement."
+        );
     } else {
         metadata["signal"] = json!("synthetic two-tone stereo");
     }
@@ -281,7 +295,9 @@ fn decoding_cases(options: &Options, fixed_alac_orders: bool) -> Result<Value> {
     } else {
         "WAV/FLAC/ALAC"
     });
-    report["comparison"]=json!("Decode and canonical interleaved s32le SHA-256 only; no meter, fingerprint or encoding. Native scalar selects generic DSP while crypto dispatch and PCM layout kernels remain active. FLAC LPC and ALAC order-4/order-6/order-8 restoration use specialized scalar loops after rejecting slower explicit NEON decoder kernels. Hash and exact frame count checked on every measured run. FLAC native/reference also verify PCM MD5; FFmpeg validates frames but is not claimed to perform the same whole-stream MD5 check.");
+    report["comparison"] = json!(
+        "Decode and canonical interleaved s32le SHA-256 only; no meter, fingerprint or encoding. Native scalar selects generic DSP while crypto dispatch and PCM layout kernels remain active. FLAC LPC and ALAC order-4/order-6/order-8 restoration use specialized scalar loops after rejecting slower explicit NEON decoder kernels. Hash and exact frame count checked on every measured run. FLAC native/reference also verify PCM MD5; FFmpeg validates frames but is not claimed to perform the same whole-stream MD5 check."
+    );
     Ok(report)
 }
 pub fn analysis(options: &Options) -> Result<Value> {
@@ -412,7 +428,9 @@ pub fn analysis(options: &Options) -> Result<Value> {
     }
     let mut report = metadata(options, seconds, results)?;
     report["fingerprint"] = json!(options.fingerprint);
-    report["comparison"]=json!("Both decode once and measure LUFS/true peak plus left-aligned s32le SHA256. Native additionally computes QC metrics. FFmpeg baseline excludes FFprobe and backend meter overhead. True-peak filters differ. With --fingerprint both downmix/resample; native retains <=90s windows and emits JSON, FFmpeg emits a continuous raw tap discarded here without backend retention cost. Resamplers are versioned and not bit-identical.");
+    report["comparison"] = json!(
+        "Both decode once and measure LUFS/true peak plus left-aligned s32le SHA256. Native additionally computes QC metrics. FFmpeg baseline excludes FFprobe and backend meter overhead. True-peak filters differ. With --fingerprint both downmix/resample; native retains <=90s windows and emits JSON, FFmpeg emits a continuous raw tap discarded here without backend retention cost. Resamplers are versioned and not bit-identical."
+    );
     Ok(report)
 }
 pub fn convert(options: &Options) -> Result<Value> {
@@ -637,11 +655,17 @@ pub fn convert(options: &Options) -> Result<Value> {
     let mut report = metadata(options, seconds, results)?;
     report["review"] = json!(options.review);
     report["fingerprint"] = json!(options.fingerprint && options.review);
-    report["comparison"]=json!("Both source decode/hash/FLAC encode and output decode/hash are timed. Native also includes fsync and no-clobber publication. FFmpeg excludes separate probe and backend overhead. Adaptive LPC/Rice or verified FLAC frame-copy can produce different sizes; sizes are reported. FFmpeg verification is a separate subprocess: sum CPU/wall, maximum child RSS. Native independent FFmpeg verification is outside timing.");
+    report["comparison"] = json!(
+        "Both source decode/hash/FLAC encode and output decode/hash are timed. Native also includes fsync and no-clobber publication. FFmpeg excludes separate probe and backend overhead. Adaptive LPC/Rice or verified FLAC frame-copy can produce different sizes; sizes are reported. FFmpeg verification is a separate subprocess: sum CPU/wall, maximum child RSS. Native independent FFmpeg verification is outside timing."
+    );
     if options.review {
-        report["comparison"] = json!("Verified FLAC conversion plus QC. Native uses convert --analyze and optionally --fingerprint; baseline runs pinned convert then analyze of verified output, sums CPU/wall and takes maximum child RSS. Baseline/current QC values and fingerprint windows must match exactly (source codec metadata excepted). FFmpeg measures source hash/FLAC encode plus ebur128 true peak in one source decode, then independent output verification; with fingerprint it also emits continuous mono 11025 s16 to /dev/null. FFmpeg excludes native's extra QC metrics and fingerprint retention/JSON cost. Independent FFmpeg checks of native/baseline FLAC outputs are outside timing.");
+        report["comparison"] = json!(
+            "Verified FLAC conversion plus QC. Native uses convert --analyze and optionally --fingerprint; baseline runs pinned convert then analyze of verified output, sums CPU/wall and takes maximum child RSS. Baseline/current QC values and fingerprint windows must match exactly (source codec metadata excepted). FFmpeg measures source hash/FLAC encode plus ebur128 true peak in one source decode, then independent output verification; with fingerprint it also emits continuous mono 11025 s16 to /dev/null. FFmpeg excludes native's extra QC metrics and fingerprint retention/JSON cost. Independent FFmpeg checks of native/baseline FLAC outputs are outside timing."
+        );
         if options.reference_codecs {
-            report["comparison"] = json!("Native and comparator both use fused convert --analyze with optional --fingerprint, exact QC equality and independent FFmpeg output hashes. Comparator provenance is in reference_mode or comparison_mode and its binary SHA-256. FFmpeg uses one source decode for FLAC encode, canonical PCM SHA-256 and ebur128 true peak, then separately verifies output. FFmpeg omits native's extra QC fields/JSON/fingerprint retention. True-peak and resampling filters differ.");
+            report["comparison"] = json!(
+                "Native and comparator both use fused convert --analyze with optional --fingerprint, exact QC equality and independent FFmpeg output hashes. Comparator provenance is in reference_mode or comparison_mode and its binary SHA-256. FFmpeg uses one source decode for FLAC encode, canonical PCM SHA-256 and ebur128 true peak, then separately verifies output. FFmpeg omits native's extra QC fields/JSON/fingerprint retention. True-peak and resampling filters differ."
+            );
         }
     }
     Ok(report)
@@ -651,8 +675,10 @@ fn combine_metrics(total: &mut Value, part: &Value) {
     for key in ["wall_s", "user_s", "system_s", "cpu_s"] {
         total[key] = json!(total[key].as_f64().unwrap() + part[key].as_f64().unwrap());
     }
-    total["peak_rss_kib"] = json!(total["peak_rss_kib"]
-        .as_u64()
-        .unwrap()
-        .max(part["peak_rss_kib"].as_u64().unwrap()));
+    total["peak_rss_kib"] = json!(
+        total["peak_rss_kib"]
+            .as_u64()
+            .unwrap()
+            .max(part["peak_rss_kib"].as_u64().unwrap())
+    );
 }

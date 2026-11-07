@@ -3,7 +3,7 @@ name = "photo-pdf-interpret"
 description = "PDF content stream interpreter (from hayro-interpret)"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.92"
+rust-version.workspace = true
 license = "Apache-2.0 OR MIT"
 publish = false
 

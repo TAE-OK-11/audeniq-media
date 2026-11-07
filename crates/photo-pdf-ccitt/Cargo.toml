@@ -3,7 +3,7 @@ name = "photo-pdf-ccitt"
 description = "CCITT group 3/4 decoder (from hayro-ccitt)"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.92"
+rust-version.workspace = true
 license = "Apache-2.0 OR MIT"
 publish = false
 

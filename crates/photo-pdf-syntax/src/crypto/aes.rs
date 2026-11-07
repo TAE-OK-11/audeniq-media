@@ -466,9 +466,7 @@ impl<const KEY_SIZE: usize, const ROUNDS: usize> AESCipher<KEY_SIZE, ROUNDS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::cipher::{
-        BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, generic_array::GenericArray,
-    };
+    use aes::cipher::{BlockCipherEncrypt, BlockModeDecrypt, BlockModeEncrypt, KeyInit};
     use aes::{Aes128, Aes256};
     use cbc::{
         Decryptor, Encryptor,
@@ -484,7 +482,7 @@ mod tests {
         let our_cipher = AES128Cipher::new(key).unwrap();
 
         let external_cipher = Aes128::new_from_slice(key).unwrap();
-        let mut external_block = GenericArray::clone_from_slice(plaintext);
+        let mut external_block = aes::Block::from(*plaintext);
         external_cipher.encrypt_block(&mut external_block);
 
         let our_ciphertext = our_cipher.encrypt_block(plaintext);
@@ -505,7 +503,7 @@ mod tests {
         let our_cipher = AES256Cipher::new(key).unwrap();
 
         let external_cipher = Aes256::new_from_slice(key).unwrap();
-        let mut external_block = GenericArray::clone_from_slice(plaintext);
+        let mut external_block = aes::Block::from(*plaintext);
         external_cipher.encrypt_block(&mut external_block);
 
         let our_ciphertext = our_cipher.encrypt_block(plaintext);
@@ -530,7 +528,7 @@ mod tests {
         let external_decryptor = Aes128CbcDec::new_from_slices(key, iv).unwrap();
         let mut external_buffer = our_ciphertext.clone();
         let external_decrypted = external_decryptor
-            .decrypt_padded_mut::<Pkcs7>(&mut external_buffer)
+            .decrypt_padded::<Pkcs7>(&mut external_buffer)
             .unwrap();
 
         assert_eq!(
@@ -542,7 +540,7 @@ mod tests {
         let mut buffer = plaintext.to_vec();
         buffer.resize(plaintext.len() + 16, 0);
         let external_ciphertext = external_encryptor
-            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())
             .unwrap();
 
         let our_decrypted = our_cipher.decrypt_cbc(external_ciphertext, iv, true);
@@ -566,7 +564,7 @@ mod tests {
         let external_decryptor = Aes256CbcDec::new_from_slices(key, iv).unwrap();
         let mut external_buffer = our_ciphertext.clone();
         let external_decrypted = external_decryptor
-            .decrypt_padded_mut::<Pkcs7>(&mut external_buffer)
+            .decrypt_padded::<Pkcs7>(&mut external_buffer)
             .unwrap();
 
         assert_eq!(
@@ -578,7 +576,7 @@ mod tests {
         let mut buffer = plaintext.to_vec();
         buffer.resize(plaintext.len() + 16, 0);
         let external_ciphertext = external_encryptor
-            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())
             .unwrap();
 
         let our_decrypted = our_cipher.decrypt_cbc(external_ciphertext, iv, true);

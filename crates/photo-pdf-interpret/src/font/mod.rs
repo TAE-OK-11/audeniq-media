@@ -27,6 +27,8 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[cfg(feature = "embed-fonts")]
+mod audeniq_sans;
 mod blob;
 mod cid;
 mod generated;
@@ -65,9 +67,38 @@ pub(crate) fn strip_subset_prefix(name: &str) -> &str {
 }
 
 use crate::util::hash128;
+#[cfg(feature = "embed-fonts")]
+pub use audeniq_sans::audeniq_sans;
 pub use outline::OutlineFontData;
 use photo_pdf_cmap::{BfString, CMap, CMapName, CharacterCollection};
 pub use standard_font::StandardFont;
+
+/// The bundled font for a query: AUDENIQ Sans for sans-serif text (the
+/// Helvetica family, which is also the default when a PDF sets no font) and
+/// for every non-embedded font that is not clearly serif or monospaced, plus
+/// any non-embedded CJK (CID) font whatever its style, since only AUDENIQ Sans
+/// has Hangul. Times, Courier, Symbol and ZapfDingbats and the oblique
+/// Helvetica faces keep their metric-compatible Foxit substitutes.
+#[cfg(feature = "embed-fonts")]
+pub fn default_font_data(query: &FontQuery) -> Option<(FontData, u32)> {
+    match query {
+        FontQuery::Standard(s) => match s {
+            StandardFont::Helvetica => audeniq_sans(false).or_else(|| Some(s.get_font_data())),
+            StandardFont::HelveticaBold => audeniq_sans(true).or_else(|| Some(s.get_font_data())),
+            _ => Some(s.get_font_data()),
+        },
+        FontQuery::Fallback(f) => {
+            let bold = f.is_bold || f.font_weight >= 600;
+            if f.character_collection.is_some()
+                || (!f.is_serif && !f.is_fixed_pitch && !f.is_italic)
+            {
+                audeniq_sans(bold).or_else(|| Some(f.pick_standard_font().get_font_data()))
+            } else {
+                Some(f.pick_standard_font().get_font_data())
+            }
+        }
+    }
+}
 
 /// A glyph that can be drawn.
 pub enum Glyph<'a> {

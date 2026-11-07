@@ -763,6 +763,7 @@ dependencies = [
  "kurbo",
  "log",
  "moxcms",
+ "photo-deflate",
  "photo-pdf-cmap",
  "photo-pdf-syntax",
  "skrifa 0.46.2",

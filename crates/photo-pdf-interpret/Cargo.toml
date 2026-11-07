@@ -9,12 +9,13 @@ publish = false
 
 [features]
 default = ["embed-fonts", "embed-cmaps"]
-embed-fonts = []
+embed-fonts = ["dep:photo-deflate"]
 embed-cmaps = ["photo-pdf-cmap/embed-cmaps"]
 logging = ["dep:log", "photo-pdf-syntax/logging"]
 
 [dependencies]
 photo-pdf-cmap.workspace = true
+photo-deflate = { workspace = true, optional = true }
 photo-pdf-syntax = { workspace = true, features = ["std", "images"] }
 kurbo.workspace = true
 log = { workspace = true, optional = true }

@@ -24,7 +24,7 @@
 //! outlines), interpreted like any other content, in the widget's rectangle
 //! with the origin at its lower left corner.
 use photo_pdf_syntax::object::dict::keys::{
-    ACRO_FORM, AP, AS, DA, FIELDS, FF, FT, KIDS, MAX_LEN, NEED_APPEARANCES, OPT, PARENT, Q, T, V,
+    ACRO_FORM, AS, DA, FF, FIELDS, FT, KIDS, MAX_LEN, NEED_APPEARANCES, OPT, PARENT, Q, T, V,
 };
 use photo_pdf_syntax::object::{Array, Dict, Name, Object, ObjectIdentifier};
 use photo_pdf_syntax::xref::XRef;
@@ -48,15 +48,22 @@ const MAX_CHARS: usize = 4_096;
 /// What kind of field a widget belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
+    /// A check box (`/Btn`).
     CheckBox,
+    /// A radio button group (`/Btn` with the radio flag).
     Radio,
+    /// A push button, which holds no value.
     PushButton,
+    /// A text field (`/Tx`).
     Text,
+    /// A list or combo box (`/Ch`).
     Choice,
+    /// A signature field (`/Sig`).
     Signature,
 }
 
 impl FieldKind {
+    /// The kind's name in reports.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CheckBox => "checkbox",
@@ -74,6 +81,7 @@ impl FieldKind {
 pub struct FormField {
     /// Fully qualified name (`parent.child`).
     pub name: String,
+    /// The field's type.
     pub kind: FieldKind,
     /// Text or selected option(s) (joined with `, `); for check boxes and
     /// radio groups the chosen state name.
@@ -83,6 +91,7 @@ pub struct FormField {
     /// Signature fields: whether a signature value is present (its
     /// cryptographic validity is not checked).
     pub signed: bool,
+    /// The read-only flag.
     pub read_only: bool,
 }
 
@@ -90,7 +99,9 @@ pub struct FormField {
 /// its fields (empty without an `/AcroForm`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Form {
+    /// `/NeedAppearances`: viewers must draw fields from their values.
     pub need_appearances: bool,
+    /// Terminal fields in document order.
     pub fields: Vec<FormField>,
 }
 
@@ -113,7 +124,8 @@ pub fn form_fields(xref: &XRef) -> Form {
 }
 
 pub(crate) fn acro_form(xref: &XRef) -> Option<Dict<'_>> {
-    xref.get::<Dict<'_>>(xref.root_id())?.get::<Dict<'_>>(ACRO_FORM)
+    xref.get::<Dict<'_>>(xref.root_id())?
+        .get::<Dict<'_>>(ACRO_FORM)
 }
 
 fn walk(
@@ -131,7 +143,9 @@ fn walk(
     {
         return;
     }
-    let partial = field.get::<photo_pdf_syntax::object::String<'_>>(T).map(|s| text_string(&s));
+    let partial = field
+        .get::<photo_pdf_syntax::object::String<'_>>(T)
+        .map(|s| text_string(&s));
     let name = match (parent.is_empty(), partial) {
         (_, None) => parent.to_string(),
         (true, Some(p)) => p,
@@ -153,11 +167,11 @@ fn walk(
     let Some(kind) = field_kind(field) else {
         return;
     };
-    let flags = inherited::<u32>(field, FF).unwrap_or(0);
+    let flags = inherited(field, |x| x.get::<u32>(FF)).unwrap_or(0);
     let (value, checked) = match kind {
         FieldKind::CheckBox | FieldKind::Radio => {
             // The state name in /V; a widget's /AS when /V is missing.
-            let state = inherited::<Name<'_>>(field, V)
+            let state = inherited(field, |x| x.get::<Name<'_>>(V))
                 .map(|n| name_str(&n))
                 .or_else(|| {
                     std::iter::once(field)
@@ -177,19 +191,17 @@ fn walk(
         kind,
         value,
         checked,
-        signed: kind == FieldKind::Signature && inherited::<Object<'_>>(field, V).is_some(),
+        signed: kind == FieldKind::Signature
+            && inherited(field, |x| x.get::<Object<'_>>(V)).is_some(),
         read_only: flags & FF_READ_ONLY != 0,
     });
 }
 
 /// An attribute of a field or widget, inherited from its ancestors.
-fn inherited<'a, T>(d: &Dict<'a>, key: &[u8]) -> Option<T>
-where
-    T: photo_pdf_syntax::object::ObjectLike<'a>,
-{
+fn inherited<'a, T>(d: &Dict<'a>, get: impl Fn(&Dict<'a>) -> Option<T>) -> Option<T> {
     let mut current = d.clone();
     for _ in 0..MAX_DEPTH {
-        if let Some(v) = current.get::<T>(key) {
+        if let Some(v) = get(&current) {
             return Some(v);
         }
         current = current.get::<Dict<'a>>(PARENT)?;
@@ -198,8 +210,8 @@ where
 }
 
 fn field_kind(d: &Dict<'_>) -> Option<FieldKind> {
-    let ft = inherited::<Name<'_>>(d, FT)?;
-    let flags = inherited::<u32>(d, FF).unwrap_or(0);
+    let ft = inherited(d, |x| x.get::<Name<'_>>(FT))?;
+    let flags = inherited(d, |x| x.get::<u32>(FF)).unwrap_or(0);
     Some(match ft.as_ref() {
         b"Btn" if flags & FF_PUSHBUTTON != 0 => FieldKind::PushButton,
         b"Btn" if flags & FF_RADIO != 0 => FieldKind::Radio,
@@ -214,7 +226,7 @@ fn field_kind(d: &Dict<'_>) -> Option<FieldKind> {
 /// A text or choice value: a string, or an array of them (multiple
 /// selection), joined with `, `.
 fn field_value(d: &Dict<'_>) -> Option<String> {
-    let v = inherited::<Object<'_>>(d, V)?;
+    let v = inherited(d, |x| x.get::<Object<'_>>(V))?;
     let s = match v {
         Object::String(s) => text_string(&s),
         Object::Name(n) => name_str(&n),
@@ -288,12 +300,17 @@ const BLUE: [f32; 3] = [0.231_4, 0.388_2, 0.952_9]; // #3B63F3
 /// The content of a widget without a usable appearance, in its rectangle of
 /// `w`×`h` (origin at the lower left), or `None` when there is nothing to
 /// draw.
-pub(crate) fn widget_content(widget: &Dict<'_>, w: f32, h: f32, form_da: Option<&str>) -> Option<Vec<u8>> {
+pub(crate) fn widget_content(
+    widget: &Dict<'_>,
+    w: f32,
+    h: f32,
+    form_da: Option<&str>,
+) -> Option<Vec<u8>> {
     if !(w.is_finite() && h.is_finite() && w > 0.5 && h > 0.5 && w < 20_000.0 && h < 20_000.0) {
         return None;
     }
     let kind = field_kind(widget)?;
-    let flags = inherited::<u32>(widget, FF).unwrap_or(0);
+    let flags = inherited(widget, |x| x.get::<u32>(FF)).unwrap_or(0);
     let mut s = String::new();
     match kind {
         FieldKind::CheckBox | FieldKind::Radio => {
@@ -301,7 +318,8 @@ pub(crate) fn widget_content(widget: &Dict<'_>, w: f32, h: f32, form_da: Option<
             // missing (a single widget).
             let on = match widget.get::<Name<'_>>(AS) {
                 Some(state) => state.as_ref() != b"Off",
-                None => inherited::<Name<'_>>(widget, V).is_some_and(|v| v.as_ref() != b"Off"),
+                None => inherited(widget, |x| x.get::<Name<'_>>(V))
+                    .is_some_and(|v| v.as_ref() != b"Off"),
             };
             control(&mut s, kind == FieldKind::Radio, on, w, h);
         }
@@ -316,16 +334,18 @@ pub(crate) fn widget_content(widget: &Dict<'_>, w: f32, h: f32, form_da: Option<
             if flags & FF_PASSWORD != 0 {
                 value = "•".repeat(value.chars().count());
             }
-            let da = inherited::<photo_pdf_syntax::object::String<'_>>(widget, DA)
-                .map(|s| text_string(&s))
-                .or_else(|| form_da.map(str::to_string))
-                .unwrap_or_default();
+            let da = inherited(widget, |x| {
+                x.get::<photo_pdf_syntax::object::String<'_>>(DA)
+            })
+            .map(|s| text_string(&s))
+            .or_else(|| form_da.map(str::to_string))
+            .unwrap_or_default();
             let style = TextStyle::parse(&da);
-            let align = inherited::<u32>(widget, Q).unwrap_or(0).min(2);
+            let align = inherited(widget, |x| x.get::<u32>(Q)).unwrap_or(0).min(2);
             let multiline = kind == FieldKind::Text && flags & FF_MULTILINE != 0
                 || kind == FieldKind::Choice && flags & FF_COMBO == 0;
             let comb = (kind == FieldKind::Text && flags & FF_COMB != 0)
-                .then(|| inherited::<u32>(widget, MAX_LEN))
+                .then(|| inherited(widget, |x| x.get::<u32>(MAX_LEN)))
                 .flatten()
                 .filter(|&n| n > 0 && n <= 1_000);
             text(&mut s, &value, &style, align, multiline, comb, w, h)?;
@@ -338,7 +358,7 @@ pub(crate) fn widget_content(widget: &Dict<'_>, w: f32, h: f32, form_da: Option<
 /// A choice value shown by its display text (`/Opt` pairs are
 /// `[export display]`).
 fn display_choice(widget: &Dict<'_>, value: &str) -> String {
-    let Some(opt) = inherited::<Array<'_>>(widget, OPT) else {
+    let Some(opt) = inherited(widget, |x| x.get::<Array<'_>>(OPT)) else {
         return value.to_string();
     };
     let pairs: Vec<(String, String)> = opt
@@ -347,7 +367,10 @@ fn display_choice(widget: &Dict<'_>, value: &str) -> String {
             Object::Array(a) => {
                 let mut it = a.iter::<photo_pdf_syntax::object::String<'_>>();
                 let export = text_string(&it.next()?);
-                let display = it.next().map(|s| text_string(&s)).unwrap_or_else(|| export.clone());
+                let display = it
+                    .next()
+                    .map(|s| text_string(&s))
+                    .unwrap_or_else(|| export.clone());
                 Some((export, display))
             }
             Object::String(s) => {
@@ -417,11 +440,32 @@ fn circle(s: &mut String, cx: f32, cy: f32, r: f32) {
     let _ = writeln!(
         s,
         "{} {} m {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c h",
-        cx + r, cy,
-        cx + r, cy + c, cx + c, cy + r, cx, cy + r,
-        cx - c, cy + r, cx - r, cy + c, cx - r, cy,
-        cx - r, cy - c, cx - c, cy - r, cx, cy - r,
-        cx + c, cy - r, cx + r, cy - c, cx + r, cy
+        cx + r,
+        cy,
+        cx + r,
+        cy + c,
+        cx + c,
+        cy + r,
+        cx,
+        cy + r,
+        cx - c,
+        cy + r,
+        cx - r,
+        cy + c,
+        cx - r,
+        cy,
+        cx - r,
+        cy - c,
+        cx - c,
+        cy - r,
+        cx,
+        cy - r,
+        cx + c,
+        cy - r,
+        cx + r,
+        cy - c,
+        cx + r,
+        cy
     );
 }
 
@@ -432,15 +476,40 @@ fn rounded_rect(s: &mut String, x: f32, y: f32, w: f32, h: f32, r: f32) {
     let _ = writeln!(
         s,
         "{} {} m {} {} l {} {} {} {} {} {} c {} {} l {} {} {} {} {} {} c {} {} l {} {} {} {} {} {} c {} {} l {} {} {} {} {} {} c h",
-        x + r, y,
-        x1 - r, y,
-        x1 - r + c, y, x1, y + r - c, x1, y + r,
-        x1, y1 - r,
-        x1, y1 - r + c, x1 - r + c, y1, x1 - r, y1,
-        x + r, y1,
-        x + r - c, y1, x, y1 - r + c, x, y1 - r,
-        x, y + r,
-        x, y + r - c, x + r - c, y, x + r, y
+        x + r,
+        y,
+        x1 - r,
+        y,
+        x1 - r + c,
+        y,
+        x1,
+        y + r - c,
+        x1,
+        y + r,
+        x1,
+        y1 - r,
+        x1,
+        y1 - r + c,
+        x1 - r + c,
+        y1,
+        x1 - r,
+        y1,
+        x + r,
+        y1,
+        x + r - c,
+        y1,
+        x,
+        y1 - r + c,
+        x,
+        y1 - r,
+        x,
+        y + r,
+        x,
+        y + r - c,
+        x + r - c,
+        y,
+        x + r,
+        y
     );
 }
 
@@ -481,7 +550,8 @@ impl TextStyle {
                         _ => 4,
                     };
                     if let Some(v) = nums(n) {
-                        let v: Vec<String> = v.iter().map(|c| c.clamp(0.0, 1.0).to_string()).collect();
+                        let v: Vec<String> =
+                            v.iter().map(|c| c.clamp(0.0, 1.0).to_string()).collect();
                         style.color = format!("{} {t}", v.join(" "));
                     }
                 }
@@ -509,6 +579,7 @@ fn text(
 ) -> Option<()> {
     use skrifa::MetadataProvider;
     use skrifa::instance::{LocationRef, Size};
+    use skrifa::raw::TableProvider;
     let (data, index) = crate::font::audeniq_sans(false)?;
     let font = skrifa::FontRef::from_index(data.as_ref().as_ref(), index).ok()?;
     let charmap = font.charmap();
@@ -536,7 +607,9 @@ fn text(
     } else {
         let by_height = inner_h / (ascent + descent);
         let by_width = inner_w / (width_of(value, 1.0)).max(0.01);
-        by_height.min(by_width).clamp(4.0, 12.0_f32.max(4.0).min(by_height.max(4.0)))
+        by_height
+            .min(by_width)
+            .clamp(4.0, 12.0_f32.max(4.0).min(by_height.max(4.0)))
     };
     let lines: Vec<String> = if multiline {
         wrap(value, inner_w, |t| width_of(t, size))
@@ -561,8 +634,12 @@ fn text(
                     x: gx,
                     y: baseline,
                     any: false,
+                    last: (gx, baseline),
                 };
-                let settings = skrifa::outline::DrawSettings::unhinted(Size::unscaled(), LocationRef::default());
+                let settings = skrifa::outline::DrawSettings::unhinted(
+                    Size::unscaled(),
+                    LocationRef::default(),
+                );
                 if glyph.draw(settings, &mut pen).is_ok() && pen.any {
                     pen.s.push_str("f\n");
                 }
@@ -598,7 +675,16 @@ fn text(
 
 #[cfg(not(feature = "embed-fonts"))]
 #[allow(clippy::too_many_arguments)]
-fn text(_: &mut String, _: &str, _: &TextStyle, _: u32, _: bool, _: Option<u32>, _: f32, _: f32) -> Option<()> {
+fn text(
+    _: &mut String,
+    _: &str,
+    _: &TextStyle,
+    _: u32,
+    _: bool,
+    _: Option<u32>,
+    _: f32,
+    _: f32,
+) -> Option<()> {
     None
 }
 
@@ -649,6 +735,8 @@ struct Pen<'s> {
     x: f32,
     y: f32,
     any: bool,
+    /// The current point, for quadratic segments.
+    last: (f32, f32),
 }
 
 #[cfg(feature = "embed-fonts")]
@@ -664,22 +752,30 @@ impl skrifa::outline::OutlinePen for Pen<'_> {
         let (x, y) = self.p(x, y);
         let _ = write!(self.s, "{x} {y} m ");
         self.any = true;
+        self.last = (x, y);
     }
     fn line_to(&mut self, x: f32, y: f32) {
         let (x, y) = self.p(x, y);
         let _ = write!(self.s, "{x} {y} l ");
+        self.last = (x, y);
     }
     fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        // PDF has cubic curves only: the quadratic's equivalent cubic needs
-        // the current point, which `v`/`y` operators do not give, so the
-        // quadratic is drawn with both control points at 2/3 towards the
-        // control point from each end, using the last end recorded below.
-        let (c, e) = (self.p(cx, cy), self.p(x, y));
-        let _ = write!(self.s, "{} {} {} {} {} {} QUAD ", c.0, c.1, e.0, e.1, 0, 0);
+        // PDF has cubic curves only: the same curve as a cubic has its
+        // control points 2/3 of the way from each end to the quadratic's.
+        let (c, e, s) = (self.p(cx, cy), self.p(x, y), self.last);
+        let c1 = (s.0 + (c.0 - s.0) * 2.0 / 3.0, s.1 + (c.1 - s.1) * 2.0 / 3.0);
+        let c2 = (e.0 + (c.0 - e.0) * 2.0 / 3.0, e.1 + (c.1 - e.1) * 2.0 / 3.0);
+        let _ = write!(
+            self.s,
+            "{} {} {} {} {} {} c ",
+            c1.0, c1.1, c2.0, c2.1, e.0, e.1
+        );
+        self.last = e;
     }
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
         let (a, b, e) = (self.p(cx0, cy0), self.p(cx1, cy1), self.p(x, y));
         let _ = write!(self.s, "{} {} {} {} {} {} c ", a.0, a.1, b.0, b.1, e.0, e.1);
+        self.last = e;
     }
     fn close(&mut self) {
         self.s.push_str("h ");
@@ -693,20 +789,18 @@ pub(crate) fn form_default_da(xref: &XRef) -> Option<String> {
         .map(|s| text_string(&s))
 }
 
-/// Whether a widget's `/AP` has a stream for its current state.
-pub(crate) fn has_ap(widget: &Dict<'_>) -> bool {
-    widget.contains_key(AP)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn text_strings_decode() {
-        assert_eq!(text_string(b"\xFE\xFF\xD6\x5C\xAE\x38\xB3\xD9"), "홍길동");
+        assert_eq!(text_string(b"\xFE\xFF\xD6\x4D\xAE\x38\xB3\xD9"), "홍길동");
         assert_eq!(text_string(b"\xEF\xBB\xBFabc"), "abc");
-        assert_eq!(text_string(b"caf\xE9 \x93ok\x94 \x80"), "café “ok” •");
+        assert_eq!(
+            text_string(b"caf\xE9 \x8Dok\x8E \x80 \x93"),
+            "café “ok” • ﬁ"
+        );
     }
 
     #[test]

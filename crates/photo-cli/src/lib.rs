@@ -147,8 +147,32 @@ fn run(args: &[String]) -> Result<(), String> {
             std::fs::write(dst, out).map_err(|e| e.to_string())?;
         }
         "pdf-info" => {
-            let i = audeniq_photo::pdf::info(&read(file()?)?).map_err(|e| e.to_string())?;
-            print(&json!({"pages": i.pages, "encrypted": i.encrypted}));
+            let data = read(file()?)?;
+            let i = audeniq_photo::pdf::info(&data).map_err(|e| e.to_string())?;
+            let form = if i.encrypted {
+                Default::default()
+            } else {
+                audeniq_photo::pdf::form(&data).unwrap_or_default()
+            };
+            let fields: Vec<Value> = form
+                .fields
+                .iter()
+                .map(|f| {
+                    json!({
+                        "name": f.name,
+                        "type": f.kind.as_str(),
+                        "value": f.value,
+                        "checked": f.checked,
+                        "signed": f.signed,
+                        "read_only": f.read_only,
+                    })
+                })
+                .collect();
+            print(&json!({
+                "pages": i.pages,
+                "encrypted": i.encrypted,
+                "form": {"need_appearances": form.need_appearances, "fields": fields},
+            }));
         }
         "pdf-rasterize" => {
             let (src, dst) = (file()?, args.get(2).ok_or("missing destination")?);
